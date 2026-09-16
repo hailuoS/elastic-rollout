@@ -58,7 +58,7 @@ def runtime(request):
             str(i),
             f"node{i if tp == 8 else 0}",
             f"host{i if tp == 8 else 0}",
-            tuple(map(str, range(8) if tp == 8 else range(i * tp, (i + 1) * tp))),
+            tp,
             port=8000 + i,
         )
         for i in range(4)

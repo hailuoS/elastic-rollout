@@ -13,17 +13,30 @@ from .base import LaunchPlan
 class _ProcessActor:
     def __init__(self):
         self.process = None
+        self.actual_device_ids: tuple[str, ...] = ()
 
-    def start(self, argv: tuple[str, ...], expected_devices: tuple[str, ...], port: int) -> None:
+    def start(self, argv: tuple[str, ...], num_devices: int, port: int) -> tuple[str, ...]:
+        import ray
+
         if os.name != "posix":
             raise RuntimeError("RayProcessLauncher requires Linux Ascend worker nodes")
-        # Never override Ray's device assignment: validate static inventory against
-        # the actual Ray reservation, failing before launch if they disagree.
-        visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").split(",")
-        if set(visible) != set(expected_devices):
-            raise RuntimeError(f"Ray assigned NPU IDs {visible}, expected {expected_devices}")
         if self.process is not None:
             raise RuntimeError("process already started")
+        # NOSET actors may see the whole node. Only Ray's runtime assignment owns
+        # the device set; sort these local IDs without selecting any other NPUs.
+        assigned = ray.get_runtime_context().get_accelerator_ids().get("NPU", [])
+        if (
+            len(assigned) != num_devices
+            or any(not isinstance(x, str) or not x.isascii() or not x.isdecimal() for x in assigned)
+            or len({int(x) for x in assigned}) != num_devices
+        ):
+            raise RuntimeError(
+                f"Ray assigned invalid NPU IDs {assigned!r}; expected {num_devices} distinct "
+                "numeric local device IDs"
+            )
+        self.actual_device_ids = tuple(sorted(assigned, key=int))
+        child_env = os.environ.copy()
+        child_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(self.actual_device_ids)
         # Refuse an already occupied API port before any health probe can
         # accidentally identify a pre-existing server as our new replica.
         with socket.socket() as probe:
@@ -31,15 +44,18 @@ class _ProcessActor:
         self.process = subprocess.Popen(
             [sys.executable, "-m", "elastic_rollout.launcher.supervisor", *argv],
             stdin=subprocess.PIPE,
+            env=child_env,
         )
+        return self.actual_device_ids
 
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def stop(self) -> None:
+    def stop(self) -> tuple[str, ...]:
         if self.process is not None:
             self.process.stdin.close()
             self.process.wait(timeout=20)
+        return self.actual_device_ids
 
 
 class RayProcessLauncher:
@@ -51,6 +67,7 @@ class RayProcessLauncher:
         self.ray = ray
         self.actors: dict = {}
         self.starts: dict = {}
+        self.leases: dict[str, ResourceLease] = {}
 
     def start(self, replica_id: str, lease: ResourceLease, plan: LaunchPlan) -> None:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -62,7 +79,7 @@ class RayProcessLauncher:
             self.ray.remote(_ProcessActor)
             .options(
                 num_cpus=slot.num_cpus,
-                resources={"NPU": len(slot.device_ids)},
+                resources={"NPU": slot.num_devices},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(slot.node_id, soft=False),
                 max_restarts=0,
                 max_task_retries=0,
@@ -70,13 +87,14 @@ class RayProcessLauncher:
             .remote()
         )
         self.actors[replica_id] = actor
-        self.starts[replica_id] = actor.start.remote(plan.argv, slot.device_ids, slot.port)
+        self.leases[replica_id] = lease
+        self.starts[replica_id] = actor.start.remote(plan.argv, slot.num_devices, slot.port)
 
     def started(self, replica_id: str) -> bool:
         ready, _ = self.ray.wait([self.starts[replica_id]], timeout=0)
         if not ready:
             return False
-        self.ray.get(ready[0])
+        self.leases[replica_id].allocation.actual_device_ids = tuple(self.ray.get(ready[0]))
         return True
 
     def alive(self, replica_id: str) -> bool:
@@ -91,10 +109,14 @@ class RayProcessLauncher:
         # Even a pending start can race with process creation. Always require a
         # stop acknowledgement before releasing its physical slot.
         try:
-            self.ray.get(actor.stop.remote(), timeout=25)
+            # Also recover assignment when start raised (e.g. an occupied port),
+            # or a startup timeout occurred before we consumed the start result.
+            assigned = self.ray.get(actor.stop.remote(), timeout=25)
+            self.leases[replica_id].allocation.actual_device_ids = tuple(assigned)
         except self.ray.exceptions.RayActorError:
             # Cannot prove remote process cleanup during a node partition.
             raise RuntimeError("actor unreachable; physical slot remains quarantined") from None
         self.ray.kill(actor, no_restart=True)
         del self.actors[replica_id]
         del self.starts[replica_id]
+        del self.leases[replica_id]

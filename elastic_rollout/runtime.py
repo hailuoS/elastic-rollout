@@ -79,6 +79,7 @@ class ReplicaManager:
             self.last_error = str(exc)
             return False
         replica.endpoint = replica.resource.slot.endpoint
+        replica.allocation = replica.resource.allocation
         with self.traffic.lock:
             self.traffic.replicas[replica.replica_id] = replica
         try:

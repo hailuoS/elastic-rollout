@@ -14,7 +14,7 @@ from elastic_rollout.engine.vllm import StandardVLLMControl, VLLMServiceDriver
 
 
 def replica_and_spec(args=(), tp=8):
-    slot = ResourceSlot("slot", "node", "host", tuple(map(str, range(tp))))
+    slot = ResourceSlot("slot", "node", "host", tp)
     replica = ReplicaDescriptor("r", "d", 0, resource=ResourceLease("l", "r", slot))
     spec = DeploymentSpec("d", ReplicaSpec("model", vllm_args=args, tensor_parallel_size=tp))
     return replica, spec

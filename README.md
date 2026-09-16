@@ -25,8 +25,8 @@ Controller -> Reconciler -> ReplicaManager      |
 - Core 不 import `areal`、`verl`；适配器在 `elastic_rollout/integrations/`，按需导入。
 - Controller 不处理 prompt、token 或 logprob，没有 `/elastic/generate`。
 - `GenerationClient` 是框架进程内的 HTTP 客户端和 token 编解码工具，不是服务端代理。
-- Ray actor 按 slot 申请 `resources={"NPU": len(slot.device_ids)}` 并固定到指定节点，vLLM 用本地 `mp` 启动 TP workers。
-- 一个 replica 对应单节点 slot，启动前要求设备数等于 TP。同节点 slot 的设备和 serving port 不得冲突；不同节点可复用设备编号和端口。
+- Ray actor 按 slot 申请 `resources={"NPU": slot.num_devices}` 并固定到指定节点，vLLM 用本地 `mp` 启动 TP workers。
+- 一个 replica 对应单节点逻辑 capacity slot，启动前要求 `num_devices == TP`。同节点 serving port 不得冲突，实际 NPU 集合由 Ray 分配。
 - `policy_version` 是启动时固定模型的标签，MVP-0 不执行权重内容校验或更新。
 
 ### 路由和缩容
@@ -59,7 +59,7 @@ uv pip install -e .
 uv pip install -e '.[ray]'
 ```
 
-1. 准备模型可见的 Linux NPU 节点，Ray 节点公布真实 NPU 资源。原 TP=8 示例需四台八卡节点；单机 TP=2 示例只需一台八卡节点。
+1. 准备模型可见的 Linux NPU 节点，按下面的 NOSET 步骤启动 Ray，节点公布真实 NPU 资源。原 TP=8 示例需四台八卡节点；单机 TP=2 示例只需一台八卡节点。
 2. 从现有集群 `ray.nodes()` 取得 `NodeID` 和网络地址，填写
    [runtime.example.json](examples/runtime.example.json) 的所有 `REPLACE_*`，保存为 `runtime.json`。
 3. 确认模型路径、Python/vLLM 版本、可见 NPU ID、端口均与实际环境一致；运行时与框架必须能直连各节点的 vLLM 端口。
@@ -86,16 +86,48 @@ Ctrl-C 会等待排空和停止。正常停止时进程 guardian 会清理 vLLM 
 ### 单台 8-NPU：四个 TP=2 副本（MVP-0.1）
 
 使用 [runtime.single-node-tp2.json](examples/runtime.single-node-tp2.json)：四个 slot 共用真实
-NodeID/IP，设备分别为 `[0,1]`、`[2,3]`、`[4,5]`、`[6,7]`，端口为 8000–8003。
+NodeID/IP，各声明 `num_devices: 2`，端口为 8000–8003。
 每个 actor 申请 2 NPU / 2 CPU，节点应有足够的 Ray CPU 资源；TP 在 deployment 内固定，PP=1。
 填好占位符后保存为 `runtime.json`，按上面的 serve/scale 命令验证 `2 → 4 → 2`。
-原四节点 TP=8 配置仍然支持，框架接入方式不变。
+四节点 TP=8 示例也已改为 `num_devices: 8`，框架接入方式不变。
 
-**需要实机验证的假设：Ray 按数量申请 2 NPU，未承诺恰好返回静态 slot 的物理设备编号。**
-同节点 actor 的调度顺序、缩容后重新分配都可能使编号不同。
-launcher 保留 `ASCEND_RT_VISIBLE_DEVICES` 严格检查；不一致时在创建 vLLM 进程前报错，
-显示实际/预期 device IDs，绝不覆盖环境变量。此时该副本失败并记录错误，现有调和逻辑会重试；
-不能把配置支持视为 Ray 静态编号匹配已经通过集群验收。模型本身也必须能在 TP=2 下加载运行。
+**配置迁移：删除旧 `device_ids` 字段，改为 `num_devices`。** 不再接受静态物理设备绑定；
+slot 只描述节点、NPU 数量和服务端口，Ray 负责实际设备分配与总容量 accounting。
+四个 slot 不预分配设备集合；正确公布 8 NPU 的 Ray 节点最多同时容纳四个 TP=2 actor。
+
+### Ray NOSET 模式与设备归属
+
+先正常停止旧 ElasticRollout 服务，再在启动 Ray 的环境中设置：
+
+```bash
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ray stop --force
+ray start --head --resources='{"NPU":8}'
+```
+
+这是单机八卡示例；保留实际环境所需的网络参数，公布的 NPU 数量必须与可用设备一致。
+多节点部署时，每个 Ray 节点启动前都设置对应节点的环境，Replica 本身仍只运行在单节点。
+**修改这些变量后必须重新启动 Ray cluster；只在运行中的 actor 或 serve shell 设置不会更新已有 Ray worker。**
+重启后重新读取 `ray.nodes()` 的 NodeID/IP 并更新 `runtime.json`；所有 worker 使用同一版组件。
+这个启动时机要求也见 [vLLM-Ascend 官方 Ray 启动说明](https://docs.vllm.ai/projects/ascend/en/v0.8.4rc1/tutorials/multi_node.html#start-ray-cluster)。
+
+启动链路为：
+
+```text
+Ray get_runtime_context().get_accelerator_ids()["NPU"] -> ["5", "4"]
+ElasticRollout sorted(assigned_ids, key=int)           -> ["4", "5"]
+guardian / vLLM subprocess ASCEND_RT_VISIBLE_DEVICES  -> 4,5
+```
+
+NOSET 下 actor 可能继承整机可见设备；它不是实际分配的依据。
+launcher 检查 Ray 返回的数量、数字 ID 和唯一性，只给子进程设置排序后的同一设备集合；
+不修改 actor 环境、不在 actor 内导入 torch_npu 或初始化 NPU。排序仅作用于当前节点，
+不设计跨节点设备顺序。guardian 原样继承环境并传给 vLLM，不改变进程组清理机制。
+无需依赖 actor 启动顺序匹配 slot 编号；重试时同一 slot 得到不同卡组是合法的。
+
+本 patch 的 CPU 测试验证分配传递与历史保留；NOSET 配置和 Ascend 首次启动仍需在目标
+Ray/CANN/vLLM 环境验证，不能将重试后 READY 视为首次初始化故障已经消失。
 
 ### 控制 API
 
@@ -113,6 +145,15 @@ launcher 保留 `ASCEND_RT_VISIBLE_DEVICES` 严格检查；不一致时在创建
 
 `ready` 只计 READY；`available` 计 READY+DRAINING；`total` 计所有非 FAILED/TERMINATED 副本。
 历史失败副本的资源是否已释放，要查看 `/replicas` 中的 `resource`；它可能仍处于隔离状态。
+每个副本的 `allocation` 保留最近获知的 Ray 分配，例如：
+
+```json
+{"slot_id": "slot0", "num_devices": 2, "actual_device_ids": ["4", "5"]}
+```
+
+即使 FAILED/TERMINATED 副本的 `resource` 已变成 null，这份 `allocation` 仍保留。
+尚未调度或 actor 在回传分配前失联时，`actual_device_ids` 可能为空；不根据 slot 猜测设备。
+历史仅存在当前 Controller 内存中，重启不恢复。
 Ensure 不重置已有 desired state，不允许原地修改模型、policy 或 replica shape。
 
 ## AReaL 接入
@@ -228,7 +269,7 @@ MVP-0 的最终验收需保留这些真实运行日志，并确认 NPU 进程与
 ## 当前限制
 
 - 单 Controller、内存状态、无重启恢复；不要同时启动两个 Controller 管同一批 slot。
-- 静态独占单节点 slot，不能与训练共享/切换同一设备，不能动态改变 TP/PP，不支持 multi-node replica。
+- 静态单节点 capacity slot，Ray actor 持有独占 NPU 资源；不能与训练共享/切换同一设备，不能动态改变 TP/PP，不支持 multi-node replica。
 - vLLM 必须提供 OpenAI completions 的 token-ID/logprobs 和运行/排队 metrics；自定义旧版服务
   可替换 `VLLMControlPlane`，MVP-0 不猜测其私有 pause/reload API。
 - 停止失败/节点网络分区时优先保留资源占用，需要人工处理隔离 slot；不自动重用不确定资源。

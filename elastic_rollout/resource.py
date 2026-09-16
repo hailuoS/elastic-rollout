@@ -18,12 +18,6 @@ class StaticResourceProvider:
         for i, slot in enumerate(slots):
             for other in slots[:i]:
                 if slot.node_id == other.node_id or slot.host == other.host:
-                    overlap = set(slot.device_ids) & set(other.device_ids)
-                    if overlap:
-                        raise ValueError(
-                            f"Slots {other.slot_id}/{slot.slot_id} on node {slot.node_id} "
-                            f"(host {slot.host}) overlap NPU devices {sorted(overlap)}"
-                        )
                     if slot.port == other.port:
                         raise ValueError(
                             f"Slots {other.slot_id}/{slot.slot_id} on node {slot.node_id} "

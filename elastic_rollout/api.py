@@ -92,18 +92,15 @@ class ResourceSlot:
     slot_id: str
     node_id: str
     host: str
-    device_ids: tuple[str, ...]
+    num_devices: int
     port: int = 8000
     num_cpus: float = 8.0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "device_ids", tuple(str(x) for x in self.device_ids))
         if not self.slot_id or not self.node_id or not self.host:
             raise ValueError("slot_id, Ray node_id and host are required")
-        if not self.device_ids or len(set(self.device_ids)) != len(self.device_ids):
-            raise ValueError("each slot must reserve a nonempty list of distinct NPUs")
-        if any(not x.isdigit() for x in self.device_ids):
-            raise ValueError("device_ids must be numeric physical NPU IDs")
+        if type(self.num_devices) is not int or self.num_devices <= 0:
+            raise ValueError("num_devices must be a positive integer")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         positive_seconds(self.num_cpus, "num_cpus")
@@ -114,11 +111,26 @@ class ResourceSlot:
         return f"http://{host}:{self.port}"
 
 
+@dataclass
+class ResourceAllocation:
+    """Last observed assignment, retained by the replica after lease release."""
+
+    slot_id: str
+    num_devices: int
+    actual_device_ids: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class ResourceLease:
     lease_id: str
     replica_id: str
     slot: ResourceSlot
+    allocation: ResourceAllocation = field(init=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "allocation", ResourceAllocation(self.slot.slot_id, self.slot.num_devices)
+        )
 
 
 @dataclass(frozen=True)
@@ -140,6 +152,7 @@ class ReplicaDescriptor:
     state: ReplicaState = ReplicaState.REQUESTED
     endpoint: str = ""
     resource: ResourceLease | None = None
+    allocation: ResourceAllocation | None = None
     started_at: float = 0.0
     drain_deadline: float | None = None
     error: str | None = None

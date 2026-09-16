@@ -69,7 +69,7 @@ class VLLMServiceDriver:
         shape = spec.replica
         if replica.resource is None:
             raise ValueError("Replica requires an allocated ResourceSlot before launch")
-        device_count = len(replica.resource.slot.device_ids)
+        device_count = replica.resource.slot.num_devices
         if shape.tensor_parallel_size != device_count:
             raise ValueError(
                 f"Replica TP={shape.tensor_parallel_size} requires a ResourceSlot with exactly "

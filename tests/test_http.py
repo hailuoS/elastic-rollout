@@ -48,6 +48,31 @@ def test_control_api_and_auth(http_runtime):
     assert error.value.status == 404
 
 
+def test_replicas_api_retains_assignment_after_failure_and_slot_reuse(http_runtime):
+    client, runtime = http_runtime
+    controller, manager, driver, _ = runtime
+    failed = next(iter(manager.traffic.replicas.values()))
+    allocation = failed.resource.allocation
+    assigned = tuple(map(str, range(allocation.num_devices)))
+    allocation.actual_device_ids = assigned
+    driver.processes.remove(failed.replica_id)
+    controller.reconcile()  # Clean failed lease and allocate its slot to a new replica.
+    record = next(r for r in client.replicas() if r["replica_id"] == failed.replica_id)
+    assert record["state"] == "FAILED" and record["resource"] is None
+    assert record["allocation"] == {
+        "slot_id": allocation.slot_id,
+        "num_devices": allocation.num_devices,
+        "actual_device_ids": list(assigned),
+    }
+    replacement = next(
+        r
+        for r in manager.traffic.replicas.values()
+        if r.resource is not None and r.resource.slot.slot_id == allocation.slot_id
+    )
+    assert replacement.allocation is not allocation
+    assert replacement.allocation.actual_device_ids == ()
+
+
 @pytest.fixture
 def inference_server():
     requests = []
