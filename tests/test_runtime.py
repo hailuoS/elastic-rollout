@@ -24,8 +24,10 @@ class FakeDriver:
         self.busy = set()
         self.fail_launch = False
         self.fail_stop = False
+        self.starts = []
 
     def start(self, replica, spec):
+        self.starts.append((replica.replica_id, spec.replica.model, replica.serving_policy_version))
         self.processes.add(replica.replica_id)
         if self.fail_launch:
             raise RuntimeError("launch failed")

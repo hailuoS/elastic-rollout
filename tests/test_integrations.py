@@ -9,15 +9,19 @@ import asyncio
 import copy
 import importlib.util
 import logging
+import os
 import sys
+import threading
 import types
-from dataclasses import asdict, dataclass
+from concurrent.futures import Future
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from elastic_rollout.client import ControlError
 from elastic_rollout.generation import Completion
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -153,7 +157,7 @@ def test_areal_default_agent_config_workflow_binding_and_version(areal_adapter):
     assert engine.generator.generate.call_args.args[2]["max_tokens"] == 3
     assert engine.rid_to_address == {}
     engine.set_version(7)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="PREPARED"):
         engine.set_version(8)
     with pytest.raises(NotImplementedError):
         engine.launch_server({})
@@ -274,9 +278,13 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
     )
     assert client._load_balancer is None
     assert result.extra_fields["global_steps"] == 6
+    client.generator.generate.return_value = Completion([10], [-0.4], [9], "stop")
+    advanced = asyncio.run(client.generate("id2", prompt_ids=[1], sampling_params={}))
+    assert advanced.extra_fields["global_steps"] == 9
+    client.generator.generate.return_value = Completion([9], [-0.3], [6], "length")
     assert result.stop_reason == "completed"
     assert result.extra_fields["finish_reason"] == "length"
-    assert client.generator.generate.call_args.args[2]["max_tokens"] == 4
+    assert client.generator.generate.call_args_list[0].args[2]["max_tokens"] == 4
     with pytest.raises(ValueError, match="standalone"):
         service_module.ElasticRolloutService(config, worker_group=object())
     with pytest.raises(ValueError, match="text"):
@@ -298,3 +306,264 @@ def test_core_and_adapters_obey_dependency_direction():
                 if "integrations" not in path.parts:
                     assert name.split(".")[0] not in ("areal", "verl"), path
                 assert not name.startswith("verl.experimental.fully_async_policy"), path
+
+
+def actual_weight_meta_class():
+    path = ROOT / "AReaL/areal/api/io_struct.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "WeightUpdateMeta")
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            cls,
+        ],
+        type_ignores=[],
+    )
+    namespace = dict(__name__=__name__, dataclass=dataclass, field=field, copy=copy, os=os)
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["WeightUpdateMeta"]
+
+
+def test_persistent_meta_preserves_exact_areal_contract(areal_adapter, tmp_path):
+    module, _ = areal_adapter
+    meta_cls = actual_weight_meta_class()
+    meta = meta_cls(type="disk", path=str(tmp_path / "weight_update"))
+    persistent = module.ElasticInferenceEngine.prepare_weight_update_meta(meta)
+    other_run = module.ElasticInferenceEngine.prepare_weight_update_meta(meta)
+    assert type(persistent) is meta_cls
+    assert not persistent.clear_checkpoint_after_load
+    assert meta.clear_checkpoint_after_load
+    assert persistent.path != other_run.path
+    v1, v2 = persistent.with_version(1), persistent.with_version(2)
+    assert Path(v1.path).parent == Path(persistent.path).parent
+    assert Path(v1.path).name == "weight_update_v1" and v1.version == 1
+    assert v1.path != v2.path
+
+
+@pytest.mark.parametrize("join_existing", [False, True])
+def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
+    areal_adapter, monkeypatch, tmp_path, join_existing
+):
+    module, _ = areal_adapter
+    engine = module.ElasticInferenceEngine(
+        NS(
+            use_lora=False,
+            return_routed_experts=False,
+            request_timeout=30,
+            experiment_name="experiment",
+            trial_name="trial",
+        )
+    )
+    engine.initialize(addr="http://control", deployment_id="test")
+    engine.control.status.return_value = {"policy": {"version": 7}}
+    entered, exported = threading.Event(), threading.Event()
+
+    def wait_for_export(key, timeout):
+        entered.set()
+        assert exported.wait(2)
+        return "done"
+
+    names = NS(update_weights_from_disk=MagicMock(return_value="export-key"))
+    name_resolve = NS(wait=MagicMock(side_effect=wait_for_export))
+    utils = sys.modules["areal.utils"]
+    monkeypatch.setattr(utils, "names", names, raising=False)
+    monkeypatch.setattr(utils, "name_resolve", name_resolve, raising=False)
+    meta = actual_weight_meta_class()(
+        type="disk", path=str(tmp_path), clear_checkpoint_after_load=False
+    )
+    update = dict(update_id="u", base_version=7, snapshot_path=str(tmp_path), state="PREPARED")
+    if join_existing:
+        engine.control.begin_policy_update.side_effect = ControlError(409, "active")
+        engine.control.status.return_value["policy_update"] = update
+    else:
+        engine.control.begin_policy_update.return_value = update
+    try:
+        future = engine.update_weights_from_disk(meta)
+        assert isinstance(future, Future)
+        assert entered.wait(1) and not future.done()
+        engine.control.begin_policy_update.assert_not_called()
+        (tmp_path / "config.json").write_text("{}")
+        (tmp_path / "model.safetensors").write_bytes(b"stub weights")
+        exported.set()
+        assert future.result(timeout=2) is None
+        names.update_weights_from_disk.assert_called_once_with("experiment", "trial", 7)
+        engine.control.wait_policy_update.assert_called_once()
+        engine.control.commit_policy_update.assert_not_called()
+        engine.continue_generation()
+        engine.control.commit_policy_update.assert_not_called()
+        engine.set_version(8)
+        engine.control.commit_policy_update.assert_called_once_with("u", 8)
+        engine.set_version(8)
+        assert engine._version == 8
+        assert (tmp_path / "model.safetensors").exists()
+    finally:
+        exported.set()
+        engine._weight_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("clear_checkpoint", [False, True])
+def test_areal_controller_obeys_snapshot_retention(clear_checkpoint, tmp_path):
+    remove = MagicMock()
+    method = source_methods(
+        ROOT / "AReaL/areal/infra/controller/rollout_controller.py",
+        "RolloutController",
+        ["update_weights_from_disk"],
+        {"shutil": NS(rmtree=remove)},
+    )["update_weights_from_disk"]
+    controller = NS(_collective_rpc_async=AsyncMock())
+    meta = actual_weight_meta_class()(
+        type="disk", path=str(tmp_path), clear_checkpoint_after_load=clear_checkpoint
+    )
+    asyncio.run(method(controller, meta))
+    assert not meta.clear_checkpoint_after_load
+    assert remove.call_count == int(clear_checkpoint)
+
+
+def test_evaluation_only_observes_committed_policy(areal_adapter):
+    module, _ = areal_adapter
+    engine = module.ElasticEvaluationEngine(
+        NS(use_lora=False, return_routed_experts=False, request_timeout=30)
+    )
+    engine.initialize(addr="http://control", deployment_id="test")
+    engine.control.status.return_value = {"policy": {"version": 8}}
+    engine.set_version(8)
+    assert engine._version == 8
+    engine.control.commit_policy_update.assert_not_called()
+    with pytest.raises(RuntimeError):
+        engine.set_version(9)
+
+
+@pytest.mark.parametrize("engine", ["fsdp", "megatron"])
+def test_real_train_disk_method_orders_future_export_marker_and_wait(engine):
+    events = []
+    future = Future()
+
+    def notify(*args, **kwargs):
+        events.append("marker")
+        future.set_result(None)
+
+    rollout = NS(
+        pause_generation=lambda: events.append("pause"),
+        update_weights_from_disk=lambda meta: (events.append("future") or future),
+        continue_generation=lambda: events.append("continue"),
+    )
+
+    def save(*args, **kwargs):
+        assert not future.done()
+        events.append("save")
+
+    engine_obj = NS(
+        rollout_engine=rollout,
+        _save_model_to_hf=save,
+        tokenizer=None,
+        processor=None,
+        config=NS(experiment_name="e", trial_name="t", path="base"),
+        get_version=lambda: 0,
+        cpu_group="cpu",
+    )
+    from datetime import datetime
+
+    method = source_methods(
+        ROOT / f"AReaL/areal/engine/{engine}_engine.py",
+        "FSDPEngine" if engine == "fsdp" else "MegatronEngine",
+        ["_update_weights_from_disk"],
+        dict(
+            Future=Future,
+            dist=NS(get_rank=lambda: 0, barrier=lambda **k: None),
+            names=NS(update_weights_from_disk=lambda *a: "key"),
+            name_resolve=NS(add=notify),
+            datetime=datetime,
+            current_platform=NS(synchronize=lambda: None),
+        ),
+    )["_update_weights_from_disk"]
+    method(
+        engine_obj,
+        actual_weight_meta_class()(type="disk", path="snapshot", clear_checkpoint_after_load=False),
+    )
+    assert events == ["pause", "future", "save", "marker", "continue"]
+
+
+def test_train_callback_inherits_external_timeout_and_preserves_native_default():
+    method = source_methods(
+        ROOT / "AReaL/areal/infra/controller/train_controller.py",
+        "TrainController",
+        ["connect_engine"],
+        {"RolloutCallback": NS, "logger": logging.getLogger("test")},
+    )["connect_engine"]
+    for timeout in (None, 1200):
+        controller = NS(rollout=None, _custom_function_call=MagicMock())
+        rollout = NS(callback_addr="controller:9000")
+        if timeout is not None:
+            rollout.inf_engine = NS(weight_update_timeout=timeout)
+        method(controller, rollout, "meta")
+        callback = controller._custom_function_call.call_args.kwargs["engine"]
+        assert callback.request_timeout == (600 if timeout is None else timeout)
+
+
+def test_rollout_controller_only_advances_version_after_success():
+    method = source_methods(
+        ROOT / "AReaL/areal/infra/controller/rollout_controller.py",
+        "RolloutController",
+        ["set_version"],
+        {},
+    )["set_version"]
+    controller = NS(
+        _version_lock=threading.Lock(),
+        _version=0,
+        _proxy_started=False,
+        _collective_rpc=MagicMock(side_effect=RuntimeError("commit failed")),
+    )
+    with pytest.raises(RuntimeError):
+        method(controller, 1)
+    assert controller._version == 0
+    controller._collective_rpc.side_effect = None
+    method(controller, 1)
+    assert controller._version == 1
+
+
+def test_elastic_trainer_selects_external_workers_and_rejects_unsafe_resume(
+    areal_adapter, monkeypatch
+):
+    adapter, _ = areal_adapter
+    monkeypatch.setitem(sys.modules, "elastic_rollout.integrations.areal.inference_engine", adapter)
+    stub_module(monkeypatch, "areal.trainer")
+    parent_init = MagicMock()
+    parent = type(
+        "PPOTrainer",
+        (),
+        {
+            "__init__": lambda self, *args: parent_init(*args),
+            "_is_actor_rollout_colocated": staticmethod(lambda config: False),
+        },
+    )
+    stub_module(monkeypatch, "areal.trainer.rl_trainer", PPOTrainer=parent)
+    stub_module(monkeypatch, "areal.utils.environ", is_single_controller=lambda: True)
+    module = load_adapter(
+        monkeypatch,
+        "elastic_rollout.integrations.areal.trainer",
+        PACKAGE / "integrations/areal/trainer.py",
+    )
+    control = MagicMock()
+    control.status.return_value = {"policy": {"version": 0}, "accepting_routes": True}
+    monkeypatch.setattr(module, "ControlClient", lambda *a: control)
+    monkeypatch.setenv("ELASTIC_ROLLOUT_ENDPOINT", "http://control")
+    monkeypatch.setenv("ELASTIC_ROLLOUT_DEPLOYMENT", "test")
+    config = NS(
+        actor=NS(weight_update_mode="disk", use_lora=False, _version="v1"),
+        rollout=NS(_version="v1"),
+        recover=NS(mode="disabled"),
+    )
+    trainer = module.ElasticPPOTrainer(config, "train", "valid", workflow_worker_count=3)
+    parent_init.assert_called_once_with(config, "train", "valid")
+    trainer.scheduler = object()
+    trainer._init_rollout(config.rollout)
+    controller_factory = sys.modules["areal.infra"].RolloutController
+    assert controller_factory.call_args.kwargs["inf_engine"] is adapter.ElasticInferenceEngine
+    assert controller_factory.return_value.initialize.call_args.kwargs["workflow_worker_count"] == 3
+    trainer._init_rollout(config.rollout, is_eval=True)
+    assert controller_factory.call_args.kwargs["inf_engine"] is adapter.ElasticEvaluationEngine
+    for mode, version in (("auto", 0), ("disabled", 1)):
+        config.recover.mode = mode
+        control.status.return_value["policy"]["version"] = version
+        with pytest.raises(ValueError):
+            module.ElasticPPOTrainer(config)

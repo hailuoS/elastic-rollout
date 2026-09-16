@@ -1,8 +1,16 @@
 """Reuse AReaL workflow submission, but own neither routing nor vLLM processes."""
 
+from __future__ import annotations
+
 import asyncio
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
+from dataclasses import replace
+from pathlib import Path
+from threading import Lock
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from areal.api import ModelResponse
@@ -11,13 +19,18 @@ from areal.infra import RolloutController, WorkflowExecutor
 from areal.infra.remote_inf_engine import RemoteInfEngine
 from areal.utils import logging, stats_tracker
 
-from elastic_rollout.client import ControlClient
+from elastic_rollout.api import nonnegative_int
+from elastic_rollout.client import ControlClient, ControlError
 from elastic_rollout.generation import GenerationClient
+
+if TYPE_CHECKING:
+    from areal.api import WeightUpdateMeta
 
 
 class ElasticInferenceEngine(RemoteInfEngine):
     # Read by the small capability hook in AReaL RolloutController.
     externally_managed_servers = True
+    weight_update_timeout = 1200.0  # Export notification + bounded prepare + callback margin.
 
     def __init__(self, config):
         super().__init__(config, VLLMBackend())
@@ -27,6 +40,21 @@ class ElasticInferenceEngine(RemoteInfEngine):
             raise ValueError("MVP-0 uses AReaL v1 WorkflowExecutor/Controller")
         self.control = None
         self.generator = None
+        self._weight_executor = ThreadPoolExecutor(max_workers=1)
+        self._weight_lock = Lock()
+        self._weight_future = None
+        self._pending_update = None
+
+    @classmethod
+    def prepare_weight_update_meta(cls, meta: WeightUpdateMeta) -> WeightUpdateMeta:
+        """Called once by the AReaL trainer before connecting training engines."""
+        if meta.type != "disk" or meta.use_lora or meta.colocate_mode:
+            raise ValueError("MVP-1 requires non-colocated full-model disk snapshots")
+        if not meta.path:
+            raise ValueError("disk snapshot path is required")
+        # with_version() only replaces the basename: a unique parent survives it.
+        path = Path(meta.path).parent / "elastic-rollout" / uuid4().hex / "weight_update"
+        return replace(meta, path=str(path), clear_checkpoint_after_load=False)
 
     @classmethod
     def as_controller(cls, config, scheduler):
@@ -49,7 +77,9 @@ class ElasticInferenceEngine(RemoteInfEngine):
             raise ValueError("control addr and deployment_id are required")
         self.control = ControlClient(endpoint, deployment, os.environ.get("ELASTIC_ROLLOUT_TOKEN"))
         status = self.control.status()
-        self._version = status["spec"]["replica"]["policy_version"]
+        self._version = status.get("policy", {}).get(
+            "version", status["spec"]["replica"]["policy_version"]
+        )
         self.generator = GenerationClient(
             self.control,
             status["spec"]["replica"]["served_model_name"],
@@ -103,9 +133,102 @@ class ElasticInferenceEngine(RemoteInfEngine):
             processor=req.processor,
         )
 
-    def set_version(self, version):
-        if version != self._version:
-            raise NotImplementedError("MVP-0 serves a fixed policy; weight updates require MVP-1")
+    def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        if meta.type != "disk" or not meta.path or meta.use_lora or meta.colocate_mode:
+            raise ValueError("MVP-1 requires a full-model, non-colocated disk snapshot")
+        if meta.clear_checkpoint_after_load:
+            raise ValueError("persistent snapshots require clear_checkpoint_after_load=False")
+        with self._weight_lock:
+            if self._pending_update or (self._weight_future and not self._weight_future.done()):
+                raise RuntimeError("a weight update is already pending")
+            # The train engine exports AFTER this method returns. Waiting here
+            # would deadlock its save/barrier/name-resolve sequence.
+            self._weight_future = self._weight_executor.submit(
+                self._prepare_disk_update, copy(meta), self._version
+            )
+            return self._weight_future
+
+    def _prepare_disk_update(self, meta: WeightUpdateMeta, base_version: int) -> None:
+        from areal.utils import name_resolve, names
+
+        name_resolve.wait(
+            names.update_weights_from_disk(
+                self.config.experiment_name, self.config.trial_name, base_version
+            ),
+            timeout=120,
+        )
+        snapshot = Path(meta.path)
+        if not (snapshot / "config.json").is_file() or not (
+            any(snapshot.glob("*.safetensors")) or any(snapshot.glob("pytorch_model*.bin"))
+        ):
+            raise ValueError(f"disk export is not a standalone HF model snapshot: {meta.path}")
+        # Multiple CPU workflow workers receive the same AReaL collective RPC.
+        # One begins the update; the rest join that exact snapshot/base version.
+        deadline = time.monotonic() + 900
+        while True:
+            status = self.control.status()
+            if status["policy"]["version"] != base_version:
+                raise RuntimeError("serving policy changed before disk update")
+            try:
+                update = self.control.begin_policy_update(meta.path)
+                break
+            except ControlError as exc:
+                if exc.status != 409:
+                    raise
+                update = self.control.status().get("policy_update")
+                if update and update["state"] != "COMMITTED":
+                    if (
+                        update["snapshot_path"] != meta.path
+                        or update["base_version"] != base_version
+                    ):
+                        raise
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("deployment did not become stable for disk update") from exc
+                time.sleep(0.2)
+        if update["base_version"] != base_version:
+            raise RuntimeError("serving policy changed before disk update")
+        self.control.wait_policy_update(
+            update["update_id"], timeout=max(0, deadline - time.monotonic())
+        )
+        with self._weight_lock:
+            self._pending_update = update["update_id"]
+
+    def set_version(self, version: int) -> None:
+        nonnegative_int(version, "version")
+        with self._weight_lock:
+            if version == self._version:
+                return
+            if version < self._version or not self._pending_update:
+                raise RuntimeError("advancing version requires a PREPARED disk update")
+            deadline = time.monotonic() + 45
+            while True:
+                try:
+                    self.control.commit_policy_update(self._pending_update, version)
+                    break
+                except ControlError as exc:
+                    # A health probe may hold the manager's lifecycle lock.
+                    state = self.control.get_policy_update(self._pending_update)["state"]
+                    if exc.status != 409 or state not in ("PREPARED", "COMMITTED"):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.2)
+            self._version = version
+            self._pending_update = None
+
+    def pause_generation(self) -> None:
+        # Workflow pause is owned by AReaL; Core's prepare independently gates
+        # routes and drains existing requests without aborting vLLM generation.
+        pass
+
+    def continue_generation(self) -> None:
+        # TrainEngine calls this before set_version; Core must remain paused.
+        pass
+
+    def destroy(self):
+        self._weight_executor.shutdown(wait=True, cancel_futures=True)
+        super().destroy()
 
     def export_stats(self):
         return stats_tracker.export_all(reduce_group=None)
@@ -117,7 +240,19 @@ class ElasticInferenceEngine(RemoteInfEngine):
 
     launch_server = teardown_server = _unsupported
     init_weights_update_group = update_weights_from_distributed = _unsupported
-    update_weights_from_disk = update_weights_from_awex = _unsupported
-    pause_generation = continue_generation = offload = onload = _unsupported
+    update_weights_from_awex = _unsupported
+    offload = onload = _unsupported
     compute_logp = choose_server = set_proxy_gateway_addr = _unsupported
     _wrap_openai_agent = _unsupported
+
+
+class ElasticEvaluationEngine(ElasticInferenceEngine):
+    """Evaluation observes the training deployment's already committed policy."""
+
+    def set_version(self, version: int) -> None:
+        nonnegative_int(version, "version")
+        if version == self._version:
+            return
+        if version < self._version or self.control.status()["policy"]["version"] != version:
+            raise RuntimeError("evaluation version must match the committed training policy")
+        self._version = version

@@ -1,11 +1,12 @@
-# ElasticRollout MVP-0
+# ElasticRollout MVP-1
 
 根据相邻 `elastic_rollout_v1_2_design_rfc.md` 实现的独立 Python 公共组件。
 公共运行时管理 external standalone vLLM 副本；框架只保留 workflow/AgentLoop 和生成语义。
 
-**当前范围：固定模型、固定 policy、单节点正整数 TP / PP=1、副本数手动 `2 → 4 → 2`。**
+**当前范围：共享文件系统持久快照、prepare/commit 权重切换、单节点正整数 TP / PP=1、副本数手动 `2 → 4 → 2`。**
 已实现代码与 CPU/HTTP 模拟测试；真实 Ascend 集群和完整框架 workflow 验收仍需运行下述脚本。
-按 RFC 第 32 节，尚未进入 MVP-1，不提供权重同步、HCCL、自动扩缩策略或完整 PPO 训练接入。
+MVP-1 基于相邻 `ElasticRollout MVP-1 Weight Sync Implementation Spec.md`；保留 MVP-0 路由和资源分配。
+通过重启 stock vLLM 应用快照，HCCL 是 MVP-2，不实现自动扩缩策略。
 
 ## 结构与边界
 
@@ -27,7 +28,7 @@ Controller -> Reconciler -> ReplicaManager      |
 - `GenerationClient` 是框架进程内的 HTTP 客户端和 token 编解码工具，不是服务端代理。
 - Ray actor 按 slot 申请 `resources={"NPU": slot.num_devices}` 并固定到指定节点，vLLM 用本地 `mp` 启动 TP workers。
 - 一个 replica 对应单节点逻辑 capacity slot，启动前要求 `num_devices == TP`。同节点 serving port 不得冲突，实际 NPU 集合由 Ray 分配。
-- `policy_version` 是启动时固定模型的标签，MVP-0 不执行权重内容校验或更新。
+- `spec.replica.model/policy_version` 是不可变 bootstrap 配置；当前已提交模型和版本由 `status.policy` 描述。
 
 ### 路由和缩容
 
@@ -70,7 +71,7 @@ python -m elastic_rollout.cli serve --config runtime.json --host 0.0.0.0 --port 
 ```
 
 可通过 `ELASTIC_ROLLOUT_TOKEN` 为 control API 设置 Bearer token；框架环境使用同一变量。
-MVP 服务面向可信集群网络，不包含 TLS、HA 或持久化。vLLM 端点也需限制在集群网络内。
+MVP 服务面向可信集群网络，不包含 TLS、HA 或 Controller 状态持久化。vLLM 端点也需限制在集群网络内。
 
 ```bash
 elastic-rollout status --endpoint http://CONTROL_HOST:8080 --deployment mvp0
@@ -142,6 +143,9 @@ Ray/CANN/vLLM 环境验证，不能将重试后 READY 视为首次初始化故�
 | POST | `/routes` | `{"routing_key": "opaque-key"}`，返回 RouteLease |
 | DELETE | `/leases/{lease_id}` | 幂等释放 |
 | PUT | `/leases/{lease_id}` | 续租；过期租约不能复活 |
+| POST | `/policy-updates` | `{"snapshot_path":"/shared/policy-1"}`，暂停新路由并准备更新 |
+| GET | `/policy-updates/{update_id}` | 更新状态、目标副本、错误和状态历史 |
+| POST | `/policy-updates/{update_id}/commit` | `{"policy_version":1}`，原子提交 PREPARED 更新 |
 
 `ready` 只计 READY；`available` 计 READY+DRAINING；`total` 计所有非 FAILED/TERMINATED 副本。
 历史失败副本的资源是否已释放，要查看 `/replicas` 中的 `resource`；它可能仍处于隔离状态。
@@ -158,7 +162,7 @@ Ensure 不重置已有 desired state，不允许原地修改模型、policy 或 
 
 ## AReaL 接入
 
-目标源码：相邻 AReaL `ascend-v1.0.5`，本次读取 HEAD `2262610b`。
+目标源码：相邻 AReaL `feat/elastic-rollout`，基于此前 Ascend fork 的外部推理适配。
 已在 `areal/infra/controller/rollout_controller.py` 增加 capability hook。
 
 ```python
@@ -197,12 +201,117 @@ Elastic 子类，重写 initialize/agenerate，永不调用继承的物理 serve
 capacity 会扣除累计 accepted 样本数，默认配置没有训练版本推进时会在容量耗尽后等待。
 此限制属于框架，本组件不伪造新版本绕过它。
 
-完整 PPOTrainer 仍会 `connect_engine/update_weights`，不属于 MVP-0；这些调用明确报错。
+完整磁盘更新训练入口见下方 `ElasticPPOTrainer`；裸 AReaL `PPOTrainer` 仍选择其原生推理引擎。
+
+## MVP-1：共享磁盘快照与两阶段提交
+
+### Core 流程
+
+```text
+REQUESTED -> QUIESCING -> RESTARTING -> VERIFYING -> PREPARED -> COMMITTED
+                       unrecoverable error -> FAILED (routing remains paused)
+```
+
+Begin 要求 deployment 稳定且 READY 数等于 desired；扩缩容与更新互斥，冲突返回 HTTP 409。
+HTTP handler 只记录控制状态；Reconciler 执行排空、stop/start、health 和 completion warmup。
+更新立即阻止所有新租约（包括已有 sticky key），已有租约可以续租、释放和到期。
+只有租约数为零且各 backend `/metrics` 确认空闲后才重启，TTL 到期不代替 backend idle。
+
+Core 将候选路径作为不可变、不透明的模型目录，既不检查 Controller 本地存在性，也不复制或转换文件。
+每个目标 replica 保留逻辑 ResourceLease、slot 和 endpoint，stop 后以 `--model <snapshot_path>` 启动；
+Ray actor 重新申请资源时实际卡号可能变化，仍由 runtime context 决定。
+这是进程重启，不是热加载；没有 AReaL vLLM extension 或 `/areal_update_weights` 依赖。
+
+PREPARED 的候选副本仍不可路由，`serving_policy_version` 尚未变化。
+显式 commit 要求更大的非负整数版本，在同一同步边界更新 committed policy、全部候选副本版本、
+清除 sticky 并重新接收请求。同一 update/version 重复 commit 幂等。
+提交后的扩容和 crash replacement 直接从最新 committed snapshot 启动。
+候选启动故障可替换重试，仍使用候选快照；PREPARED 后检测到故障会回到验证流程。
+不可恢复故障保持路由关闭、不推进版本、不自动回滚。FAILED 后也锁定拓扑；可正常关闭 Controller
+清理进程，再人工确定恢复模型。Controller 重启恢复不在本次范围。
+
+```python
+from elastic_rollout.client import ControlClient
+
+client = ControlClient("http://CONTROL_HOST:8080", "mvp0")
+update = client.begin_policy_update("/shared/immutable-policy-1")
+client.wait_policy_update(update["update_id"])  # bounded polling, fails immediately on FAILED
+client.commit_policy_update(update["update_id"], 1)
+```
+
+常规 health probe 正持有生命周期锁时，begin/commit 也可能短暂返回 409，可稍后重试。
+`status.policy` 是当前版本；`status.policy_update` 是当前/最近更新；`accepting_routes` 表示准入开关。
+`/replicas.loaded_model_path` 记录实际 launch 使用的模型路径。READY 数不代表路由开关已经打开。
+
+### AReaL 训练入口与磁盘契约
+
+AReaL 是本次首个完整训练接入目标，使用 [ElasticPPOTrainer](elastic_rollout/integrations/areal/trainer.py)
+复用原 PPOTrainer 训练循环，仅选择外部 CPU workflow workers 和持久磁盘导出。
+需要同步更新本包与相邻 AReaL `feat/elastic-rollout` 的小范围补丁。
+
+```bash
+export ELASTIC_ROLLOUT_ENDPOINT=http://CONTROL_HOST:8080
+export ELASTIC_ROLLOUT_DEPLOYMENT=mvp0
+```
+
+```python
+from elastic_rollout.integrations.areal.trainer import ElasticPPOTrainer
+
+# config 是完整 AReaL PPOConfig，按现有训练脚本准备 datasets/workflow。
+config.actor.weight_update_mode = "disk"
+config.cluster.fileroot = "/shared/areal"  # 所有训练 rank、workflow worker、vLLM 节点共同可见
+config.recover.mode = "disabled"
+trainer = ElasticPPOTrainer(config, train_dataset, valid_dataset, workflow_worker_count=2)
+try:
+    trainer.train(workflow=workflow)
+finally:
+    trainer.close()
+```
+
+运行条件：AReaL single-controller/v1 engines、完整模型、非 colocate、训练和 rollout 使用独占资源。
+首次训练从可路由的 committed v0 开始，训练模型与 bootstrap 模型应为同一权重。
+训练恢复/连接非零版本后继续训练未纳入 MVP-1，入口会明确拒绝，避免训练端版本 0 与推理端版本 N 的
+导出完成通知不一致。独立推理 adapter 仍能读取非零 committed 版本。
+评估 workers 使用 `ElasticEvaluationEngine`，只观察训练已经提交的版本，不重复提交。
+训练时保留正常 off-policy/staleness 设置；上方 `10**12` 仅用于固定权重离线 workflow。
+
+本分支真实契约是 `WeightUpdateMeta.path` 与 `update_weights_from_disk(meta) -> Future[None]`。
+FSDP/Megatron 在调用 update 方法之后才导出，adapter 后台等待
+`names.update_weights_from_disk(experiment, trial, 当前旧版本)` 完成标记，再 begin 并等到 PREPARED。
+Future 完成时不 commit；训练循环随后 `set_version(new_version)` 才 commit。
+`continue_generation()` 在原训练循环中早于 `set_version()`，因此它不会打开 Core 路由。
+多个 workflow workers 加入同一路径/基础版本的更新；训练 callback 超时按 1200 秒配置，覆盖导出通知
+120 秒与 prepare 900 秒预算。更新失败保留异常和关闭的准入开关。
+
+导出复用现有 HF save_pretrained / Megatron HF exporter，包含权重、config 和 tokenizer。
+Megatron 持久导出补齐 base model 配置资源，供新 vLLM 进程独立加载；这仍需真实模型验证。
+metadata hook 使用 run-unique 父目录，`with_version(N)` 生成类似：
+
+```text
+<原 AReaL save root>/elastic-rollout/<run-uuid>/weight_update_vN/
+```
+
+`clear_checkpoint_after_load=False`；RolloutController 尊重该标志。
+当前和之前快照都会保留，不做 GC。**只要当前快照还可能用于扩容或故障补建，就不能删除或覆盖。**
+共享文件系统必须在导出 barrier/完成通知后让推理节点看到完整不可变目录。
+
+### 人工验证
+
+准备一份完整 HF 候选快照后，在专用 deployment 执行：
+
+```bash
+python -m examples.policy_update_smoke --endpoint "$ENDPOINT" --deployment mvp0 \
+  --snapshot "$SHARED_SNAPSHOT" --version 1 --prompt-ids "$PROMPT_IDS"
+```
+
+脚本执行旧版生成、prepare、PREPARED、commit、新版生成、扩容到四副本并校验模型路径和版本；
+结束时保留四副本。它不训练、不产生快照、不证明模型参数数值正确。
+真正的 AReaL train/export/vLLM load/生成验证必须在 Ascend 环境另行完成。
 
 ## verl 接入
 
-相邻 verl 当前是 detached HEAD `483b8a00`（tag `v0.9.0`），不是一个本地命名 release 分支。
-实现基于此实际源码，没有切换分支。未修改 `experimental/fully_async_policy`。
+相邻 verl 为 `feat/elastic-rollout`，基于 v0.9.0 的既有外部 AgentLoop 适配。
+本次不修改 verl 仓库或原有路由架构。
 
 ```python
 from elastic_rollout.integrations.verl.rollout_service import ElasticRolloutService
@@ -264,7 +373,7 @@ python -m examples.verl_agent_loop --endpoint "$ENDPOINT" --deployment mvp0 --mo
 没有把固定 temperature 当成跨硬件必然逐 token 一致的保证。
 
 MVP-0 的最终验收需保留这些真实运行日志，并确认 NPU 进程与 Ray 资源恢复。
-两框架均完成后再进入 snapshot/HCCL 阶段。
+MVP-1 的 CPU contract 测试额外验证 prepare/commit、快照追赶及动态版本传播；HCCL 留给 MVP-2。
 
 ## 当前限制
 
@@ -273,7 +382,7 @@ MVP-0 的最终验收需保留这些真实运行日志，并确认 NPU 进程与
 - vLLM 必须提供 OpenAI completions 的 token-ID/logprobs 和运行/排队 metrics；自定义旧版服务
   可替换 `VLLMControlPlane`，MVP-0 不猜测其私有 pause/reload API。
 - 停止失败/节点网络分区时优先保留资源占用，需要人工处理隔离 slot；不自动重用不确定资源。
-- 不含完整 PPO、weight update、fully-async policy-update resume、Agent proxy、多模态或 LoRA。
+- verl Trainer/CheckpointEngine 权重同步仍不支持；不含 HCCL、异步权重更新、自动回滚、Agent proxy、多模态或 LoRA。
 
 实现参考：本地 RFC/目标源码；Ray [NPU 资源](https://docs.ray.io/en/latest/ray-core/scheduling/accelerators.html)、
 [节点绑定](https://docs.ray.io/en/latest/ray-core/api/doc/ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy.html)

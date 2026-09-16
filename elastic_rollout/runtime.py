@@ -3,11 +3,20 @@
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from .api import DeploymentSpec, ReplicaDescriptor, ReplicaState, nonnegative_int
+from .api import (
+    DeploymentSpec,
+    PolicySnapshot,
+    PolicyUpdateDescriptor,
+    PolicyUpdateState,
+    ReplicaDescriptor,
+    ReplicaState,
+    nonnegative_int,
+)
 from .resource import NoCapacity, StaticResourceProvider
 from .traffic import TrafficManager
 
@@ -16,6 +25,11 @@ S = ReplicaState
 STARTUP = (S.ALLOCATED, S.STARTING, S.SYNCING, S.WARMING)
 DRAIN = (S.DRAINING, S.QUIESCED, S.STOPPING)
 TERMINAL = (S.FAILED, S.TERMINATED)
+U = PolicyUpdateState
+
+
+class PolicyConflict(RuntimeError):
+    pass
 
 
 class ServiceDriver(Protocol):
@@ -43,6 +57,157 @@ class ReplicaManager:
         self.traffic = TrafficManager(spec, clock)
         self.mutation_lock = threading.Lock()
         self.last_error: str | None = None
+        self.committed_policy = PolicySnapshot(spec.replica.policy_version, spec.replica.model)
+        self.policy_update: PolicyUpdateDescriptor | None = None
+        self.policy_updates: dict[str, PolicyUpdateDescriptor] = {}
+        self.closing = False
+
+    @contextmanager
+    def _control_mutation(self):
+        # HTTP handlers never wait for a process stop, start or health probe.
+        if not self.mutation_lock.acquire(blocking=False):
+            raise PolicyConflict("deployment lifecycle mutation in progress")
+        try:
+            with self.traffic.lock:
+                yield
+        finally:
+            self.mutation_lock.release()
+
+    def _effective_spec(self, model_path: str) -> DeploymentSpec:
+        return replace(self.spec, replica=replace(self.spec.replica, model=model_path))
+
+    def _update_blocks_topology(self) -> bool:
+        return self.policy_update is not None and self.policy_update.state != U.COMMITTED
+
+    def set_desired(self, count: int) -> dict:
+        # Preserve MVP-0 desired-state changes during normal reconciliation.
+        # Begin/commit also hold this lock, so the policy gate is atomic here.
+        with self.traffic.lock:
+            if self._update_blocks_topology():
+                raise PolicyConflict("policy update active or failed; topology is locked")
+            self.desired = count
+            return self.status()
+
+    def begin_policy_update(self, snapshot_path: str) -> dict:
+        if not isinstance(snapshot_path, str) or not snapshot_path.strip():
+            raise ValueError("snapshot_path must be a non-empty string")
+        with self._control_mutation():
+            if self._update_blocks_topology():
+                raise PolicyConflict("policy update active or failed")
+            replicas = list(self.traffic.replicas.values())
+            if (
+                any(r.state in STARTUP + DRAIN for r in replicas)
+                or any(r.state in TERMINAL and r.resource is not None for r in replicas)
+                or sum(r.state == S.READY for r in replicas) != self.desired
+            ):
+                raise PolicyConflict("deployment must be stable before policy update")
+            update = PolicyUpdateDescriptor(
+                uuid4().hex,
+                self.spec.deployment_id,
+                self.committed_policy.version,
+                snapshot_path,
+                started_at=self.clock(),
+                target_replica_ids=tuple(r.replica_id for r in replicas if r.state == S.READY),
+            )
+            self.policy_update = update
+            self.policy_updates[update.update_id] = update
+            self.traffic.pause_routes()
+            logger.info("policy update %s requested; routing paused", update.update_id)
+            return asdict(update)
+
+    def get_policy_update(self, update_id: str) -> dict:
+        with self.traffic.lock:
+            return asdict(self.policy_updates[update_id])
+
+    def commit_policy_update(self, update_id: str, policy_version: int) -> dict:
+        nonnegative_int(policy_version, "policy_version")
+        with self._control_mutation():
+            update = self.policy_updates[update_id]
+            if update.state == U.COMMITTED and update.committed_version == policy_version:
+                return asdict(update)
+            if update is not self.policy_update or update.state != U.PREPARED:
+                raise PolicyConflict("policy update must be PREPARED before commit")
+            if policy_version <= self.committed_policy.version:
+                raise ValueError("policy_version must exceed the current committed version")
+            live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
+            if not self._candidate_ready(live):
+                raise PolicyConflict("candidate replicas are no longer all READY")
+            self.committed_policy = PolicySnapshot(policy_version, update.snapshot_path)
+            for replica in live:
+                replica.serving_policy_version = policy_version
+            self.traffic.sticky.clear()
+            update.committed_version = policy_version
+            self._update_transition(U.COMMITTED)
+            self.traffic.resume_routes()
+            logger.info("policy version %s COMMITTED; routing resumed", policy_version)
+            return asdict(update)
+
+    def _update_transition(self, state: PolicyUpdateState) -> None:
+        with self.traffic.lock:
+            self.policy_update.state = state
+            self.policy_update.history.append(state.value)
+        logger.info("policy update %s %s", self.policy_update.update_id, state.value)
+
+    def _fail_update(self, error: Exception) -> None:
+        with self.traffic.lock:
+            self.policy_update.error = str(error)
+            self.last_error = str(error)
+            self.traffic.pause_routes()
+            self._update_transition(U.FAILED)
+        logger.error("policy update FAILED: %s", error)
+
+    def _candidate_ready(self, live: list[ReplicaDescriptor]) -> bool:
+        return len(live) == self.desired and all(
+            r.state == S.READY and r.loaded_model_path == self.policy_update.snapshot_path
+            for r in live
+        )
+
+    def _reconcile_policy(self) -> None:
+        update = self.policy_update
+        live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
+        if any(
+            r.state == S.FAILED and r.resource is not None for r in self.traffic.replicas.values()
+        ):
+            raise RuntimeError("policy update cannot proceed: replica resource quarantined")
+        if update.state == U.QUIESCING:
+            with self.traffic.lock:
+                inflight = sum(self.traffic.inflight.values())
+            if inflight:
+                logger.info("policy update waiting for %s inflight requests", inflight)
+                return
+            if not all(self.driver.idle(r) for r in live):
+                return
+            self._update_transition(U.RESTARTING)
+            for replica in live:
+                logger.info(
+                    "restarting replica %s from snapshot %s",
+                    replica.replica_id,
+                    update.snapshot_path,
+                )
+                # Keep the logical lease and endpoint across the process restart.
+                # A stop error is fatal: never launch on possibly occupied devices.
+                self.driver.stop(replica)
+                replica.loaded_model_path = update.snapshot_path
+                replica.started_at = self.clock()
+                replica.health_failures = 0
+                self._transition(replica, S.STARTING)
+                try:
+                    self.driver.start(replica, self._effective_spec(update.snapshot_path))
+                except Exception as exc:
+                    self._fail(replica, exc)
+            return
+        if update.state in (U.RESTARTING, U.VERIFYING, U.PREPARED):
+            if self._candidate_ready(live):
+                if update.state == U.RESTARTING:
+                    self._update_transition(U.VERIFYING)
+                elif update.state == U.VERIFYING:
+                    self._update_transition(U.PREPARED)
+                return
+            if update.state != U.RESTARTING:
+                self._update_transition(U.RESTARTING)
+            for _ in range(max(0, self.desired - len(live))):
+                if not self._create():
+                    break
 
     def _transition(self, replica: ReplicaDescriptor, state: ReplicaState) -> None:
         with self.traffic.lock:
@@ -70,8 +235,19 @@ class ReplicaManager:
         self._cleanup(replica)
 
     def _create(self) -> bool:
+        model_path = self.committed_policy.model_path
+        candidate = self.policy_update is not None and self.policy_update.state in (
+            U.RESTARTING,
+            U.VERIFYING,
+            U.PREPARED,
+        )
+        if candidate:
+            model_path = self.policy_update.snapshot_path
         replica = ReplicaDescriptor(
-            uuid4().hex, self.spec.deployment_id, self.spec.replica.policy_version
+            uuid4().hex,
+            self.spec.deployment_id,
+            self.committed_policy.version,
+            loaded_model_path=model_path,
         )
         try:
             replica.resource = self.resources.acquire(replica.replica_id)
@@ -86,7 +262,14 @@ class ReplicaManager:
             self._transition(replica, S.ALLOCATED)
             replica.started_at = self.clock()
             self._transition(replica, S.STARTING)
-            self.driver.start(replica, self.spec)
+            logger.info(
+                "new/replacement replica %s launching %s policy %s from %s",
+                replica.replica_id,
+                "candidate" if candidate else "committed",
+                self.committed_policy.version,
+                model_path,
+            )
+            self.driver.start(replica, self._effective_spec(model_path))
         except Exception as exc:
             self._fail(replica, exc)
         return True
@@ -96,6 +279,11 @@ class ReplicaManager:
         # merely change desired state; they never create/destroy processes.
         with self.mutation_lock:
             self.traffic.expire()
+            if self._update_blocks_topology() and not self.closing:
+                if self.policy_update.state == U.FAILED:
+                    return
+                if self.policy_update.state == U.REQUESTED:
+                    self._update_transition(U.QUIESCING)
             for replica in list(self.traffic.replicas.values()):
                 try:
                     if replica.state == S.FAILED:
@@ -115,11 +303,19 @@ class ReplicaManager:
                         if not self.driver.health(replica):
                             continue
                         if replica.state == S.STARTING:
-                            # Fixed policy loaded by vLLM at startup; no weight transport.
+                            # Model artifact is loaded by vLLM at process startup.
                             self._transition(replica, S.SYNCING)
                             self._transition(replica, S.WARMING)
-                        if self.driver.warmup(replica, self.spec):
+                        if self.driver.warmup(
+                            replica, self._effective_spec(replica.loaded_model_path)
+                        ):
                             self._transition(replica, S.READY)
+                            logger.info(
+                                "%s replica %s READY from %s",
+                                "candidate" if self._update_blocks_topology() else "committed",
+                                replica.replica_id,
+                                replica.loaded_model_path,
+                            )
                     elif replica.state in (S.READY, S.DRAINING):
                         replica.health_failures = (
                             0 if self.driver.health(replica) else replica.health_failures + 1
@@ -137,6 +333,13 @@ class ReplicaManager:
                             self._cleanup(replica)
                 except Exception as exc:
                     self._fail(replica, exc)
+
+            if self._update_blocks_topology() and not self.closing:
+                try:
+                    self._reconcile_policy()
+                except Exception as exc:
+                    self._fail_update(exc)
+                return
 
             with self.traffic.lock:
                 live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
@@ -164,6 +367,9 @@ class ReplicaManager:
             replicas = list(self.traffic.replicas.values())
             return {
                 "spec": asdict(self.spec),
+                "policy": asdict(self.committed_policy),
+                "policy_update": asdict(self.policy_update) if self.policy_update else None,
+                "accepting_routes": self.traffic.accepting_routes,
                 "desired_replicas": self.desired,
                 "ready_replicas": sum(r.state == S.READY for r in replicas),
                 "available_replicas": sum(r.state in (S.READY, S.DRAINING) for r in replicas),
@@ -206,9 +412,22 @@ class Controller:
             if self._closed and count:
                 raise RuntimeError("controller is closing")
             manager = self.deployments[deployment_id]
-            with manager.traffic.lock:
-                manager.desired = count
-            return manager.status()
+            return manager.set_desired(count)
+
+    def begin_policy_update(self, deployment_id: str, snapshot_path: str) -> dict:
+        with self._lock:
+            if self._closed:
+                raise PolicyConflict("controller is closing")
+            return self.deployments[deployment_id].begin_policy_update(snapshot_path)
+
+    def get_policy_update(self, deployment_id: str, update_id: str) -> dict:
+        return self.deployments[deployment_id].get_policy_update(update_id)
+
+    def commit_policy_update(self, deployment_id: str, update_id: str, policy_version: int) -> dict:
+        with self._lock:
+            if self._closed:
+                raise PolicyConflict("controller is closing")
+            return self.deployments[deployment_id].commit_policy_update(update_id, policy_version)
 
     def reconcile(self) -> None:
         with self._lock:
@@ -220,7 +439,12 @@ class Controller:
         with self._lock:
             self._closed = True
             for manager in self.deployments.values():
-                self.set_desired_replicas(manager.spec.deployment_id, 0)
+                with manager.mutation_lock, manager.traffic.lock:
+                    if manager._update_blocks_topology():
+                        manager._fail_update(RuntimeError("controller shutting down"))
+                    manager.closing = True
+                    manager.traffic.pause_routes()
+                    manager.desired = 0
         deadline = time.monotonic() + timeout
         while True:
             self.reconcile()

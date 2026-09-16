@@ -23,6 +23,15 @@ class TrafficManager:
         self.sticky: OrderedDict[str, str] = OrderedDict()
         self.leases: dict[str, RouteLease] = {}
         self.inflight: dict[str, int] = {}
+        self.accepting_routes = True
+
+    def pause_routes(self) -> None:
+        with self.lock:
+            self.accepting_routes = False
+
+    def resume_routes(self) -> None:
+        with self.lock:
+            self.accepting_routes = True
 
     def expire(self) -> None:
         with self.lock:
@@ -35,6 +44,8 @@ class TrafficManager:
             raise ValueError("routing_key must be a nonempty opaque string")
         with self.lock:
             self.expire()
+            if not self.accepting_routes:
+                raise NoReadyReplica("policy update in progress or failed; routing is paused")
             replica = self.replicas.get(self.sticky.get(routing_key, ""))
             if replica is not None and not (
                 replica.state == ReplicaState.READY

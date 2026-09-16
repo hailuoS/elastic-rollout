@@ -91,6 +91,37 @@ class ControlClient:
     def set_desired_replicas(self, count: int) -> dict:
         return self._request(self.path + "/desired", "PUT", {"desired_replicas": count})
 
+    def begin_policy_update(self, snapshot_path: str) -> dict:
+        return self._request(
+            self.path + "/policy-updates", "POST", {"snapshot_path": snapshot_path}
+        )
+
+    def get_policy_update(self, update_id: str) -> dict:
+        return self._request(self.path + f"/policy-updates/{quote(update_id, safe='')}")
+
+    def commit_policy_update(self, update_id: str, policy_version: int) -> dict:
+        return self._request(
+            self.path + f"/policy-updates/{quote(update_id, safe='')}/commit",
+            "POST",
+            {"policy_version": policy_version},
+        )
+
+    def wait_policy_update(
+        self, update_id: str, desired_state: str = "PREPARED", timeout: float = 900
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            update = self.get_policy_update(update_id)
+            if update["state"] == "FAILED":
+                raise RuntimeError(f"policy update {update_id} FAILED: {update.get('error')}")
+            if update["state"] == desired_state:
+                return update
+            if update["state"] == "COMMITTED":
+                raise RuntimeError(f"policy update {update_id} already COMMITTED")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"policy update {update_id} did not reach {desired_state}")
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
     def acquire(self, routing_key: str) -> RouteLease:
         return RouteLease(
             **self._request(self.path + "/routes", "POST", {"routing_key": routing_key})

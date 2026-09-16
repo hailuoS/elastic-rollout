@@ -35,6 +35,36 @@ class ReplicaState(str, Enum):
     FAILED = "FAILED"
 
 
+class PolicyUpdateState(str, Enum):
+    REQUESTED = "REQUESTED"
+    QUIESCING = "QUIESCING"
+    RESTARTING = "RESTARTING"
+    VERIFYING = "VERIFYING"
+    PREPARED = "PREPARED"
+    COMMITTED = "COMMITTED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class PolicySnapshot:
+    version: int
+    model_path: str
+
+
+@dataclass
+class PolicyUpdateDescriptor:
+    update_id: str
+    deployment_id: str
+    base_version: int
+    snapshot_path: str
+    state: PolicyUpdateState = PolicyUpdateState.REQUESTED
+    started_at: float = 0.0
+    error: str | None = None
+    target_replica_ids: tuple[str, ...] = ()
+    committed_version: int | None = None
+    history: list[str] = field(default_factory=lambda: ["REQUESTED"])
+
+
 @dataclass(frozen=True)
 class ReplicaSpec:
     model: str
@@ -153,6 +183,7 @@ class ReplicaDescriptor:
     endpoint: str = ""
     resource: ResourceLease | None = None
     allocation: ResourceAllocation | None = None
+    loaded_model_path: str = ""
     started_at: float = 0.0
     drain_deadline: float | None = None
     error: str | None = None

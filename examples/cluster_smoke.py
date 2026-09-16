@@ -16,7 +16,7 @@ async def run(framework: str, endpoint: str, deployment: str, prompt_ids: list[i
     control = ControlClient(endpoint, deployment, os.environ.get("ELASTIC_ROLLOUT_TOKEN"))
     status = await asyncio.to_thread(control.status)
     model = status["spec"]["replica"]["served_model_name"]
-    version = status["spec"]["replica"]["policy_version"]
+    version = status.get("policy", {}).get("version", status["spec"]["replica"]["policy_version"])
     engine = None
     if framework == "areal":
         from areal.api import ModelRequest

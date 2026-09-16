@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from .api import DeploymentSpec
-from .runtime import Controller
+from .runtime import Controller, PolicyConflict
 from .traffic import NoReadyReplica
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,22 @@ def make_server(
                             }
                     elif tail == ["desired"] and self.command == "PUT":
                         result = controller.set_desired_replicas(
-                            deployment_id, body["desired_replicas"]
+                            deployment_id, body.get("desired_replicas")
+                        )
+                    elif tail == ["policy-updates"] and self.command == "POST":
+                        result = controller.begin_policy_update(
+                            deployment_id, body.get("snapshot_path")
+                        )
+                    elif len(tail) == 2 and tail[0] == "policy-updates" and self.command == "GET":
+                        result = controller.get_policy_update(deployment_id, tail[1])
+                    elif (
+                        len(tail) == 3
+                        and tail[0] == "policy-updates"
+                        and tail[2] == "commit"
+                        and self.command == "POST"
+                    ):
+                        result = controller.commit_policy_update(
+                            deployment_id, tail[1], body.get("policy_version")
                         )
                     elif tail == ["routes"] and self.command == "POST":
                         result = asdict(manager.traffic.acquire(body["routing_key"]))
@@ -87,6 +102,8 @@ def make_server(
                 self._reply(200, result)
             except NoReadyReplica as exc:
                 self._reply(503, {"error": str(exc)})
+            except PolicyConflict as exc:
+                self._reply(409, {"error": str(exc)})
             except KeyError as exc:
                 self._reply(404, {"error": f"unknown deployment, lease or missing field: {exc}"})
             except (ValueError, TypeError) as exc:
