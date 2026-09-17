@@ -14,9 +14,14 @@ from .traffic import NoReadyReplica
 logger = logging.getLogger(__name__)
 
 
+class ControlHTTPServer(ThreadingHTTPServer):
+    # Set before construction: server_activate() passes this backlog to listen().
+    request_queue_size = 256
+
+
 def make_server(
     controller: Controller, host: str = "127.0.0.1", port: int = 8080, token: str | None = None
-) -> ThreadingHTTPServer:
+) -> ControlHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             logger.debug(fmt, *args)
@@ -116,6 +121,6 @@ def make_server(
 
         do_GET = do_POST = do_PUT = do_DELETE = _handle
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = ControlHTTPServer((host, port), Handler)
     server.daemon_threads = True
     return server

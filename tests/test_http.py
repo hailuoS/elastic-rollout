@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -46,6 +47,32 @@ def test_control_api_and_auth(http_runtime):
     with pytest.raises(ControlError) as error:
         request_json(client.endpoint + "/elastic/generate", "POST", {}, token=client.token)
     assert error.value.status == 404
+
+
+def test_concurrent_http_route_acquire_and_release(http_runtime):
+    client, _ = http_runtime
+    count = 128
+    # Synchronize each burst so requests compete at the HTTP accept queue.
+    barrier = threading.Barrier(count, timeout=10)
+
+    def acquire(index):
+        barrier.wait()
+        return client.acquire(f"concurrent-route-{index}")
+
+    def release(lease):
+        barrier.wait()
+        return client.release(lease.lease_id)
+
+    assert client.status()["inflight"] == 0
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        # Consume every result: connection resets and other HTTP errors fail the test.
+        leases = list(pool.map(acquire, range(count)))
+        assert len({lease.lease_id for lease in leases}) == count
+        assert client.status()["inflight"] == count
+        released = list(pool.map(release, leases))
+
+    assert all(released)
+    assert client.status()["inflight"] == 0
 
 
 def test_replicas_api_retains_assignment_after_failure_and_slot_reuse(http_runtime):
