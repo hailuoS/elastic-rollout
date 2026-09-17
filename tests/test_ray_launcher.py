@@ -1,4 +1,6 @@
+import errno
 import os
+import socket
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -133,3 +135,79 @@ def test_launcher_records_assignment_even_when_start_failed(fake_ray, start_fail
     launcher.stop("r")
     assert replica.resource.allocation.actual_device_ids == ("4", "5")
     assert not launcher.leases
+
+
+@pytest.mark.parametrize("conflict_at", [None, "bind", "listen"])
+def test_port_probe_allows_reuse_but_rejects_conflicts_before_spawn(
+    fake_ray, monkeypatch, conflict_at
+):
+    fake_ray.get_runtime_context.return_value.get_accelerator_ids.return_value = {"NPU": ["0", "1"]}
+    monkeypatch.setattr("elastic_rollout.launcher.ray.os.name", "posix")
+    probe = MagicMock()
+    factory = MagicMock()
+    factory.return_value.__enter__.return_value = probe
+    monkeypatch.setattr("elastic_rollout.launcher.ray.socket.socket", factory)
+    popen = MagicMock()
+    monkeypatch.setattr("elastic_rollout.launcher.ray.subprocess.Popen", popen)
+
+    def bind(address):
+        probe.setsockopt.assert_called_once_with(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        assert address == ("0.0.0.0", 8000)
+        if conflict_at == "bind":
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    probe.bind.side_effect = bind
+    if conflict_at == "listen":
+        probe.listen.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+    actor = _ProcessActor()
+    if conflict_at:
+        with pytest.raises(OSError, match="vLLM API port 8000 unavailable") as exc:
+            actor.start(("python",), 2, 8000)
+        assert exc.value.errno == errno.EADDRINUSE
+        popen.assert_not_called()
+        assert actor.process is None
+    else:
+        actor.start(("python",), 2, 8000)
+        probe.listen.assert_called_once_with(1)
+        popen.assert_called_once()
+    factory.return_value.__exit__.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux TCP port reuse semantics")
+def test_real_linux_port_probe_rejects_live_listener(fake_ray, monkeypatch):
+    fake_ray.get_runtime_context.return_value.get_accelerator_ids.return_value = {"NPU": ["0", "1"]}
+    popen = MagicMock()
+    monkeypatch.setattr("elastic_rollout.launcher.ray.subprocess.Popen", popen)
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        with pytest.raises(OSError) as exc:
+            _ProcessActor().start(("python",), 2, port)
+        assert exc.value.errno == errno.EADDRINUSE
+    popen.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux TCP TIME_WAIT semantics")
+def test_real_linux_port_probe_reuses_closed_server_connections(fake_ray, monkeypatch):
+    fake_ray.get_runtime_context.return_value.get_accelerator_ids.return_value = {"NPU": ["0", "1"]}
+    popen = MagicMock()
+    monkeypatch.setattr("elastic_rollout.launcher.ray.subprocess.Popen", popen)
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.settimeout(2)
+        server.bind(("0.0.0.0", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            connection, _ = server.accept()
+            connection.close()  # Server actively closes, leaving its port in TIME_WAIT.
+            assert client.recv(1) == b""
+    # Reproduce the old probe's failure after the listener has already closed.
+    with socket.socket() as old_probe, pytest.raises(OSError) as exc:
+        old_probe.bind(("0.0.0.0", port))
+    assert exc.value.errno == errno.EADDRINUSE
+    actor = _ProcessActor()
+    assert actor.start(("python",), 2, port) == ("0", "1")
+    popen.assert_called_once()

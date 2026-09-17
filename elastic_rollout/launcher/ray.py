@@ -40,7 +40,17 @@ class _ProcessActor:
         # Refuse an already occupied API port before any health probe can
         # accidentally identify a pre-existing server as our new replica.
         with socket.socket() as probe:
-            probe.bind(("0.0.0.0", port))
+            # Linux keeps closed server connections in TIME_WAIT across a
+            # policy restart. Allow their reuse, while still rejecting a live
+            # listener; SO_REUSEPORT must not be enabled here.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("0.0.0.0", port))
+                probe.listen(1)
+            except OSError as exc:
+                raise OSError(
+                    exc.errno, f"vLLM API port {port} unavailable on this node: {exc.strerror}"
+                ) from exc
         self.process = subprocess.Popen(
             [sys.executable, "-m", "elastic_rollout.launcher.supervisor", *argv],
             stdin=subprocess.PIPE,
