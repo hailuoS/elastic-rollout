@@ -94,6 +94,8 @@ class ReplicaManager:
         with self._control_mutation():
             if self._update_blocks_topology():
                 raise PolicyConflict("policy update active or failed")
+            if self.desired <= 0:
+                raise PolicyConflict("policy update requires at least one READY replica")
             replicas = list(self.traffic.replicas.values())
             if (
                 any(r.state in STARTUP + DRAIN for r in replicas)
@@ -108,6 +110,7 @@ class ReplicaManager:
                 snapshot_path,
                 started_at=self.clock(),
                 target_replica_ids=tuple(r.replica_id for r in replicas if r.state == S.READY),
+                deadline_at=self.clock() + self.spec.policy_update_runtime_timeout_s,
             )
             self.policy_update = update
             self.policy_updates[update.update_id] = update
@@ -125,6 +128,8 @@ class ReplicaManager:
             update = self.policy_updates[update_id]
             if update.state == U.COMMITTED and update.committed_version == policy_version:
                 return asdict(update)
+            if update is self.policy_update and self._check_update_deadline():
+                raise PolicyConflict(f"policy update FAILED: {update.error}")
             if update is not self.policy_update or update.state != U.PREPARED:
                 raise PolicyConflict("policy update must be PREPARED before commit")
             if policy_version <= self.committed_policy.version:
@@ -150,16 +155,30 @@ class ReplicaManager:
 
     def _fail_update(self, error: Exception) -> None:
         with self.traffic.lock:
+            if self.policy_update.state in (U.FAILED, U.COMMITTED):
+                return
             self.policy_update.error = str(error)
             self.last_error = str(error)
             self.traffic.pause_routes()
             self._update_transition(U.FAILED)
         logger.error("policy update FAILED: %s", error)
 
+    def _check_update_deadline(self) -> bool:
+        update = self.policy_update
+        if update is None or update.state == U.COMMITTED or self.closing:
+            return False
+        if update.state != U.FAILED and self.clock() >= update.deadline_at:
+            self._fail_update(TimeoutError("policy update runtime deadline exceeded"))
+        return update.state == U.FAILED
+
     def _candidate_ready(self, live: list[ReplicaDescriptor]) -> bool:
-        return len(live) == self.desired and all(
-            r.state == S.READY and r.loaded_model_path == self.policy_update.snapshot_path
-            for r in live
+        return (
+            bool(live)
+            and len(live) == self.desired
+            and all(
+                r.state == S.READY and r.loaded_model_path == self.policy_update.snapshot_path
+                for r in live
+            )
         )
 
     def _reconcile_policy(self) -> None:
@@ -179,6 +198,8 @@ class ReplicaManager:
                 return
             self._update_transition(U.RESTARTING)
             for replica in live:
+                if self._check_update_deadline():
+                    return
                 logger.info(
                     "restarting replica %s from snapshot %s",
                     replica.replica_id,
@@ -206,6 +227,8 @@ class ReplicaManager:
             if update.state != U.RESTARTING:
                 self._update_transition(U.RESTARTING)
             for _ in range(max(0, self.desired - len(live))):
+                if self._check_update_deadline():
+                    return
                 if not self._create():
                     break
 
@@ -228,11 +251,30 @@ class ReplicaManager:
             self._transition(replica, S.TERMINATED)
 
     def _fail(self, replica: ReplicaDescriptor, error: Exception) -> None:
+        update = self.policy_update
+        candidate_failure = (
+            not self.closing
+            and update is not None
+            and update.state in (U.RESTARTING, U.VERIFYING, U.PREPARED)
+            and replica.loaded_model_path == update.snapshot_path
+            and replica.state not in TERMINAL
+        )
         replica.error = str(error)
         self.last_error = str(error)
         self._transition(replica, S.FAILED)
         self.traffic.forget_replica(replica.replica_id)
         self._cleanup(replica)
+        if candidate_failure:
+            with self.traffic.lock:
+                update.candidate_failure_count += 1
+                if update.candidate_failure_count >= self.spec.candidate_start_max_failures:
+                    self._fail_update(
+                        RuntimeError(
+                            f"candidate failure budget exhausted "
+                            f"({update.candidate_failure_count}/"
+                            f"{self.spec.candidate_start_max_failures}): {error}"
+                        )
+                    )
 
     def _create(self) -> bool:
         model_path = self.committed_policy.model_path
@@ -280,11 +322,13 @@ class ReplicaManager:
         with self.mutation_lock:
             self.traffic.expire()
             if self._update_blocks_topology() and not self.closing:
-                if self.policy_update.state == U.FAILED:
+                if self._check_update_deadline():
                     return
                 if self.policy_update.state == U.REQUESTED:
                     self._update_transition(U.QUIESCING)
             for replica in list(self.traffic.replicas.values()):
+                if self._check_update_deadline():
+                    return
                 try:
                     if replica.state == S.FAILED:
                         if replica.resource is not None:
@@ -335,6 +379,8 @@ class ReplicaManager:
                     self._fail(replica, exc)
 
             if self._update_blocks_topology() and not self.closing:
+                if self._check_update_deadline():
+                    return
                 try:
                     self._reconcile_policy()
                 except Exception as exc:

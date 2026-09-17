@@ -5,6 +5,8 @@ from enum import Enum
 from math import isfinite
 from typing import Any
 
+DEFAULT_POLICY_UPDATE_TIMEOUT_S = 1800.0
+
 
 def nonnegative_int(value: int, name: str) -> None:
     if type(value) is not int or value < 0:
@@ -63,6 +65,8 @@ class PolicyUpdateDescriptor:
     target_replica_ids: tuple[str, ...] = ()
     committed_version: int | None = None
     history: list[str] = field(default_factory=lambda: ["REQUESTED"])
+    deadline_at: float | None = None
+    candidate_failure_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,8 @@ class DeploymentSpec:
     lease_ttl: float = 120.0
     drain_grace_period: float = 30.0
     sticky_cache_size: int = 10000
+    policy_update_runtime_timeout_s: float = DEFAULT_POLICY_UPDATE_TIMEOUT_S
+    candidate_start_max_failures: int = 8
 
     def __post_init__(self) -> None:
         if not self.deployment_id or any(
@@ -109,6 +115,10 @@ class DeploymentSpec:
             raise ValueError("sticky_cache_size must be positive")
         positive_seconds(self.lease_ttl, "lease_ttl")
         positive_seconds(self.drain_grace_period, "drain_grace_period", allow_zero=True)
+        positive_seconds(self.policy_update_runtime_timeout_s, "policy_update_runtime_timeout_s")
+        nonnegative_int(self.candidate_start_max_failures, "candidate_start_max_failures")
+        if self.candidate_start_max_failures == 0:
+            raise ValueError("candidate_start_max_failures must be positive")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DeploymentSpec":

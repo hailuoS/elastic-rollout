@@ -106,7 +106,9 @@ def areal_adapter(monkeypatch):
     stub_module(monkeypatch, "areal.infra.remote_inf_engine", RemoteInfEngine=RemoteBase)
     stub_module(monkeypatch, "areal.utils", logging=logging, stats_tracker=MagicMock())
     module = load_adapter(
-        monkeypatch, "areal_elastic_under_test", PACKAGE / "integrations/areal/inference_engine.py"
+        monkeypatch,
+        "elastic_rollout.integrations.areal.inference_engine",
+        PACKAGE / "integrations/areal/inference_engine.py",
     )
     control = MagicMock()
     control.status.return_value = {
@@ -341,8 +343,9 @@ def test_persistent_meta_preserves_exact_areal_contract(areal_adapter, tmp_path)
 
 
 @pytest.mark.parametrize("join_existing", [False, True])
+@pytest.mark.parametrize("custom_timeouts", [False, True])
 def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
-    areal_adapter, monkeypatch, tmp_path, join_existing
+    areal_adapter, monkeypatch, tmp_path, join_existing, custom_timeouts
 ):
     module, _ = areal_adapter
     engine = module.ElasticInferenceEngine(
@@ -354,13 +357,27 @@ def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
             trial_name="trial",
         )
     )
-    engine.initialize(addr="http://control", deployment_id="test")
+    timeouts = (
+        dict(
+            snapshot_export_timeout_s=2400,
+            policy_prepare_timeout_s=2100,
+            weight_update_callback_timeout_s=4560,
+        )
+        if custom_timeouts
+        else {}
+    )
+    engine.initialize(addr="http://control", deployment_id="test", weight_sync_config=timeouts)
+    elapsed = [0.0]
+    monkeypatch.setattr(module, "time", NS(monotonic=lambda: elapsed[0], sleep=MagicMock()))
     engine.control.status.return_value = {"policy": {"version": 7}}
     entered, exported = threading.Event(), threading.Event()
 
     def wait_for_export(key, timeout):
+        assert timeout == timeouts.get("snapshot_export_timeout_s", 1800)
         entered.set()
         assert exported.wait(2)
+        elapsed[0] += 500  # A slow export exceeds the previous 120s budget.
+        assert elapsed[0] < timeout
         return "done"
 
     names = NS(update_weights_from_disk=MagicMock(return_value="export-key"))
@@ -369,7 +386,7 @@ def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
     monkeypatch.setattr(utils, "names", names, raising=False)
     monkeypatch.setattr(utils, "name_resolve", name_resolve, raising=False)
     meta = actual_weight_meta_class()(
-        type="disk", path=str(tmp_path), clear_checkpoint_after_load=False
+        type="disk", path=str(tmp_path), clear_checkpoint_after_load=False, version=8
     )
     update = dict(update_id="u", base_version=7, snapshot_path=str(tmp_path), state="PREPARED")
     if join_existing:
@@ -377,6 +394,14 @@ def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
         engine.control.status.return_value["policy_update"] = update
     else:
         engine.control.begin_policy_update.return_value = update
+
+    def slow_prepare(update_id, timeout):
+        assert timeout == timeouts.get("policy_prepare_timeout_s", 1800)
+        elapsed[0] += 1000  # No real sleeping; exercise the configured budget.
+        assert timeout > 1000
+        return update
+
+    engine.control.wait_policy_update.side_effect = slow_prepare
     try:
         future = engine.update_weights_from_disk(meta)
         assert isinstance(future, Future)
@@ -391,10 +416,16 @@ def test_areal_future_waits_for_export_then_prepares_and_set_version_commits(
         engine.control.commit_policy_update.assert_not_called()
         engine.continue_generation()
         engine.control.commit_policy_update.assert_not_called()
+        with pytest.raises(ValueError, match="prepared snapshot version 8"):
+            engine.set_version(9)
+        engine.control.commit_policy_update.assert_not_called()
+        assert engine._pending_update == "u" and engine._pending_policy_version == 8
+        engine.set_version(7)  # Idempotent current-version call keeps the pending update.
         engine.set_version(8)
         engine.control.commit_policy_update.assert_called_once_with("u", 8)
         engine.set_version(8)
         assert engine._version == 8
+        assert engine._pending_update is None and engine._pending_policy_version is None
         assert (tmp_path / "model.safetensors").exists()
     finally:
         exported.set()
@@ -490,14 +521,16 @@ def test_train_callback_inherits_external_timeout_and_preserves_native_default()
         ["connect_engine"],
         {"RolloutCallback": NS, "logger": logging.getLogger("test")},
     )["connect_engine"]
-    for timeout in (None, 1200):
+    for timeout, override in ((None, None), (1200, None), (3660, 4560)):
         controller = NS(rollout=None, _custom_function_call=MagicMock())
         rollout = NS(callback_addr="controller:9000")
         if timeout is not None:
             rollout.inf_engine = NS(weight_update_timeout=timeout)
+        if override is not None:
+            rollout.weight_update_timeout = override
         method(controller, rollout, "meta")
         callback = controller._custom_function_call.call_args.kwargs["engine"]
-        assert callback.request_timeout == (600 if timeout is None else timeout)
+        assert callback.request_timeout == (override or timeout or 600)
 
 
 def test_rollout_controller_only_advances_version_after_success():
@@ -553,13 +586,22 @@ def test_elastic_trainer_selects_external_workers_and_rejects_unsafe_resume(
         rollout=NS(_version="v1"),
         recover=NS(mode="disabled"),
     )
-    trainer = module.ElasticPPOTrainer(config, "train", "valid", workflow_worker_count=3)
+    sync_config = module.WeightSyncConfig(2400, 2100, 4560)
+    trainer = module.ElasticPPOTrainer(
+        config, "train", "valid", workflow_worker_count=3, weight_sync_config=sync_config
+    )
     parent_init.assert_called_once_with(config, "train", "valid")
     trainer.scheduler = object()
     trainer._init_rollout(config.rollout)
     controller_factory = sys.modules["areal.infra"].RolloutController
     assert controller_factory.call_args.kwargs["inf_engine"] is adapter.ElasticInferenceEngine
     assert controller_factory.return_value.initialize.call_args.kwargs["workflow_worker_count"] == 3
+    assert controller_factory.return_value.weight_update_timeout == 4560
+    assert controller_factory.return_value.initialize.call_args.kwargs["weight_sync_config"] == {
+        "snapshot_export_timeout_s": 2400,
+        "policy_prepare_timeout_s": 2100,
+        "weight_update_callback_timeout_s": 4560,
+    }
     trainer._init_rollout(config.rollout, is_eval=True)
     assert controller_factory.call_args.kwargs["inf_engine"] is adapter.ElasticEvaluationEngine
     for mode, version in (("auto", 0), ("disabled", 1)):

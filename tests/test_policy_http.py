@@ -69,3 +69,35 @@ def test_wait_fails_immediately_on_failed_and_times_out(monkeypatch):
     client.get_policy_update.return_value = {"state": "QUIESCING"}
     with pytest.raises(TimeoutError):
         client.wait_policy_update("u", timeout=0)
+
+
+def test_zero_replica_update_is_http_conflict(http_runtime):
+    client, (controller, manager, _, clock) = http_runtime
+    client.set_desired_replicas(0)
+    controller.reconcile()
+    clock.now += manager.spec.drain_grace_period
+    controller.reconcile()
+    assert client.status()["total_replicas"] == 0
+    with pytest.raises(ControlError, match="at least one READY replica") as exc:
+        client.begin_policy_update("/unverified")
+    assert exc.value.status == 409
+    assert client.status()["policy_update"] is None
+
+
+def test_candidate_failure_is_visible_and_terminal_over_http(http_runtime):
+    from dataclasses import replace
+
+    client, (controller, manager, driver, _) = http_runtime
+    manager.spec = replace(manager.spec, candidate_start_max_failures=1)
+    update = client.begin_policy_update("/bad-snapshot")
+    driver.fail_launch = True
+    controller.reconcile()
+    observed = client.get_policy_update(update["update_id"])
+    assert observed["state"] == "FAILED" and observed["candidate_failure_count"] == 1
+    assert "budget exhausted" in observed["error"]
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        client.wait_policy_update(update["update_id"])
+    assert client.status()["policy"]["version"] == 0
+    with pytest.raises(ControlError) as exc:
+        client.acquire("failed-update")
+    assert exc.value.status == 503

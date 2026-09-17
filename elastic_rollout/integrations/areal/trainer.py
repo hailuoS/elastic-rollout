@@ -2,6 +2,7 @@
 
 import os
 from copy import deepcopy
+from dataclasses import asdict
 
 from areal.trainer.rl_trainer import PPOTrainer
 from areal.utils.environ import is_single_controller
@@ -9,10 +10,20 @@ from areal.utils.environ import is_single_controller
 from elastic_rollout.client import ControlClient
 
 from .inference_engine import ElasticEvaluationEngine, ElasticInferenceEngine
+from .weight_sync import WeightSyncConfig
 
 
 class ElasticPPOTrainer(PPOTrainer):
-    def __init__(self, config, train_dataset=None, valid_dataset=None, *, workflow_worker_count=2):
+    def __init__(
+        self,
+        config,
+        train_dataset=None,
+        valid_dataset=None,
+        *,
+        workflow_worker_count=2,
+        weight_sync_config: WeightSyncConfig | None = None,
+    ):
+        self._weight_sync_config = weight_sync_config or WeightSyncConfig()
         if not is_single_controller():
             raise ValueError("MVP-1 ElasticPPOTrainer requires AReaL single-controller mode")
         if (
@@ -49,10 +60,12 @@ class ElasticPPOTrainer(PPOTrainer):
             config.max_head_offpolicyness = int(1e12)
         engine_cls = ElasticEvaluationEngine if is_eval else ElasticInferenceEngine
         controller = engine_cls.as_controller(config, self.scheduler)
+        controller.weight_update_timeout = self._weight_sync_config.weight_update_callback_timeout_s
         controller.initialize(
             role="eval-rollout" if is_eval else "rollout",
             workflow_worker_count=self._elastic_workflow_workers,
             addr=os.environ["ELASTIC_ROLLOUT_ENDPOINT"],
             deployment_id=os.environ["ELASTIC_ROLLOUT_DEPLOYMENT"],
+            weight_sync_config=asdict(self._weight_sync_config),
         )
         return controller

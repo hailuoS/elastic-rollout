@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from .api import DeploymentSpec, RouteLease
+from .api import DEFAULT_POLICY_UPDATE_TIMEOUT_S, DeploymentSpec, RouteLease
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +107,10 @@ class ControlClient:
         )
 
     def wait_policy_update(
-        self, update_id: str, desired_state: str = "PREPARED", timeout: float = 900
+        self,
+        update_id: str,
+        desired_state: str = "PREPARED",
+        timeout: float = DEFAULT_POLICY_UPDATE_TIMEOUT_S,
     ) -> dict:
         deadline = time.monotonic() + timeout
         while True:

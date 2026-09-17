@@ -23,6 +23,8 @@ from elastic_rollout.api import nonnegative_int
 from elastic_rollout.client import ControlClient, ControlError
 from elastic_rollout.generation import GenerationClient
 
+from .weight_sync import WeightSyncConfig
+
 if TYPE_CHECKING:
     from areal.api import WeightUpdateMeta
 
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
 class ElasticInferenceEngine(RemoteInfEngine):
     # Read by the small capability hook in AReaL RolloutController.
     externally_managed_servers = True
-    weight_update_timeout = 1200.0  # Export notification + bounded prepare + callback margin.
+    weight_update_timeout = WeightSyncConfig().weight_update_callback_timeout_s
 
     def __init__(self, config):
         super().__init__(config, VLLMBackend())
@@ -44,6 +46,8 @@ class ElasticInferenceEngine(RemoteInfEngine):
         self._weight_lock = Lock()
         self._weight_future = None
         self._pending_update = None
+        self._pending_policy_version = None
+        self.weight_sync_config = WeightSyncConfig()
 
     @classmethod
     def prepare_weight_update_meta(cls, meta: WeightUpdateMeta) -> WeightUpdateMeta:
@@ -68,9 +72,11 @@ class ElasticInferenceEngine(RemoteInfEngine):
         engine_rank=None,
         num_engines=None,
         deployment_id=None,
+        weight_sync_config=None,
     ):
         if self.initialized:
             raise RuntimeError("engine already initialized")
+        self.weight_sync_config = WeightSyncConfig(**(weight_sync_config or {}))
         endpoint = addr or os.environ.get("ELASTIC_ROLLOUT_ENDPOINT")
         deployment = deployment_id or os.environ.get("ELASTIC_ROLLOUT_DEPLOYMENT")
         if not endpoint or not deployment:
@@ -138,7 +144,10 @@ class ElasticInferenceEngine(RemoteInfEngine):
             raise ValueError("MVP-1 requires a full-model, non-colocated disk snapshot")
         if meta.clear_checkpoint_after_load:
             raise ValueError("persistent snapshots require clear_checkpoint_after_load=False")
+        nonnegative_int(meta.version, "meta.version")
         with self._weight_lock:
+            if meta.version <= self._version:
+                raise ValueError("meta.version must exceed the current serving version")
             if self._pending_update or (self._weight_future and not self._weight_future.done()):
                 raise RuntimeError("a weight update is already pending")
             # The train engine exports AFTER this method returns. Waiting here
@@ -155,7 +164,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
             names.update_weights_from_disk(
                 self.config.experiment_name, self.config.trial_name, base_version
             ),
-            timeout=120,
+            timeout=self.weight_sync_config.snapshot_export_timeout_s,
         )
         snapshot = Path(meta.path)
         if not (snapshot / "config.json").is_file() or not (
@@ -164,7 +173,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
             raise ValueError(f"disk export is not a standalone HF model snapshot: {meta.path}")
         # Multiple CPU workflow workers receive the same AReaL collective RPC.
         # One begins the update; the rest join that exact snapshot/base version.
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + self.weight_sync_config.policy_prepare_timeout_s
         while True:
             status = self.control.status()
             if status["policy"]["version"] != base_version:
@@ -193,6 +202,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
         )
         with self._weight_lock:
             self._pending_update = update["update_id"]
+            self._pending_policy_version = meta.version
 
     def set_version(self, version: int) -> None:
         nonnegative_int(version, "version")
@@ -201,6 +211,11 @@ class ElasticInferenceEngine(RemoteInfEngine):
                 return
             if version < self._version or not self._pending_update:
                 raise RuntimeError("advancing version requires a PREPARED disk update")
+            if version != self._pending_policy_version:
+                raise ValueError(
+                    f"version {version} does not match prepared snapshot version "
+                    f"{self._pending_policy_version}"
+                )
             deadline = time.monotonic() + 45
             while True:
                 try:
@@ -216,6 +231,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
                     time.sleep(0.2)
             self._version = version
             self._pending_update = None
+            self._pending_policy_version = None
 
     def pause_generation(self) -> None:
         # Workflow pause is owned by AReaL; Core's prepare independently gates

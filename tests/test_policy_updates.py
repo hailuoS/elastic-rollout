@@ -108,6 +108,7 @@ def test_scale_and_crash_replacement_use_latest_committed_snapshot(runtime):
 def test_candidate_launch_failure_replaces_from_candidate_without_routes(runtime):
     controller, manager, driver, _ = runtime
     traffic = ready(runtime)
+    manager.spec = replace(manager.spec, candidate_start_max_failures=3)
     controller.begin_policy_update("test", SNAPSHOT)
     driver.fail_launch = True
     controller.reconcile()
@@ -118,6 +119,7 @@ def test_candidate_launch_failure_replaces_from_candidate_without_routes(runtime
         with pytest.raises(NoReadyReplica):
             traffic.acquire("blocked")
     assert manager.policy_update.state == U.PREPARED
+    assert manager.policy_update.candidate_failure_count == 2
     assert all(path == SNAPSHOT and version == 0 for _, path, version in driver.starts[2:])
     assert any(r.state == S.FAILED for r in traffic.replicas.values())
     assert manager.committed_policy.version == 0
@@ -153,6 +155,10 @@ def test_unrecoverable_stop_failure_is_closed_without_releasing_resources(runtim
         traffic.acquire("still-closed")
     with pytest.raises(PolicyConflict):
         controller.commit_policy_update("test", update["update_id"], 1)
+    manager.spec = replace(manager.spec, drain_grace_period=0)
+    controller.close(timeout=2)
+    assert manager.resources.allocated == 0
+    assert manager.policy_update.state == U.FAILED
 
 
 def test_conflicts_and_input_validation(runtime):
@@ -220,3 +226,97 @@ def test_shutdown_can_drain_an_active_update(runtime):
     controller.close(timeout=2)
     assert manager.resources.allocated == 0
     assert manager.policy_update.state == U.FAILED
+
+
+def test_permanent_candidate_failure_exhausts_budget_and_stays_terminal(runtime):
+    controller, manager, driver, _ = runtime
+    traffic = ready(runtime)
+    manager.spec = replace(manager.spec, candidate_start_max_failures=3)
+    update = controller.begin_policy_update("test", SNAPSHOT)
+    driver.fail_launch = True
+    for _ in range(5):
+        controller.reconcile()
+    status = manager.status()
+    assert status["policy_update"]["state"] == U.FAILED
+    assert status["policy_update"]["candidate_failure_count"] == 3
+    assert "budget exhausted (3/3): launch failed" in status["policy_update"]["error"]
+    assert status["policy"] == {"version": 0, "model_path": "model"}
+    assert len(driver.starts) == 5  # Two bootstrap starts plus three candidate attempts.
+    assert all(r.serving_policy_version == 0 for r in traffic.replicas.values())
+    driver.fail_launch = False
+    for _ in range(5):
+        controller.reconcile()
+    assert manager.status() == status
+    assert len(driver.starts) == 5
+    with pytest.raises(NoReadyReplica):
+        traffic.acquire("failed")
+    with pytest.raises(PolicyConflict):
+        controller.set_desired_replicas("test", 0)
+    with pytest.raises(PolicyConflict):
+        controller.commit_policy_update("test", update["update_id"], 1)
+
+
+@pytest.mark.parametrize("phase", ["REQUESTED", "QUIESCING", "RESTARTING", "PREPARED"])
+def test_runtime_deadline_is_terminal_in_every_active_phase(runtime, phase):
+    controller, manager, driver, clock = runtime
+    traffic = ready(runtime)
+    manager.spec = replace(manager.spec, policy_update_runtime_timeout_s=30)
+    if phase == "PREPARED":
+        update_id = prepare(runtime)
+    else:
+        update_id = controller.begin_policy_update("test", SNAPSHOT)["update_id"]
+        if phase == "QUIESCING":
+            driver.busy.update(driver.processes)
+            controller.reconcile()
+        elif phase == "RESTARTING":
+            controller.reconcile()
+            driver.healthy = False
+    assert manager.policy_update.state == phase
+    assert manager.policy_update.deadline_at == clock.now + 30
+    starts = len(driver.starts)
+    clock.now += 30
+    if phase == "PREPARED":
+        # A commit cannot outrun an expired deadline between reconcile ticks.
+        with pytest.raises(PolicyConflict, match="deadline"):
+            controller.commit_policy_update("test", update_id, 1)
+    for _ in range(3):
+        controller.reconcile()
+    assert manager.policy_update.state == U.FAILED
+    assert "deadline" in manager.policy_update.error
+    assert len(driver.starts) == starts
+    assert manager.committed_policy.version == 0
+    assert all(r.serving_policy_version == 0 for r in traffic.replicas.values())
+    assert not traffic.accepting_routes
+
+
+def test_zero_replicas_cannot_prepare_or_commit(runtime):
+    controller, manager, driver, _ = runtime
+    controller.set_desired_replicas("test", 0)
+    controller.reconcile()
+    with pytest.raises(PolicyConflict, match="at least one READY replica"):
+        controller.begin_policy_update("test", SNAPSHOT)
+    assert not manager._candidate_ready([])
+    assert manager.policy_update is None
+    assert not manager.policy_updates
+    assert not driver.starts
+    assert manager.traffic.accepting_routes  # Rejection has not begun a transaction.
+
+
+def test_candidate_startup_health_timeout_consumes_failure_budget(runtime):
+    controller, manager, driver, clock = runtime
+    ready(runtime)
+    manager.spec = replace(
+        manager.spec,
+        replica=replace(manager.spec.replica, startup_timeout=5),
+        candidate_start_max_failures=2,
+    )
+    controller.begin_policy_update("test", SNAPSHOT)
+    controller.reconcile()
+    driver.healthy = False
+    clock.now += 5
+    controller.reconcile()
+    assert manager.policy_update.state == U.FAILED
+    assert manager.policy_update.candidate_failure_count == 2
+    assert "startup/health timeout" in manager.policy_update.error
+    assert not manager.traffic.accepting_routes
+    assert len(driver.starts) == 4
