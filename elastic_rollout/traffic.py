@@ -100,3 +100,16 @@ class TrafficManager:
             for key, target in list(self.sticky.items()):
                 if target == replica_id:
                     del self.sticky[key]
+
+    def invalidate_replica(self, replica_id: str) -> int:
+        """Remove leases only after confirmed failure, never during normal drain."""
+        with self.lock:
+            if self.replicas[replica_id].state != ReplicaState.FAILED:
+                raise ValueError("only FAILED replicas can invalidate active leases")
+            self.forget_replica(replica_id)
+            leases = [
+                lease.lease_id for lease in self.leases.values() if lease.replica_id == replica_id
+            ]
+            for lease_id in leases:
+                self.release(lease_id)
+            return len(leases)

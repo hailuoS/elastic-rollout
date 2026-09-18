@@ -261,8 +261,16 @@ class ReplicaManager:
         )
         replica.error = str(error)
         self.last_error = str(error)
-        self._transition(replica, S.FAILED)
-        self.traffic.forget_replica(replica.replica_id)
+        # Renew/acquire must not see FAILED with still-active leases. Cleanup may
+        # block or fail, so invalidate before stopping/quarantining the process.
+        with self.traffic.lock:
+            self._transition(replica, S.FAILED)
+            invalidated = self.traffic.invalidate_replica(replica.replica_id)
+        logger.info(
+            "replica failed replica_id=%s invalidated_leases=%s",
+            replica.replica_id,
+            invalidated,
+        )
         self._cleanup(replica)
         if candidate_failure:
             with self.traffic.lock:

@@ -247,6 +247,18 @@ class ControlClient:
                 )
             except Exception as exc:
                 remaining = current.expires_at - time.time()
+                if isinstance(exc, ControlError) and exc.status in (404, 410):
+                    # A missing lease may have expired, been released or been
+                    # invalidated by a failed replica. Do not invent its cause.
+                    logger.warning(
+                        "route lease unavailable; heartbeat stopped "
+                        "lease_id=%s replica_id=%s status=%s",
+                        current.lease_id,
+                        current.replica_id,
+                        exc.status,
+                    )
+                    logger.debug("terminal lease renewal response", exc_info=True)
+                    return
                 retryable = (
                     500 <= exc.status < 600
                     if isinstance(exc, ControlError)

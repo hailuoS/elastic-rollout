@@ -127,6 +127,7 @@ def test_heartbeat_survives_default_executor_starvation(http_runtime, blocked_ge
         TimeoutError("temporary timeout"),
         ConnectionResetError("connection reset"),
         URLError("temporary connection failure"),
+        ControlError(500, "temporary controller failure"),
         ControlError(503, "temporarily unavailable"),
     ],
 )
