@@ -93,6 +93,7 @@ def areal_adapter(monkeypatch):
             self._initialized = False
             self.rid_to_address = {}
             self._version = 0
+            self._proxy_gateway_addr = None
 
         @property
         def initialized(self):
@@ -100,9 +101,13 @@ def areal_adapter(monkeypatch):
 
     # Verify inherited Controller callback submission using upstream implementation.
     methods = source_methods(
-        ROOT / "AReaL/areal/infra/remote_inf_engine.py", "RemoteInfEngine", ["submit"], {}
+        ROOT / "AReaL/areal/infra/remote_inf_engine.py",
+        "RemoteInfEngine",
+        ["submit", "set_proxy_gateway_addr", "_wrap_openai_agent"],
+        {},
     )
-    RemoteBase.submit = methods["submit"]
+    for name, method in methods.items():
+        setattr(RemoteBase, name, method)
     stub_module(monkeypatch, "areal.infra.remote_inf_engine", RemoteInfEngine=RemoteBase)
     stub_module(monkeypatch, "areal.utils", logging=logging, stats_tracker=MagicMock())
     module = load_adapter(
@@ -186,6 +191,7 @@ def test_areal_controller_preserves_native_and_decouples_external_workers(extern
     globals_dict = {
         "asyncio": asyncio,
         "asdict": asdict,
+        "deepcopy": copy.deepcopy,
         "SchedulingSpec": SchedulingSpec,
         "Job": NS,
         "run_async_task": lambda f, *a, **k: asyncio.run(f(*a, **k)),
@@ -223,7 +229,12 @@ def test_areal_controller_preserves_native_and_decouples_external_workers(extern
     instance._start_callback_server = MagicMock()
     instance._create_submit_callback = MagicMock()
     kwargs = (
-        {"workflow_worker_count": 2, "addr": "http://control", "deployment_id": "test"}
+        {
+            "workflow_worker_count": 2,
+            "addr": "http://control",
+            "deployment_id": "test",
+            "weight_sync_config": {"snapshot_export_timeout_s": 1800},
+        }
         if external
         else {}
     )
@@ -239,6 +250,15 @@ def test_areal_controller_preserves_native_and_decouples_external_workers(extern
         for call in scheduler.async_call_engine.call_args_list:
             assert call.kwargs["addr"] == "http://control"
             assert "workflow_worker_count" not in call.kwargs
+        assert set(instance._external_connection_params) == {
+            "addr",
+            "deployment_id",
+            "weight_sync_config",
+        }
+        kwargs["weight_sync_config"]["snapshot_export_timeout_s"] = 99
+        assert instance._external_connection_params["weight_sync_config"] == {
+            "snapshot_export_timeout_s": 1800,
+        }
     else:
         instance._collective_rpc_async.assert_awaited_once_with("launch_server", server_args=None)
 

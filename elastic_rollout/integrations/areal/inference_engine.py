@@ -37,7 +37,9 @@ class ElasticInferenceEngine(RemoteInfEngine):
     def __init__(self, config):
         super().__init__(config, VLLMBackend())
         if config.use_lora or config.return_routed_experts:
-            raise ValueError("MVP-0 supports text RolloutWorkflow without LoRA or expert replay")
+            raise ValueError(
+                "external inference supports text generation without LoRA or expert replay"
+            )
         if getattr(config, "_version", "v1") != "v1":
             raise ValueError("MVP-0 uses AReaL v1 WorkflowExecutor/Controller")
         self.control = None
@@ -47,6 +49,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
         self._weight_future = None
         self._pending_update = None
         self._pending_policy_version = None
+        self._policy_observer = False
         self.weight_sync_config = WeightSyncConfig()
 
     @classmethod
@@ -73,9 +76,13 @@ class ElasticInferenceEngine(RemoteInfEngine):
         num_engines=None,
         deployment_id=None,
         weight_sync_config=None,
+        policy_observer=False,
     ):
         if self.initialized:
             raise RuntimeError("engine already initialized")
+        if type(policy_observer) is not bool:
+            raise ValueError("policy_observer must be a boolean")
+        self._policy_observer = policy_observer
         self.weight_sync_config = WeightSyncConfig(**(weight_sync_config or {}))
         endpoint = addr or os.environ.get("ELASTIC_ROLLOUT_ENDPOINT")
         deployment = deployment_id or os.environ.get("ELASTIC_ROLLOUT_DEPLOYMENT")
@@ -140,6 +147,8 @@ class ElasticInferenceEngine(RemoteInfEngine):
         )
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        if self._policy_observer:
+            raise RuntimeError("policy observers cannot initiate weight updates")
         if meta.type != "disk" or not meta.path or meta.use_lora or meta.colocate_mode:
             raise ValueError("MVP-1 requires a full-model, non-colocated disk snapshot")
         if meta.clear_checkpoint_after_load:
@@ -207,6 +216,13 @@ class ElasticInferenceEngine(RemoteInfEngine):
     def set_version(self, version: int) -> None:
         nonnegative_int(version, "version")
         with self._weight_lock:
+            if self._policy_observer:
+                if version < self._version or self.control.status()["policy"]["version"] != version:
+                    raise RuntimeError("observer version must match the committed policy")
+                if version != self._version:
+                    self.logger.info("policy observer following committed version %s", version)
+                self._version = version
+                return
             if version == self._version:
                 return
             if version < self._version or not self._pending_update:
@@ -251,21 +267,22 @@ class ElasticInferenceEngine(RemoteInfEngine):
 
     def _unsupported(self, *args, **kwargs):
         raise NotImplementedError(
-            "MVP-0 external replicas support generation only; runtime owns lifecycle"
+            "external replicas support generation only; runtime owns physical lifecycle"
         )
 
     launch_server = teardown_server = _unsupported
     init_weights_update_group = update_weights_from_distributed = _unsupported
     update_weights_from_awex = _unsupported
     offload = onload = _unsupported
-    compute_logp = choose_server = set_proxy_gateway_addr = _unsupported
-    _wrap_openai_agent = _unsupported
+    compute_logp = choose_server = _unsupported
 
 
 class ElasticEvaluationEngine(ElasticInferenceEngine):
     """Evaluation observes the training deployment's already committed policy."""
 
     def set_version(self, version: int) -> None:
+        if self._policy_observer:
+            return super().set_version(version)
         nonnegative_int(version, "version")
         if version == self._version:
             return
