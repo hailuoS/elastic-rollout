@@ -19,6 +19,7 @@ AGENT_WORKFLOWS = {
 def run(endpoint, deployment, tokenizer_path, log_dir, agent="math", replicas=(2, 4, 2)):
     import torch
     from areal.api.cli_args import AgentConfig, InferenceEngineConfig
+    from areal.infra.rpc.rtensor import RTensor
     from areal.infra.scheduler.local import LocalScheduler
     from areal.infra.utils.http import validate_admin_api_key
 
@@ -47,6 +48,7 @@ def run(endpoint, deployment, tokenizer_path, log_dir, agent="math", replicas=(2
         max_head_offpolicyness=10**12,
         request_timeout=300,
         agent=AgentConfig(
+            agent_cls_path=AGENT_WORKFLOWS[agent],
             mode="inline",
             admin_api_key=key,
             export_style="individual",
@@ -90,6 +92,7 @@ def run(endpoint, deployment, tokenizer_path, log_dir, agent="math", replicas=(2
                 workflow=AGENT_WORKFLOWS[agent],
                 workflow_kwargs=generation_kwargs,
             )
+            trajectories = RTensor.localize(trajectories)
             assert len(trajectories) == 2
             generated = 0
             for trajectory in trajectories:
