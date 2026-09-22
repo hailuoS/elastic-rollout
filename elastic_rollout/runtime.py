@@ -32,6 +32,10 @@ class PolicyConflict(RuntimeError):
     pass
 
 
+class GenerationControlTimeout(TimeoutError):
+    pass
+
+
 class ServiceDriver(Protocol):
     def start(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> None: ...
     def alive(self, replica: ReplicaDescriptor) -> bool: ...
@@ -39,6 +43,8 @@ class ServiceDriver(Protocol):
     def warmup(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> bool: ...
     def idle(self, replica: ReplicaDescriptor) -> bool: ...
     def stop(self, replica: ReplicaDescriptor) -> None: ...
+    def pause_generation(self, replica: ReplicaDescriptor, *, timeout: float = 30) -> None: ...
+    def resume_generation(self, replica: ReplicaDescriptor, *, timeout: float = 30) -> None: ...
 
 
 class ReplicaManager:
@@ -56,6 +62,14 @@ class ReplicaManager:
         self.clock = clock
         self.traffic = TrafficManager(spec, clock)
         self.mutation_lock = threading.Lock()
+        # Serializes physical generation control with process incarnation changes.
+        # Lock order: generation -> mutation -> traffic. Serving lease operations
+        # only take traffic, never either lifecycle/control lock.
+        self.generation_lock = threading.Lock()
+        self.generation_paused = False
+        self._generation_control_failed = False
+        self._generation_pause_verified = False
+        self._generation_timeout_epoch = 0
         self.last_error: str | None = None
         self.committed_policy = PolicySnapshot(spec.replica.policy_version, spec.replica.model)
         self.policy_update: PolicyUpdateDescriptor | None = None
@@ -83,10 +97,115 @@ class ReplicaManager:
         # Preserve MVP-0 desired-state changes during normal reconciliation.
         # Begin/commit also hold this lock, so the policy gate is atomic here.
         with self.traffic.lock:
+            if "generation" in self.traffic.route_pause_reasons:
+                raise PolicyConflict("generation paused; topology is locked")
             if self._update_blocks_topology():
                 raise PolicyConflict("policy update active or failed; topology is locked")
             self.desired = count
             return self.status()
+
+    def pause_generation(self) -> dict:
+        return self._set_generation_paused(True)
+
+    def resume_generation(self) -> dict:
+        return self._set_generation_paused(False)
+
+    def _generation_timeout(self, action: str) -> GenerationControlTimeout:
+        with self.traffic.lock:
+            self.traffic.pause_routes("generation")
+            self._generation_control_failed = True
+            self._generation_timeout_epoch += 1
+            inflight = {rid: n for rid, n in self.traffic.inflight.items() if n}
+            self.last_error = (
+                f"generation {action} timed out after {self.spec.generation_control_timeout_s}s; "
+                f"inflight={sum(inflight.values())}; replica_ids={sorted(inflight)}"
+            )
+            return GenerationControlTimeout(self.last_error)
+
+    def _generation_remaining(self, deadline: float, action: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._generation_timeout(action)
+        return remaining
+
+    @contextmanager
+    def _generation_operation(self, deadline: float, action: str):
+        if not self.generation_lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise self._generation_timeout(action)
+        try:
+            yield
+        finally:
+            self.generation_lock.release()
+
+    def _set_generation_paused(self, paused: bool) -> dict:
+        action = "pause" if paused else "resume"
+        deadline = time.monotonic() + self.spec.generation_control_timeout_s
+        with self._generation_operation(deadline, action):
+            self._generation_remaining(deadline, action)
+            with self.traffic.lock:
+                if self.closing:
+                    raise PolicyConflict("controller is closing")
+                gated = "generation" in self.traffic.route_pause_reasons
+                if (
+                    paused
+                    and self._generation_pause_verified
+                    and not self._generation_control_failed
+                ) or (not paused and not gated):
+                    return self.status()
+                self.traffic.pause_routes("generation")
+                timeout_epoch = self._generation_timeout_epoch
+                targets = [
+                    r for r in self.traffic.replicas.values() if r.state in (S.READY, S.DRAINING)
+                ]
+            logger.info(
+                "generation %s requested deployment_id=%s targets=%s reason=generation",
+                action,
+                self.spec.deployment_id,
+                len(targets),
+            )
+            try:
+                control = self.driver.pause_generation if paused else self.driver.resume_generation
+                while True:
+                    for replica in targets:
+                        control(
+                            replica, timeout=min(30, self._generation_remaining(deadline, action))
+                        )
+                    self._generation_remaining(deadline, action)
+                    with self.traffic.lock:
+                        inflight = sum(self.traffic.inflight.values())
+                    if not paused or inflight == 0:
+                        break
+                    # Re-abort requests arriving after the previous pause. Keep
+                    # leases valid so their clients can receive partials and release.
+                    time.sleep(min(0.1, self._generation_remaining(deadline, action)))
+            except Exception as exc:
+                with self.traffic.lock:
+                    self._generation_control_failed = True
+                    self.last_error = f"generation {action} failed: {exc}"
+                # The request may have reached vLLM even if its response was lost.
+                # Keep the gate; explicit pause/resume retries address current targets.
+                if isinstance(exc, GenerationControlTimeout):
+                    raise
+                raise RuntimeError(self.last_error) from exc
+            with self.traffic.lock:
+                # A waiting caller may have timed out and closed admission while
+                # this operation was in I/O. Never undo that fail-closed decision.
+                if timeout_epoch != self._generation_timeout_epoch:
+                    raise GenerationControlTimeout(self.last_error)
+                self.generation_paused = paused
+                self._generation_pause_verified = paused
+                self._generation_control_failed = False
+                if not paused:
+                    self.traffic.resume_routes("generation")
+                status = self.status()
+            logger.info(
+                "generation %s complete deployment_id=%s targets=%s route_pause_reasons=%s",
+                action,
+                self.spec.deployment_id,
+                len(targets),
+                status["route_pause_reasons"],
+            )
+            return status
 
     def begin_policy_update(self, snapshot_path: str) -> dict:
         if not isinstance(snapshot_path, str) or not snapshot_path.strip():
@@ -114,7 +233,7 @@ class ReplicaManager:
             )
             self.policy_update = update
             self.policy_updates[update.update_id] = update
-            self.traffic.pause_routes()
+            self.traffic.pause_routes("policy_update")
             logger.info("policy update %s requested; routing paused", update.update_id)
             return asdict(update)
 
@@ -143,8 +262,12 @@ class ReplicaManager:
             self.traffic.sticky.clear()
             update.committed_version = policy_version
             self._update_transition(U.COMMITTED)
-            self.traffic.resume_routes()
-            logger.info("policy version %s COMMITTED; routing resumed", policy_version)
+            self.traffic.resume_routes("policy_update")
+            logger.info(
+                "policy version %s COMMITTED; route_pause_reasons=%s",
+                policy_version,
+                self.traffic.route_pause_reasons,
+            )
             return asdict(update)
 
     def _update_transition(self, state: PolicyUpdateState) -> None:
@@ -159,7 +282,7 @@ class ReplicaManager:
                 return
             self.policy_update.error = str(error)
             self.last_error = str(error)
-            self.traffic.pause_routes()
+            self.traffic.pause_routes("policy_update")
             self._update_transition(U.FAILED)
         logger.error("policy update FAILED: %s", error)
 
@@ -197,25 +320,7 @@ class ReplicaManager:
             if not all(self.driver.idle(r) for r in live):
                 return
             self._update_transition(U.RESTARTING)
-            for replica in live:
-                if self._check_update_deadline():
-                    return
-                logger.info(
-                    "restarting replica %s from snapshot %s",
-                    replica.replica_id,
-                    update.snapshot_path,
-                )
-                # Keep the logical lease and endpoint across the process restart.
-                # A stop error is fatal: never launch on possibly occupied devices.
-                self.driver.stop(replica)
-                replica.loaded_model_path = update.snapshot_path
-                replica.started_at = self.clock()
-                replica.health_failures = 0
-                self._transition(replica, S.STARTING)
-                try:
-                    self.driver.start(replica, self._effective_spec(update.snapshot_path))
-                except Exception as exc:
-                    self._fail(replica, exc)
+            self._prepare_policy_via_snapshot_restart(live)
             return
         if update.state in (U.RESTARTING, U.VERIFYING, U.PREPARED):
             if self._candidate_ready(live):
@@ -232,8 +337,34 @@ class ReplicaManager:
                 if not self._create():
                     break
 
+    def _prepare_policy_via_snapshot_restart(self, targets: list[ReplicaDescriptor]) -> None:
+        """Physical preparation only; the transaction retains the gate and commit.
+
+        Fresh processes are running (not physically paused). The generation route
+        gate survives restart, so warmup can run while logical continuations wait.
+        Snapshot health/warmup and candidate replacement reuse normal reconciliation.
+        """
+        snapshot_path = self.policy_update.snapshot_path
+        for replica in targets:
+            if self._check_update_deadline():
+                return
+            logger.info("restarting replica %s from snapshot %s", replica.replica_id, snapshot_path)
+            # Preserve the resource lease/endpoint, never a request's RouteLease.
+            # A stop error is fatal: never start on possibly occupied devices.
+            self.driver.stop(replica)
+            replica.loaded_model_path = snapshot_path
+            replica.started_at = self.clock()
+            replica.health_failures = 0
+            self._transition(replica, S.STARTING)
+            try:
+                self.driver.start(replica, self._effective_spec(snapshot_path))
+            except Exception as exc:
+                self._fail(replica, exc)
+
     def _transition(self, replica: ReplicaDescriptor, state: ReplicaState) -> None:
         with self.traffic.lock:
+            if state in (S.STARTING, S.READY):
+                self._generation_pause_verified = False
             replica.transition(state)
 
     def _cleanup(self, replica: ReplicaDescriptor) -> None:
@@ -327,7 +458,7 @@ class ReplicaManager:
     def reconcile(self) -> None:
         # A deployment has only one lifecycle mutation in progress. API handlers
         # merely change desired state; they never create/destroy processes.
-        with self.mutation_lock:
+        with self.generation_lock, self.mutation_lock:
             self.traffic.expire()
             if self._update_blocks_topology() and not self.closing:
                 if self._check_update_deadline():
@@ -424,6 +555,8 @@ class ReplicaManager:
                 "policy": asdict(self.committed_policy),
                 "policy_update": asdict(self.policy_update) if self.policy_update else None,
                 "accepting_routes": self.traffic.accepting_routes,
+                "generation_paused": self.generation_paused,
+                "route_pause_reasons": self.traffic.route_pause_reasons,
                 "desired_replicas": self.desired,
                 "ready_replicas": sum(r.state == S.READY for r in replicas),
                 "available_replicas": sum(r.state in (S.READY, S.DRAINING) for r in replicas),
@@ -474,6 +607,18 @@ class Controller:
                 raise PolicyConflict("controller is closing")
             return self.deployments[deployment_id].begin_policy_update(snapshot_path)
 
+    def _generation_manager(self, deployment_id: str) -> ReplicaManager:
+        with self._lock:
+            if self._closed:
+                raise PolicyConflict("controller is closing")
+            return self.deployments[deployment_id]
+
+    def pause_generation(self, deployment_id: str) -> dict:
+        return self._generation_manager(deployment_id).pause_generation()
+
+    def resume_generation(self, deployment_id: str) -> dict:
+        return self._generation_manager(deployment_id).resume_generation()
+
     def get_policy_update(self, deployment_id: str, update_id: str) -> dict:
         return self.deployments[deployment_id].get_policy_update(update_id)
 
@@ -493,11 +638,11 @@ class Controller:
         with self._lock:
             self._closed = True
             for manager in self.deployments.values():
-                with manager.mutation_lock, manager.traffic.lock:
+                with manager.generation_lock, manager.mutation_lock, manager.traffic.lock:
                     if manager._update_blocks_topology():
                         manager._fail_update(RuntimeError("controller shutting down"))
                     manager.closing = True
-                    manager.traffic.pause_routes()
+                    manager.traffic.pause_routes("shutdown")
                     manager.desired = 0
         deadline = time.monotonic() + timeout
         while True:

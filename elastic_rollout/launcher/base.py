@@ -7,6 +7,7 @@ from elastic_rollout.api import ResourceLease
 @dataclass(frozen=True)
 class LaunchPlan:
     argv: tuple[str, ...]
+    env: tuple[tuple[str, str], ...] = ()
 
 
 class ProcessLauncher(Protocol):

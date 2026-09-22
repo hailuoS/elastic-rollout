@@ -10,7 +10,7 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | MVP-0 | 固定权重生成、租约路由、手动扩缩容、故障补建、NPU 资源清理 | 已在你的目标环境验证 |
 | MVP-1 | 持久 HF 快照、重启加载、prepare/commit、更新后扩容和补副本追赶新权重 | 已在你的目标环境验证 |
 | **MVP-1.5A** | AReaL Agent Proxy、Proxy 跟随 committed policy、保守磁盘更新 | **当前需要做真机验证** |
-| MVP-1.5B | 中断生成、partial rollout、跨版本 continuation | 待 1.5A 验收后实现 |
+| **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **代码与本地回归已完成，待真机验收** |
 | MVP-2 | HCCL/XCCL 直接权重传输 | 未实现 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
@@ -20,7 +20,16 @@ verl 目前保留生成接入，Trainer/CheckpointEngine 权重同步尚不支�
 > 示例中的 `deployment_id: "mvp0"` 只是部署名称。使用该名称的现有部署也可以验证 MVP-1，
 > 不需要为了阶段名称改动已经跑通的配置。
 
-## 现在验证 MVP-1.5A，从这里开始
+## 现在验证 MVP-1.5B，从这里开始
+
+**[打开 MVP-1.5B 实现与验收报告](docs/mvp15b-validation.md)**：先验证 stock vLLM abort/resume，
+再验证跨版本 continuation，最后运行真实 AReaL RLVR / Agent 训练。
+报告包含 Rev2 逐项核对、并发语义、自动化测试和待真机确认的边界。
+
+Serving 基线为 **vLLM / vLLM-Ascend 0.23.x**。最新暂停排空语义、180 秒控制 RPC、
+迟到请求与 AcquireRoute 竞态修复见 [1.5B Hardening 报告](docs/mvp15b-hardening.md)。
+
+### MVP-1.5A Agent 基线回归
 
 **[打开 MVP-1.5A 验证手册](docs/mvp15a-validation.md)**，按阶段进行：
 
@@ -28,11 +37,12 @@ verl 目前保留生成接入，Trainer/CheckpointEngine 权重同步尚不支�
 2. **真实训练更新**：Agent v0 → 训练与持久快照 → drain/restart/commit → Proxy 跟随 v1。
 3. **故障补建回归**：确认最新策略副本恢复后 Agent 仍可工作。
 
-上述真机验收完成后再进入 1.5B；本轮保留 MVP-1 的保守排空，不启用生成中断。
+1.5A 手册保留原阶段基线；当前代码在训练更新时已经接入 1.5B planned abort，按新手册检查续接。
 
 | 文档 | 何时阅读 |
 | --- | --- |
-| [MVP-1.5A 验证手册](docs/mvp15a-validation.md) | 当前入口：Agent/Proxy、训练更新、阶段验收 |
+| [MVP-1.5B 实现与验收报告](docs/mvp15b-validation.md) | 当前入口：planned abort、跨版本续接、Rev2 核对 |
+| [MVP-1.5A 验证手册](docs/mvp15a-validation.md) | Agent/Proxy 基线回归 |
 | [MVP-1 验证手册](docs/mvp1-validation.md) | 已验收的权重同步基线与回归 |
 | [MVP-1 行为与配置参考](docs/mvp1-reference.md) | 查询状态机、HTTP API、超时和 AReaL 磁盘契约 |
 | [MVP-0 已验证基线](docs/mvp0-baseline.md) | 重建基础环境、查询 Ray/NPU 配置或回归固定权重生成 |
@@ -44,6 +54,7 @@ verl 目前保留生成接入，Trainer/CheckpointEngine 权重同步尚不支�
 - [areal_agent.py](examples/areal_agent.py)：固定权重 Agent Proxy 真机验证。
 - [areal_agent_train.py](examples/areal_agent_train.py)：原生 Math Agent 的 Elastic 训练入口。
 - [policy_update_smoke.py](examples/policy_update_smoke.py)：MVP-1 Core 真机验证工具。
+- [partial_rollout_smoke.py](examples/partial_rollout_smoke.py)：中断、恢复和跨版本续接验收。
 - [单机 TP2 配置](examples/runtime.single-node-tp2.json)：单台 8-NPU、最多四个 TP2 副本。
 
 ## 本地开发检查
@@ -63,5 +74,5 @@ ruff format --check .
 - 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
 - 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
 - 副本数手动调整，不含自动扩缩策略。
-- 不支持 verl Trainer 权重同步、HCCL、LoRA、多模态或跨版本 partial rollout；Agent Proxy 处于 1.5A 验收阶段。
+- 不支持 verl Trainer 权重同步、HCCL、LoRA、多模态；跨版本 partial rollout 与 Agent Proxy 仍需真机验收。
 - 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。

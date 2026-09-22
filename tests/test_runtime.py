@@ -25,6 +25,17 @@ class FakeDriver:
         self.fail_launch = False
         self.fail_stop = False
         self.starts = []
+        self.paused = set()
+        self.pause_calls = []
+        self.resume_calls = []
+
+    def pause_generation(self, replica, *, timeout=30):
+        self.pause_calls.append(replica.replica_id)
+        self.paused.add(replica.replica_id)
+
+    def resume_generation(self, replica, *, timeout=30):
+        self.resume_calls.append(replica.replica_id)
+        self.paused.discard(replica.replica_id)
 
     def start(self, replica, spec):
         self.starts.append((replica.replica_id, spec.replica.model, replica.serving_policy_version))
@@ -39,7 +50,7 @@ class FakeDriver:
         return self.healthy
 
     def warmup(self, replica, spec):
-        return True
+        return replica.replica_id not in self.paused
 
     def idle(self, replica):
         return replica.replica_id not in self.busy
@@ -48,6 +59,7 @@ class FakeDriver:
         if self.fail_stop:
             raise RuntimeError("stop failed")
         self.processes.discard(replica.replica_id)
+        self.paused.discard(replica.replica_id)
         self.stopped.append(replica.replica_id)
 
 

@@ -2,9 +2,13 @@
 
 import asyncio
 import math
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
-from .client import ControlClient, complete_on_cancel, request_json
+from .client import ControlClient, RoutingPaused, complete_on_cancel, request_json
+
+ResumeGate = Callable[[], Awaitable[None]]
 
 
 @dataclass
@@ -47,10 +51,34 @@ class GenerationClient:
         control: ControlClient,
         model: str,
         request_timeout: float = 300,
-        max_resume_attempts: int = 8,
+        max_stalled_aborts: int = 8,
+        wait_for_resume: ResumeGate | None = None,
     ):
         self.control, self.model = control, model
-        self.request_timeout, self.max_resume_attempts = request_timeout, max_resume_attempts
+        if type(max_stalled_aborts) is not int or max_stalled_aborts <= 0:
+            raise ValueError("max_stalled_aborts must be a positive integer")
+        self.request_timeout = request_timeout
+        self.max_stalled_aborts = max_stalled_aborts
+        self.wait_for_resume = wait_for_resume
+
+    @asynccontextmanager
+    async def _route(self, routing_key: str):
+        backoff = 0.1
+        while True:
+            async with AsyncExitStack() as stack:
+                try:
+                    lease = await stack.enter_async_context(self.control.route(routing_key))
+                except RoutingPaused:
+                    if self.wait_for_resume is not None:
+                        await self.wait_for_resume()
+                    # The framework callback may return before distributed pause
+                    # state catches up. Bound polling even with no callback.
+                    await asyncio.sleep(backoff)
+                    backoff = min(1.0, backoff * 2)
+                    continue
+                # Catch only failed admission, never generation/body/release errors.
+                yield lease
+                return
 
     async def generate(
         self, routing_key: str, prompt_ids: list[int], sampling_params: dict
@@ -70,7 +98,8 @@ class GenerationClient:
         if any(k in params for k in ("model", "prompt", "messages", "extra_body")):
             raise ValueError("sampling parameters cannot override model or prompt")
         result = Completion()
-        for _ in range(self.max_resume_attempts):
+        stalled_aborts = 0
+        while len(result.token_ids) < budget:
             payload = dict(
                 params,
                 model=self.model,
@@ -80,7 +109,7 @@ class GenerationClient:
                 logprobs=0,
                 return_tokens_as_token_ids=True,
             )
-            async with self.control.route(routing_key) as lease:
+            async with self._route(routing_key) as lease:
                 response = await complete_on_cancel(
                     asyncio.to_thread(
                         request_json,
@@ -102,6 +131,12 @@ class GenerationClient:
             if len(result.token_ids) >= budget:
                 result.finish_reason = "length"
                 return result
-            # Resume from complete token state, allowing cold rebinding after drain.
-            await asyncio.sleep(0.1)
-        raise RuntimeError("generation repeatedly aborted; resume budget exhausted")
+            stalled_aborts = 0 if segment.token_ids else stalled_aborts + 1
+            if stalled_aborts >= self.max_stalled_aborts:
+                raise RuntimeError("generation repeatedly aborted without token progress")
+            # Release the segment lease before waiting. Framework resume happens
+            # after policy commit; every continuation acquires a fresh route.
+            if self.wait_for_resume is not None:
+                await self.wait_for_resume()
+            else:
+                await asyncio.sleep(0.1)

@@ -35,7 +35,11 @@ def fake_ray(monkeypatch):
 def test_ray_reserves_npu_and_node_before_start(fake_ray, tp):
     launcher = RayProcessLauncher()
     replica, _ = replica_and_spec(tp=tp)
-    launcher.start("r", replica.resource, LaunchPlan(("python", "-m", "vllm")))
+    plan = LaunchPlan(("python", "-m", "vllm"), (("VLLM_SERVER_DEV_MODE", "1"),))
+    launcher.start("r", replica.resource, plan)
+    fake_ray.remote.return_value.options.return_value.remote.return_value.start.remote.assert_called_once_with(
+        plan.argv, tp, replica.resource.slot.port, dict(plan.env)
+    )
     options = fake_ray.remote.return_value.options.call_args.kwargs
     assert options["resources"] == {"NPU": tp}
     assert options["scheduling_strategy"] == {"node_id": "node", "soft": False}
@@ -114,6 +118,26 @@ def test_actor_retains_assignment_after_spawn_failure(fake_ray, monkeypatch):
     with pytest.raises(OSError, match="spawn failed"):
         actor.start(("python",), 2, 8000)
     assert actor.stop() == ("4", "5")
+
+
+def test_launch_environment_cannot_override_ray_devices(fake_ray, monkeypatch):
+    fake_ray.get_runtime_context.return_value.get_accelerator_ids.return_value = {"NPU": ["5", "4"]}
+    monkeypatch.setattr("elastic_rollout.launcher.ray.os.name", "posix")
+    monkeypatch.setattr("elastic_rollout.launcher.ray.socket.socket", MagicMock())
+    popen = MagicMock()
+    monkeypatch.setattr("elastic_rollout.launcher.ray.subprocess.Popen", popen)
+    _ProcessActor().start(
+        ("python",),
+        2,
+        8000,
+        {
+            "VLLM_SERVER_DEV_MODE": "1",
+            "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+        },
+    )
+    env = popen.call_args.kwargs["env"]
+    assert env["ASCEND_RT_VISIBLE_DEVICES"] == "4,5"
+    assert env["VLLM_SERVER_DEV_MODE"] == "1"
 
 
 @pytest.mark.parametrize("start_failed", [False, True])

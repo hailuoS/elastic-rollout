@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from .api import DeploymentSpec
-from .runtime import Controller, PolicyConflict
-from .traffic import NoReadyReplica
+from .runtime import Controller, GenerationControlTimeout, PolicyConflict
+from .traffic import NoReadyReplica, RoutingPaused
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,10 @@ def make_server(
                         result = controller.set_desired_replicas(
                             deployment_id, body.get("desired_replicas")
                         )
+                    elif tail == ["generation", "pause"] and self.command == "POST":
+                        result = controller.pause_generation(deployment_id)
+                    elif tail == ["generation", "resume"] and self.command == "POST":
+                        result = controller.resume_generation(deployment_id)
                     elif tail == ["policy-updates"] and self.command == "POST":
                         result = controller.begin_policy_update(
                             deployment_id, body.get("snapshot_path")
@@ -105,6 +109,17 @@ def make_server(
                         self._reply(404, {"error": "unknown control endpoint"})
                         return
                 self._reply(200, result)
+            except RoutingPaused as exc:
+                self._reply(
+                    503,
+                    {
+                        "error": str(exc),
+                        "code": "ROUTING_PAUSED",
+                        "route_pause_reasons": exc.reasons,
+                    },
+                )
+            except GenerationControlTimeout as exc:
+                self._reply(504, {"error": str(exc), "code": "GENERATION_CONTROL_TIMEOUT"})
             except NoReadyReplica as exc:
                 self._reply(503, {"error": str(exc)})
             except PolicyConflict as exc:

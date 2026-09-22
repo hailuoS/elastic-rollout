@@ -14,7 +14,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from .api import DEFAULT_POLICY_UPDATE_TIMEOUT_S, DeploymentSpec, RouteLease
+from .api import (
+    DEFAULT_POLICY_UPDATE_TIMEOUT_S,
+    GENERATION_CONTROL_RPC_TIMEOUT_S,
+    DeploymentSpec,
+    RouteLease,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,10 @@ class ControlError(RuntimeError):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+class RoutingPaused(ControlError):
+    """An explicit, rejected AcquireRoute during a planned pause; no lease was created."""
 
 
 def request_json(
@@ -118,6 +127,16 @@ class ControlClient:
     def set_desired_replicas(self, count: int) -> dict:
         return self._request(self.path + "/desired", "PUT", {"desired_replicas": count})
 
+    def pause_generation(self) -> dict:
+        return self._request(
+            self.path + "/generation/pause", "POST", {}, timeout=GENERATION_CONTROL_RPC_TIMEOUT_S
+        )
+
+    def resume_generation(self) -> dict:
+        return self._request(
+            self.path + "/generation/resume", "POST", {}, timeout=GENERATION_CONTROL_RPC_TIMEOUT_S
+        )
+
     def begin_policy_update(self, snapshot_path: str) -> dict:
         return self._request(
             self.path + "/policy-updates", "POST", {"snapshot_path": snapshot_path}
@@ -153,9 +172,26 @@ class ControlClient:
             time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
     def acquire(self, routing_key: str) -> RouteLease:
-        return RouteLease(
-            **self._request(self.path + "/routes", "POST", {"routing_key": routing_key})
-        )
+        try:
+            result = self._request(self.path + "/routes", "POST", {"routing_key": routing_key})
+        except ControlError as exc:
+            # Only a structured rejection proves no lease was created. Never
+            # infer this from an arbitrary 503 or retry an ambiguous network error.
+            try:
+                detail = json.loads(str(exc))
+            except (ValueError, TypeError):
+                detail = None
+            if isinstance(detail, dict) and exc.status == 503:
+                reasons = detail.get("route_pause_reasons")
+                if (
+                    detail.get("code") == "ROUTING_PAUSED"
+                    and isinstance(reasons, list)
+                    and reasons
+                    and all(r in ("generation", "policy_update") for r in reasons)
+                ):
+                    raise RoutingPaused(exc.status, str(exc)) from exc
+            raise
+        return RouteLease(**result)
 
     def release(self, lease_id: str) -> bool:
         return self._request(self.path + f"/leases/{quote(lease_id, safe='')}", "DELETE")[

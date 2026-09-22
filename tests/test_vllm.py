@@ -28,6 +28,7 @@ def test_launch_plan_fixed_topology_and_separate_launcher(tp):
     driver.start(replica, spec)
     args = launcher.start.call_args.args
     argv = args[2].argv
+    assert dict(args[2].env)["VLLM_SERVER_DEV_MODE"] == "1"
     assert args[:2] == ("r", replica.resource)
     assert argv[argv.index("--tensor-parallel-size") + 1] == str(tp)
     assert argv[argv.index("--pipeline-parallel-size") + 1] == "1"
@@ -80,3 +81,31 @@ def test_pending_launcher_never_becomes_healthy_from_existing_port():
     replica, _ = replica_and_spec()
     assert not VLLMServiceDriver(launcher, control).health(replica)
     control.health.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "action,path",
+    [
+        ("pause_generation", "/pause?mode=abort"),
+        ("resume_generation", "/resume"),
+    ],
+)
+def test_planned_generation_control(monkeypatch, action, path):
+    paused = action == "pause_generation"
+    request = MagicMock(side_effect=[{"is_paused": not paused}, {}, {"is_paused": paused}])
+    monkeypatch.setattr("elastic_rollout.engine.vllm.request_json", request)
+    replica, _ = replica_and_spec()
+    replica.endpoint = "http://vllm"
+    driver = VLLMServiceDriver(MagicMock())
+    getattr(driver, action)(replica)
+    calls = request.call_args_list
+    assert [c.args[0] for c in calls] == [
+        "http://vllm/is_paused",
+        "http://vllm" + path,
+        "http://vllm/is_paused",
+    ]
+    assert calls[1].args[1:] == ("POST", {})
+    assert 0 < calls[2].kwargs["timeout"] <= calls[1].kwargs["timeout"] <= 30
+    request.side_effect = [{"is_paused": False}, TimeoutError("control timed out")]
+    with pytest.raises(TimeoutError):
+        getattr(driver, action)(replica)

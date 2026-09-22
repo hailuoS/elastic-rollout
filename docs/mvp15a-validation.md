@@ -1,5 +1,8 @@
 # MVP-1.5A：AReaL Agent Proxy 验证
 
+> 本文保留 1.5A 阶段基线。当前代码已接入 planned abort；更新时的行为、测试与验收入口见
+> [MVP-1.5B 报告](mvp15b-validation.md)。下文“尚未实现 B / 保守排空”的描述仅适用于原基线。
+
 ## 文档审查与本轮范围
 
 基线为 `b500ac6`，MVP-1 已由用户在 Ascend 真机验收。本轮只实现 MVP-1.5A，

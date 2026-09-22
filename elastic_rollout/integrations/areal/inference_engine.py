@@ -97,6 +97,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
             self.control,
             status["spec"]["replica"]["served_model_name"],
             request_timeout=self.config.request_timeout,
+            wait_for_resume=self._wait_for_workflow_resume,
         )
         self.engine_id = engine_id or uuid4().hex
         self.logger = logging.getLogger(f"[RemoteInfEngine Rank {self.engine_id}]")
@@ -123,8 +124,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
         )
         if request.gconfig.max_new_tokens <= 0:
             raise ValueError("prompt leaves no generation token budget")
-        while self.workflow_executor.is_paused():
-            await asyncio.sleep(0.05)
+        await self._wait_for_workflow_resume()
         http_request = self.backend.build_generation_request(
             request, with_lora=False, version=self._version
         )
@@ -250,13 +250,14 @@ class ElasticInferenceEngine(RemoteInfEngine):
             self._pending_policy_version = None
 
     def pause_generation(self) -> None:
-        # Workflow pause is owned by AReaL; Core's prepare independently gates
-        # routes and drains existing requests without aborting vLLM generation.
-        pass
+        self.control.pause_generation()
 
     def continue_generation(self) -> None:
-        # TrainEngine calls this before set_version; Core must remain paused.
-        pass
+        self.control.resume_generation()
+
+    async def _wait_for_workflow_resume(self) -> None:
+        while self.workflow_executor.is_paused():
+            await asyncio.sleep(0.05)
 
     def destroy(self):
         self._weight_executor.shutdown(wait=True, cancel_futures=True)

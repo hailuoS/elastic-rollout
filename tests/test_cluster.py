@@ -44,3 +44,27 @@ def test_real_areal_agent_proxy_2_4_2(agent, tmp_path):
     )
     assert [step["replicas"] for step in result] == [2, 4, 2]
     assert all(step["workflow_workers"] == step["proxy_workers"] == 2 for step in result)
+
+
+@pytest.mark.cluster
+def test_real_partial_rollout_across_policy_update():
+    if os.environ.get("ELASTIC_PARTIAL_E2E") != "1":
+        pytest.skip("requires ELASTIC_PARTIAL_E2E=1, stock vLLM and a shared candidate snapshot")
+    from elastic_rollout.client import ControlClient
+    from examples.partial_rollout_smoke import run
+
+    client = ControlClient(
+        os.environ["ELASTIC_ROLLOUT_ENDPOINT"],
+        os.environ["ELASTIC_ROLLOUT_DEPLOYMENT"],
+        os.environ.get("ELASTIC_ROLLOUT_TOKEN"),
+        timeout=180,
+    )
+    result = asyncio.run(
+        run(
+            client,
+            json.loads(os.environ["ELASTIC_E2E_PROMPT_IDS"]),
+            snapshot=os.environ["ELASTIC_PARTIAL_SNAPSHOT"],
+            version=int(os.environ["ELASTIC_PARTIAL_VERSION"]),
+        )
+    )
+    assert len(result["version_token_counts"]) == 2

@@ -1,6 +1,7 @@
-"""MVP-0 uses stock health/completions/metrics, with no version-specific RL APIs."""
+"""Stock vLLM serving and planned-abort control; no framework-specific worker APIs."""
 
 import re
+import time
 from typing import Protocol
 from urllib.request import urlopen
 
@@ -13,9 +14,45 @@ class VLLMControlPlane(Protocol):
     def health(self, endpoint: str) -> bool: ...
     def warmup(self, endpoint: str, model: str) -> bool: ...
     def idle(self, endpoint: str) -> bool: ...
+    def pause_generation(self, endpoint: str, *, timeout: float = 30) -> None: ...
+    def resume_generation(self, endpoint: str, *, timeout: float = 30) -> None: ...
 
 
 class StandardVLLMControl:
+    def is_paused(self, endpoint: str, *, timeout: float = 3) -> bool:
+        try:
+            result = request_json(endpoint + "/is_paused", timeout=timeout)
+            if not isinstance(result, dict) or type(result.get("is_paused")) is not bool:
+                raise ValueError("expected boolean is_paused")
+            return result["is_paused"]
+        except Exception as exc:
+            raise RuntimeError(
+                f"replica {endpoint} does not satisfy MVP-1.5B vLLM 0.23 control capability: "
+                f"GET /is_paused failed: {exc}"
+            ) from exc
+
+    def _set_paused(self, endpoint: str, paused: bool, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError("vLLM generation control deadline exceeded")
+            return value
+
+        self.is_paused(endpoint, timeout=remaining())  # Capability check before relying on control.
+        path = "/pause?mode=abort" if paused else "/resume"
+        # Always send abort, even when already paused: late admissions may now be queued.
+        request_json(endpoint + path, "POST", {}, timeout=remaining())
+        if self.is_paused(endpoint, timeout=remaining()) != paused:
+            raise RuntimeError(f"vLLM {endpoint} did not confirm is_paused={paused}")
+
+    def pause_generation(self, endpoint: str, *, timeout: float = 30) -> None:
+        self._set_paused(endpoint, True, timeout)
+
+    def resume_generation(self, endpoint: str, *, timeout: float = 30) -> None:
+        self._set_paused(endpoint, False, timeout)
+
     def health(self, endpoint: str) -> bool:
         try:
             with urlopen(endpoint + "/health", timeout=3) as response:
@@ -122,7 +159,7 @@ class VLLMServiceDriver:
             "priority",
             *shape.vllm_args,
         )
-        return LaunchPlan(argv)
+        return LaunchPlan(argv, env=(("VLLM_SERVER_DEV_MODE", "1"),))
 
     def start(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> None:
         self.launcher.start(
@@ -143,3 +180,9 @@ class VLLMServiceDriver:
 
     def stop(self, replica: ReplicaDescriptor) -> None:
         self.launcher.stop(replica.replica_id)
+
+    def pause_generation(self, replica: ReplicaDescriptor, *, timeout: float = 30) -> None:
+        self.control.pause_generation(replica.endpoint, timeout=timeout)
+
+    def resume_generation(self, replica: ReplicaDescriptor, *, timeout: float = 30) -> None:
+        self.control.resume_generation(replica.endpoint, timeout=timeout)

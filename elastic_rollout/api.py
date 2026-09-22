@@ -6,6 +6,8 @@ from math import isfinite
 from typing import Any
 
 DEFAULT_POLICY_UPDATE_TIMEOUT_S = 1800.0
+GENERATION_CONTROL_RPC_TIMEOUT_S = 180.0
+MAX_GENERATION_CONTROL_TIMEOUT_S = 150.0
 
 
 def nonnegative_int(value: int, name: str) -> None:
@@ -102,6 +104,7 @@ class DeploymentSpec:
     sticky_cache_size: int = 10000
     policy_update_runtime_timeout_s: float = DEFAULT_POLICY_UPDATE_TIMEOUT_S
     candidate_start_max_failures: int = 8
+    generation_control_timeout_s: float = MAX_GENERATION_CONTROL_TIMEOUT_S
 
     def __post_init__(self) -> None:
         if not self.deployment_id or any(
@@ -119,6 +122,9 @@ class DeploymentSpec:
         nonnegative_int(self.candidate_start_max_failures, "candidate_start_max_failures")
         if self.candidate_start_max_failures == 0:
             raise ValueError("candidate_start_max_failures must be positive")
+        positive_seconds(self.generation_control_timeout_s, "generation_control_timeout_s")
+        if self.generation_control_timeout_s > MAX_GENERATION_CONTROL_TIMEOUT_S:
+            raise ValueError("generation_control_timeout_s must be <= 150s (RPC timeout is 180s)")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DeploymentSpec":

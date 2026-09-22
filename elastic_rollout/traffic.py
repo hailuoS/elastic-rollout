@@ -14,6 +14,12 @@ class NoReadyReplica(RuntimeError):
     pass
 
 
+class RoutingPaused(NoReadyReplica):
+    def __init__(self, reasons: tuple[str, ...]):
+        super().__init__("routing is paused: " + ",".join(reasons))
+        self.reasons = reasons
+
+
 class TrafficManager:
     def __init__(self, spec: DeploymentSpec, clock: Callable[[], float] = time.time):
         self.spec = spec
@@ -23,15 +29,25 @@ class TrafficManager:
         self.sticky: OrderedDict[str, str] = OrderedDict()
         self.leases: dict[str, RouteLease] = {}
         self.inflight: dict[str, int] = {}
-        self.accepting_routes = True
+        self._pause_reasons: set[str] = set()
 
-    def pause_routes(self) -> None:
+    @property
+    def accepting_routes(self) -> bool:
         with self.lock:
-            self.accepting_routes = False
+            return not self._pause_reasons
 
-    def resume_routes(self) -> None:
+    @property
+    def route_pause_reasons(self) -> tuple[str, ...]:
         with self.lock:
-            self.accepting_routes = True
+            return tuple(sorted(self._pause_reasons))
+
+    def pause_routes(self, reason: str) -> None:
+        with self.lock:
+            self._pause_reasons.add(reason)
+
+    def resume_routes(self, reason: str) -> None:
+        with self.lock:
+            self._pause_reasons.discard(reason)
 
     def expire(self) -> None:
         with self.lock:
@@ -45,7 +61,7 @@ class TrafficManager:
         with self.lock:
             self.expire()
             if not self.accepting_routes:
-                raise NoReadyReplica("policy update in progress or failed; routing is paused")
+                raise RoutingPaused(self.route_pause_reasons)
             replica = self.replicas.get(self.sticky.get(routing_key, ""))
             if replica is not None and not (
                 replica.state == ReplicaState.READY

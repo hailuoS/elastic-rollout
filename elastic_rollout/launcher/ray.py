@@ -15,7 +15,9 @@ class _ProcessActor:
         self.process = None
         self.actual_device_ids: tuple[str, ...] = ()
 
-    def start(self, argv: tuple[str, ...], num_devices: int, port: int) -> tuple[str, ...]:
+    def start(
+        self, argv: tuple[str, ...], num_devices: int, port: int, env: dict | None = None
+    ) -> tuple[str, ...]:
         import ray
 
         if os.name != "posix":
@@ -36,6 +38,8 @@ class _ProcessActor:
             )
         self.actual_device_ids = tuple(sorted(assigned, key=int))
         child_env = os.environ.copy()
+        child_env.update(env or {})
+        # Launch capabilities cannot override Ray's physical device assignment.
         child_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(self.actual_device_ids)
         # Refuse an already occupied API port before any health probe can
         # accidentally identify a pre-existing server as our new replica.
@@ -98,7 +102,9 @@ class RayProcessLauncher:
         )
         self.actors[replica_id] = actor
         self.leases[replica_id] = lease
-        self.starts[replica_id] = actor.start.remote(plan.argv, slot.num_devices, slot.port)
+        self.starts[replica_id] = actor.start.remote(
+            plan.argv, slot.num_devices, slot.port, dict(plan.env)
+        )
 
     def started(self, replica_id: str) -> bool:
         ready, _ = self.ray.wait([self.starts[replica_id]], timeout=0)
