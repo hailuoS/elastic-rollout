@@ -42,11 +42,18 @@ class ReplicaState(str, Enum):
 class PolicyUpdateState(str, Enum):
     REQUESTED = "REQUESTED"
     QUIESCING = "QUIESCING"
+    PREPARING = "PREPARING"
+    TRANSFERRING = "TRANSFERRING"
     RESTARTING = "RESTARTING"
     VERIFYING = "VERIFYING"
     PREPARED = "PREPARED"
     COMMITTED = "COMMITTED"
     FAILED = "FAILED"
+
+
+class PolicyPreparationKind(str, Enum):
+    SNAPSHOT_RESTART = "SNAPSHOT_RESTART"
+    EXTERNAL_HCCL = "EXTERNAL_HCCL"
 
 
 @dataclass(frozen=True)
@@ -60,7 +67,7 @@ class PolicyUpdateDescriptor:
     update_id: str
     deployment_id: str
     base_version: int
-    snapshot_path: str
+    snapshot_path: str | None
     state: PolicyUpdateState = PolicyUpdateState.REQUESTED
     started_at: float = 0.0
     error: str | None = None
@@ -69,6 +76,8 @@ class PolicyUpdateDescriptor:
     history: list[str] = field(default_factory=lambda: ["REQUESTED"])
     deadline_at: float | None = None
     candidate_failure_count: int = 0
+    preparation_kind: PolicyPreparationKind = PolicyPreparationKind.SNAPSHOT_RESTART
+    target_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -81,8 +90,11 @@ class ReplicaSpec:
     startup_timeout: float = 600.0
     python_executable: str = "python"
     vllm_args: tuple[str, ...] = ()
+    weight_sync: str = "snapshot"
 
     def __post_init__(self) -> None:
+        if self.weight_sync not in ("snapshot", "hccl"):
+            raise ValueError("weight_sync must be snapshot or hccl")
         if not self.model or not self.served_model_name or not self.python_executable:
             raise ValueError("model, served_model_name and python_executable are required")
         if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size <= 0:
@@ -200,6 +212,7 @@ class ReplicaDescriptor:
     resource: ResourceLease | None = None
     allocation: ResourceAllocation | None = None
     loaded_model_path: str = ""
+    loaded_policy_version: int | None = None
     started_at: float = 0.0
     drain_deadline: float | None = None
     error: str | None = None

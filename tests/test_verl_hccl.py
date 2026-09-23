@@ -1,0 +1,585 @@
+import asyncio
+import json
+import sys
+import threading
+import time
+from types import SimpleNamespace as NS
+
+import pytest
+from test_hccl_transfer import cleanup_subprocess
+from test_integrations import PACKAGE, ROOT, load_adapter, source_methods, stub_module
+
+
+@pytest.fixture
+def adapters(monkeypatch):
+    stub_module(monkeypatch, "verl")
+    stub_module(monkeypatch, "verl.checkpoint_engine")
+    stub_module(
+        monkeypatch,
+        "verl.checkpoint_engine.base",
+        CheckpointEngine=object,
+        CheckpointEngineRegistry=NS(register=lambda name: lambda cls: cls),
+    )
+    stub_module(monkeypatch, "verl.utils")
+    stub_module(monkeypatch, "verl.utils.ray_utils", auto_await=lambda f: f)
+    stub_module(monkeypatch, "ray", get=lambda values: values)
+    sender = load_adapter(
+        monkeypatch, "elastic_test_hccl", PACKAGE / "integrations/verl/hccl_checkpoint_engine.py"
+    )
+    manager = load_adapter(
+        monkeypatch, "elastic_test_checkpoint", PACKAGE / "integrations/verl/checkpoint_manager.py"
+    )
+    return sender, manager
+
+
+class Tensor:
+    dtype = "torch.bfloat16"
+    shape = (4,)
+
+    def numel(self):
+        return 4
+
+    def element_size(self):
+        return 2
+
+
+def test_bucket_data_metadata_order_and_oversized(adapters):
+    module, _ = adapters
+    weights = [(f"weight.{i}", Tensor()) for i in range(8)]
+    groups = list(module.weight_groups(iter(weights), 16, 32768, True, 2))
+    assert [n for b, _ in groups for n, _ in b] == [n for n, _ in weights]
+    assert all(len(b) == 2 for b, _ in groups)
+    assert all(info["shapes"] == [[4], [4]] for _, info in groups)
+    long = [("x" * 80 + str(i), Tensor()) for i in range(8)]
+    groups = list(module.weight_groups(iter(long), 1024, 320, True, 2))
+    assert all(len(json.dumps(info).encode()) <= 320 for _, info in groups)
+    with pytest.raises(ValueError, match="bucket"):
+        list(module.weight_groups(iter(weights), 4, 32768, True, 2))
+
+
+def test_nonmaster_exhausts_iterator_without_sender_import(adapters):
+    module, _ = adapters
+    engine = module.ElasticHCCLCheckpointEngine(16, endpoint="http://control", deployment_id="test")
+    engine.session = {"target_version": 1}
+    consumed = []
+
+    def weights():
+        for i in range(9):
+            consumed.append(i)
+            yield str(i), Tensor()
+
+    assert asyncio.run(engine.send_weights(weights(), global_steps=1)) == {}
+    assert consumed == list(range(9))
+
+
+def test_sender_receives_overlap_and_releases_buckets(adapters, monkeypatch):
+    module, _ = adapters
+    barrier = threading.Barrier(2)
+    sent, received = [], []
+
+    def broadcast(iterator, args):
+        bucket = list(iterator)
+        assert all(t.numel() == 4 for _, t in bucket)
+        barrier.wait(timeout=3)
+        sent.extend(n for n, _ in bucket)
+
+    def control(uid, action, **kwargs):
+        assert action == "group"
+        received.extend(kwargs["update_info"]["names"])
+        barrier.wait(timeout=3)
+
+    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    for path in (
+        "vllm_ascend",
+        "vllm_ascend.distributed",
+        "vllm_ascend.distributed.weight_transfer",
+    ):
+        stub_module(monkeypatch, path)
+    stub_module(
+        monkeypatch,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        HCCLWeightTransferEngine=NS(trainer_send_weights=broadcast),
+    )
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, True, endpoint="http://control", deployment_id="test"
+    )
+    engine.session = dict(target_version=1, update_id="u", session_id="s")
+    engine.control.transfer_operation = control
+    metrics = asyncio.run(engine.send_weights(((str(i), Tensor()) for i in range(6)), 1))
+    assert sent == received == list(map(str, range(6)))
+    assert metrics["elastic_hccl/bytes_transferred"] == 48
+    assert metrics["elastic_hccl/num_weight_groups"] == 3
+
+
+def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
+    _, module = adapters
+    events = []
+    clock = NS(now=0.0)
+    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now))
+
+    class Control:
+        def status(self):
+            clock.now += 3
+            return {"inflight": 0}
+
+        def begin_external_update(self, version):
+            clock.now += 2
+            self.version = version
+            events.append("begin")
+            return {"update_id": "u"}
+
+        def pause_generation(self):
+            self.pause_started = clock.now
+            clock.now += 1
+            events.append("pause")
+
+        def transfer_operation(self, uid, action, **kwargs):
+            clock.now += 1
+            events.append(action)
+            return {"session_id": "s", "needs_initialize": self.version == 1}
+
+        def commit_policy_update(self, uid, version):
+            events.append("commit")
+
+        def resume_generation(self):
+            clock.now += 2
+            events.append("resume")
+
+    class Actors:
+        world_size = 2
+
+        def execute_checkpoint_engine(self, method, **kwargs):
+            clock.now += 1
+            assert method == [method[0]] * 2
+            events.append(method[0])
+            return (
+                [{"master_address": "trainer", "master_port": 1234}, {}]
+                if method[0] == "prepare"
+                else []
+            )
+
+        def update_weights(self, **kwargs):
+            events.append("send")
+            assert kwargs["mode"] == "elastic_hccl"
+            return [{}, {}]
+
+    manager = module.ElasticCheckpointEngineManager(
+        NS(
+            backend="elastic_hccl",
+            engine_kwargs={"elastic_hccl": {"endpoint": "http://control", "deployment_id": "test"}},
+        ),
+        Actors(),
+        [],
+    )
+    manager.control = Control()
+    metrics = asyncio.run(manager.update_weights(1))
+    assert (
+        metrics["elastic_hccl/logical_generation_pause_s"]
+        == clock.now - manager.control.pause_started
+    )
+    assert metrics["elastic_hccl/weight_sync_total_s"] == clock.now
+    assert (
+        metrics["elastic_hccl/weight_sync_total_s"]
+        - metrics["elastic_hccl/logical_generation_pause_s"]
+        == 5
+    )
+    assert metrics["elastic_hccl/hccl_init_s"] == 1
+    assert events == [
+        "begin",
+        "pause",
+        "prepare",
+        "prepare",
+        "configure_session",
+        "start",
+        "send",
+        "finish",
+        "commit",
+        "resume",
+    ]
+    events.clear()
+    reused = asyncio.run(manager.update_weights(2))
+    assert reused["elastic_hccl/hccl_init_s"] == 0
+    assert "configure_session" in events and "finalize" not in events
+    events.clear()
+
+    def fail(**kwargs):
+        raise TimeoutError("HCCL timeout")
+
+    manager.actor_wg.update_weights = fail
+    with pytest.raises(TimeoutError):
+        asyncio.run(manager.update_weights(1))
+    assert events[-1] == "fail"
+    assert "commit" not in events and "resume" not in events
+
+
+def test_sender_persistent_identity_and_one_init_across_three_updates(adapters, monkeypatch):
+    module, _ = adapters
+    init_calls, sends, control_calls = [], [], []
+    rendezvous = threading.Barrier(2, timeout=3)
+    group = object()
+
+    def init(session):
+        init_calls.append(session["transport_id"])
+        rendezvous.wait()
+        return group
+
+    def send(weights, args):
+        assert args["group"] is group
+        sends.append([n for n, _ in weights])
+
+    def control(uid, action, **body):
+        control_calls.append(action)
+        if action == "initialize":
+            rendezvous.wait()
+
+    stub_module(monkeypatch, "ray.util", get_node_ip_address=lambda: "127.0.0.1")
+    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    for path in (
+        "vllm_ascend",
+        "vllm_ascend.distributed",
+        "vllm_ascend.distributed.weight_transfer",
+    ):
+        stub_module(monkeypatch, path)
+    stub_module(
+        monkeypatch,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        HCCLWeightTransferEngine=NS(trainer_init=init, trainer_send_weights=send),
+    )
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, True, endpoint="http://control", deployment_id="test"
+    )
+    engine.control.transfer_operation = control
+    metadata = engine.prepare()
+
+    def forbidden_bind():
+        raise AssertionError("rendezvous must not be chosen/bound again")
+
+    monkeypatch.setattr(module, "socket", NS(socket=forbidden_bind))
+    for version in (1, 2, 3):
+        assert engine.prepare() == metadata
+        session = dict(
+            metadata,
+            transport_id="transport",
+            session_id=f"s{version}",
+            update_id=f"u{version}",
+            target_version=version,
+            needs_initialize=version == 1,
+        )
+        engine.configure_session(session)
+        metrics = asyncio.run(engine.send_weights(iter([("weight", Tensor())]), version))
+        assert metrics["elastic_hccl/transport_init_count"] == 1
+        engine.finalize()  # Even the legacy ABC hook must not discard the group.
+        assert engine.group is group
+    assert init_calls == ["transport"]
+    assert control_calls.count("initialize") == 1
+    assert sends == [["weight"]] * 3
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_sender_rejects_missing_or_changed_cached_transport(adapters, missing):
+    module, _ = adapters
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, True, endpoint="http://control", deployment_id="test"
+    )
+    engine.control.transfer_operation = lambda *args, **kwargs: None
+    engine.group = None if missing else object()
+    engine.transport_id = "old"
+    with pytest.raises(RuntimeError, match="restart"):
+        engine.configure_session(
+            dict(
+                sender_instance_id=engine.sender_instance_id,
+                transport_id="old" if missing else "new",
+                needs_initialize=False,
+                session_id="s",
+                update_id="u",
+            )
+        )
+    assert engine._poisoned
+
+
+def test_actual_verl_worker_uses_native_export(adapters):
+    consumed = []
+
+    class Export:
+        def get_per_tensor_param(self):
+            consumed.append("native_export")
+            return iter([("weight", Tensor())]), None
+
+    class Sender:
+        async def send_weights(self, iterator, global_steps):
+            consumed.extend(name for name, _ in iterator)
+            return {"step": global_steps}
+
+    methods = source_methods(
+        ROOT / "verl/verl/workers/engine_workers.py",
+        "ActorRolloutRefWorker",
+        ["update_weights"],
+        {},
+    )
+    worker = NS(actor=NS(engine=Export()), checkpoint_engine=Sender())
+    result = asyncio.run(methods["update_weights"](worker, global_steps=1, mode="elastic_hccl"))
+    assert consumed == ["native_export", "weight"]
+    assert result == {"step": 1}
+
+
+def test_training_service_keeps_external_ownership(adapters, monkeypatch):
+    class Config(dict):
+        __getattr__ = dict.__getitem__
+
+    stub_module(
+        monkeypatch,
+        "elastic_rollout.integrations.verl.llm_client",
+        ElasticLLMClient=lambda *args: "external-client",
+    )
+    module = load_adapter(
+        monkeypatch,
+        "elastic_rollout.integrations.verl.rollout_service",
+        PACKAGE / "integrations/verl/rollout_service.py",
+    )
+    options = dict(endpoint="http://control", deployment_id="test", bootstrap_model_path="model")
+    rollout = Config(
+        custom={"elastic": dict(options, fixed_policy=False, weight_sync="hccl")},
+        checkpoint_manager_class="elastic_rollout.integrations.verl.checkpoint_manager.ElasticCheckpointEngineManager",
+        checkpoint_engine=Config(backend="elastic_hccl", engine_kwargs={"elastic_hccl": options}),
+        free_cache_engine=False,
+    )
+    config = Config(actor_rollout_ref=Config(rollout=rollout, model=Config(path="model")))
+    service = module.ElasticRolloutService(
+        config, worker_group=object(), rollout_resource_pool=object()
+    )
+    service.control.status = lambda: {"ready_replicas": 2}
+    assert service.get_replicas() == []
+    assert service.get_active_server_count() == 2
+    assert service.get_client() == "external-client"
+    with pytest.raises(ValueError, match="own external"):
+        service.get_client(client_cls=object)
+    config["async_training"] = {"partial_rollout": True}
+    with pytest.raises(ValueError, match="MVP-2A"):
+        module.ElasticRolloutService(config)
+
+
+def test_initial_version_skip_requires_matching_bootstrap(adapters):
+    _, module = adapters
+    options = dict(endpoint="http://control", deployment_id="test", bootstrap_model_path="model")
+    manager = module.ElasticCheckpointEngineManager(
+        NS(backend="elastic_hccl", engine_kwargs={"elastic_hccl": options}), None, []
+    )
+    status = dict(
+        serving_policy_version=0,
+        bootstrap_snapshot={"version": 0, "model_path": "other"},
+        policy_update=None,
+        accepting_routes=True,
+    )
+    manager.control.status = lambda: status
+    with pytest.raises(ValueError, match="equivalence"):
+        manager._update(0)
+    status["bootstrap_snapshot"]["model_path"] = "model"
+    assert manager._update(0) == {}
+
+
+@pytest.mark.parametrize("error", [TimeoutError("receiver timeout"), RuntimeError("HTTP 500")])
+def test_sender_receiver_error_propagates_and_no_reacquire(adapters, error):
+    module, _ = adapters
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, True, endpoint="http://control", deployment_id="test"
+    )
+    engine.session = dict(update_id="u", session_id="s")
+    calls = []
+
+    def control(uid, action, **kwargs):
+        calls.append(action)
+        if action == "group":
+            raise error
+
+    engine.control.transfer_operation = control
+    with pytest.raises(type(error), match=str(error)):
+        engine._overlap("group", lambda: None)
+    assert calls == ["group", "fail"]
+    assert engine._poisoned
+
+
+def test_sender_failure_does_not_hold_process_open(adapters, monkeypatch, request):
+    if cleanup_subprocess(request):
+        return
+    module, _ = adapters
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def control(uid, action, **kwargs):
+        calls.append(action)
+        if action == "group":
+            entered.set()
+            release.wait(timeout=120)  # Never released, even at test teardown.
+
+    def send(weights, args):
+        assert entered.wait(timeout=3)
+        raise RuntimeError("trainer send failed")
+
+    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    for path in (
+        "vllm_ascend",
+        "vllm_ascend.distributed",
+        "vllm_ascend.distributed.weight_transfer",
+    ):
+        stub_module(monkeypatch, path)
+    stub_module(
+        monkeypatch,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        HCCLWeightTransferEngine=NS(trainer_send_weights=send),
+    )
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, True, endpoint="http://control", deployment_id="test"
+    )
+    engine.session = dict(update_id="u", session_id="s", target_version=1)
+    engine.control.transfer_operation = control
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="trainer send failed"):
+        asyncio.run(engine.send_weights(iter([("weight", Tensor())]), 1))
+    assert time.monotonic() - started < 3
+    assert engine._poisoned
+    assert calls[0] == "group" and set(calls[1:]) == {"fail"}
+    assert entered.is_set() and not release.is_set()
+    print("ABANDONED_CONTROL_READY_TO_EXIT", flush=True)
+
+
+@pytest.mark.parametrize("mode", ["native", "core"])
+def test_npu_entry_repeats_updates_with_one_init(adapters, receivers, monkeypatch, tmp_path, mode):
+    from examples import hccl_smoke as entry
+
+    module, _ = adapters
+    client, _, receiver_state = receivers
+    rendezvous = threading.Barrier(3, timeout=5) if mode == "core" else None
+    receiver_state["barrier"] = rendezvous
+    calls = []
+    group = object()
+
+    class Model:
+        def to(self, *args):
+            return self
+
+        def named_parameters(self):
+            return iter([("weight", Tensor())])
+
+    def init(session):
+        calls.append("trainer_init")
+        if rendezvous:
+            rendezvous.wait()
+        return group
+
+    def send(weights, args):
+        assert args["group"] is group
+        assert list(weights)[0][0] == "weight"
+        calls.append("send")
+        if rendezvous:
+            rendezvous.wait()
+
+    stub_module(
+        monkeypatch,
+        "torch",
+        bfloat16="bf16",
+        npu=NS(set_device=lambda d: None, current_stream=lambda: NS(synchronize=lambda: None)),
+    )
+    stub_module(monkeypatch, "torch_npu")
+    stub_module(monkeypatch, "ray.util", get_node_ip_address=lambda: "127.0.0.1")
+    stub_module(
+        monkeypatch,
+        "transformers",
+        AutoModelForCausalLM=NS(from_pretrained=lambda *a, **k: Model()),
+    )
+    for path in (
+        "vllm_ascend",
+        "vllm_ascend.distributed",
+        "vllm_ascend.distributed.weight_transfer",
+    ):
+        stub_module(monkeypatch, path)
+    stub_module(
+        monkeypatch,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        HCCLWeightTransferEngine=NS(trainer_init=init, trainer_send_weights=send),
+    )
+    monkeypatch.setitem(
+        sys.modules, "elastic_rollout.integrations.verl.hccl_checkpoint_engine", module
+    )
+    physical = NS(get_world_size=lambda e: 1)
+    for name in (
+        "pause_generation",
+        "resume_generation",
+        "init_weight_transfer",
+        "start_weight_update",
+        "receive_weight_group",
+        "finish_weight_update",
+    ):
+        setattr(physical, name, lambda *a, _name=name, **k: calls.append(_name))
+    monkeypatch.setattr(entry, "StandardVLLMControl", lambda: physical)
+    monkeypatch.setattr(entry, "preflight", lambda endpoints: {})
+    monkeypatch.setattr(
+        entry, "receiver_processes", lambda pids: [{"pid": p, "start_ticks": "1"} for p in pids]
+    )
+    monkeypatch.setattr(entry, "generate", lambda *args: "output")
+    report = tmp_path / "acceptance.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hccl_smoke",
+            "--receiver",
+            "http://one",
+            "--receiver",
+            "http://two",
+            "--master-address",
+            "127.0.0.1",
+            "--receiver-pid",
+            "1",
+            "--receiver-pid",
+            "2",
+            "--model",
+            "model",
+            "--rounds",
+            "2",
+            "--report",
+            str(report),
+        ],
+    )
+    if mode == "core":
+        monkeypatch.setenv("ELASTIC_ROLLOUT_TOKEN", client.token)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "hccl_smoke",
+                "--endpoint",
+                client.endpoint,
+                "--deployment",
+                "test",
+                "--master-address",
+                "127.0.0.1",
+                "--receiver-pid",
+                "1",
+                "--receiver-pid",
+                "2",
+                "--model",
+                "model",
+                "--rounds",
+                "2",
+                "--report",
+                str(report),
+            ],
+        )
+    entry.main()
+    assert calls.count("trainer_init") == 1
+    if mode == "native":
+        assert calls.count("init_weight_transfer") == 2  # one per receiver
+        assert calls.count("start_weight_update") == calls.count("finish_weight_update") == 4
+    else:
+        paths = [path for _, path, _ in receiver_state["calls"]]
+        assert paths.count("/init_weight_transfer_engine") == 2
+        assert paths.count("/start_weight_update") == paths.count("/finish_weight_update") == 4
+    assert calls.count("send") == 2
+    evidence = json.loads(report.read_text())
+    assert evidence["round_count"] == 2
+    assert evidence["init_count"] == 1
+    if mode == "native":
+        assert evidence["receiver_init_counts"] == [1, 1]
+    else:
+        assert len({r["transport_id"] for r in evidence["rounds"]}) == 1
+        assert len({r["session_id"] for r in evidence["rounds"]}) == 2

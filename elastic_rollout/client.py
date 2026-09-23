@@ -145,6 +145,23 @@ class ControlClient:
     def get_policy_update(self, update_id: str) -> dict:
         return self._request(self.path + f"/policy-updates/{quote(update_id, safe='')}")
 
+    def begin_external_update(self, target_version: int) -> dict:
+        return self._request(
+            self.path + "/policy-updates",
+            "POST",
+            {
+                "preparation_kind": "EXTERNAL_HCCL",
+                "target_version": target_version,
+            },
+        )
+
+    def transfer_operation(self, update_id: str, action: str, **body) -> dict:
+        path = self.path + f"/policy-updates/{quote(update_id, safe='')}/transfer-sessions"
+        if action != "prepare":
+            path += "/" + quote(action, safe="")
+        # Receiver RPCs have a <=120s deadline. No blind retries of mutations.
+        return self._request(path, "POST", body, timeout=150)
+
     def commit_policy_update(self, update_id: str, policy_version: int) -> dict:
         return self._request(
             self.path + f"/policy-updates/{quote(update_id, safe='')}/commit",

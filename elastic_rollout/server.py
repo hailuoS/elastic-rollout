@@ -86,7 +86,19 @@ def make_server(
                         result = controller.resume_generation(deployment_id)
                     elif tail == ["policy-updates"] and self.command == "POST":
                         result = controller.begin_policy_update(
-                            deployment_id, body.get("snapshot_path")
+                            deployment_id,
+                            body.get("snapshot_path"),
+                            preparation_kind=body.get("preparation_kind", "SNAPSHOT_RESTART"),
+                            target_version=body.get("target_version"),
+                        )
+                    elif (
+                        len(tail) in (3, 4)
+                        and tail[0] == "policy-updates"
+                        and tail[2] == "transfer-sessions"
+                        and self.command == "POST"
+                    ):
+                        result = manager.transfer.execute(
+                            tail[1], tail[3] if len(tail) == 4 else "prepare", body
                         )
                     elif len(tail) == 2 and tail[0] == "policy-updates" and self.command == "GET":
                         result = controller.get_policy_update(deployment_id, tail[1])

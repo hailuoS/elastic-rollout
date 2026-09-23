@@ -17,8 +17,12 @@ from .api import (
     ReplicaState,
     nonnegative_int,
 )
+from .api import (
+    PolicyPreparationKind as K,
+)
 from .resource import NoCapacity, StaticResourceProvider
 from .traffic import TrafficManager
+from .weight_transfer import RECOVERY_REQUIRED, WeightTransferControl
 
 logger = logging.getLogger(__name__)
 S = ReplicaState
@@ -37,6 +41,9 @@ class GenerationControlTimeout(TimeoutError):
 
 
 class ServiceDriver(Protocol):
+    @property
+    def weight_transfer_control(self) -> WeightTransferControl: ...
+
     def start(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> None: ...
     def alive(self, replica: ReplicaDescriptor) -> bool: ...
     def health(self, replica: ReplicaDescriptor) -> bool: ...
@@ -72,6 +79,11 @@ class ReplicaManager:
         self._generation_timeout_epoch = 0
         self.last_error: str | None = None
         self.committed_policy = PolicySnapshot(spec.replica.policy_version, spec.replica.model)
+        self.bootstrap_snapshot = self.committed_policy
+        self.serving_policy_version = spec.replica.policy_version
+        from .weight_transfer import TransferCoordinator
+
+        self.transfer = TransferCoordinator(self)
         self.policy_update: PolicyUpdateDescriptor | None = None
         self.policy_updates: dict[str, PolicyUpdateDescriptor] = {}
         self.closing = False
@@ -97,6 +109,8 @@ class ReplicaManager:
         # Preserve MVP-0 desired-state changes during normal reconciliation.
         # Begin/commit also hold this lock, so the policy gate is atomic here.
         with self.traffic.lock:
+            if self.spec.replica.weight_sync == "hccl" and count != self.desired:
+                raise PolicyConflict("Direct HCCL requires fixed topology; scaling is unsupported")
             if "generation" in self.traffic.route_pause_reasons:
                 raise PolicyConflict("generation paused; topology is locked")
             if self._update_blocks_topology():
@@ -145,6 +159,8 @@ class ReplicaManager:
             with self.traffic.lock:
                 if self.closing:
                     raise PolicyConflict("controller is closing")
+                if not paused and self._external_update() and self._update_blocks_topology():
+                    raise PolicyConflict("external update must COMMIT before generation resume")
                 gated = "generation" in self.traffic.route_pause_reasons
                 if (
                     paused
@@ -207,10 +223,33 @@ class ReplicaManager:
             )
             return status
 
-    def begin_policy_update(self, snapshot_path: str) -> dict:
-        if not isinstance(snapshot_path, str) or not snapshot_path.strip():
+    def _external_update(self) -> bool:
+        return bool(self.policy_update and self.policy_update.preparation_kind == K.EXTERNAL_HCCL)
+
+    def begin_policy_update(
+        self,
+        snapshot_path: str | None = None,
+        preparation_kind: str = K.SNAPSHOT_RESTART,
+        target_version: int | None = None,
+    ) -> dict:
+        kind = K(preparation_kind)
+        if kind == K.EXTERNAL_HCCL:
+            nonnegative_int(target_version, "target_version")
+            if self.spec.replica.weight_sync != "hccl":
+                raise PolicyConflict("deployment is not HCCL capable")
+            if snapshot_path is not None:
+                raise ValueError("EXTERNAL_HCCL has no snapshot_path")
+        elif not isinstance(snapshot_path, str) or not snapshot_path.strip():
             raise ValueError("snapshot_path must be a non-empty string")
         with self._control_mutation():
+            if (
+                kind == K.EXTERNAL_HCCL
+                and self.transfer.transport
+                and self.transfer.transport.state == "POISONED"
+            ):
+                raise PolicyConflict(RECOVERY_REQUIRED)
+            if kind == K.EXTERNAL_HCCL and target_version <= self.serving_policy_version:
+                raise ValueError("target_version must exceed serving_policy_version")
             if self._update_blocks_topology():
                 raise PolicyConflict("policy update active or failed")
             if self.desired <= 0:
@@ -225,13 +264,17 @@ class ReplicaManager:
             update = PolicyUpdateDescriptor(
                 uuid4().hex,
                 self.spec.deployment_id,
-                self.committed_policy.version,
+                self.serving_policy_version,
                 snapshot_path,
                 started_at=self.clock(),
                 target_replica_ids=tuple(r.replica_id for r in replicas if r.state == S.READY),
                 deadline_at=self.clock() + self.spec.policy_update_runtime_timeout_s,
+                preparation_kind=kind,
+                target_version=target_version,
             )
             self.policy_update = update
+            if kind == K.EXTERNAL_HCCL:
+                self.transfer.session = None
             self.policy_updates[update.update_id] = update
             self.traffic.pause_routes("policy_update")
             logger.info("policy update %s requested; routing paused", update.update_id)
@@ -251,14 +294,29 @@ class ReplicaManager:
                 raise PolicyConflict(f"policy update FAILED: {update.error}")
             if update is not self.policy_update or update.state != U.PREPARED:
                 raise PolicyConflict("policy update must be PREPARED before commit")
-            if policy_version <= self.committed_policy.version:
+            if policy_version <= self.serving_policy_version:
                 raise ValueError("policy_version must exceed the current committed version")
             live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
-            if not self._candidate_ready(live):
+            if self._external_update():
+                if policy_version != update.target_version:
+                    raise ValueError("commit version must equal bound target_version")
+                if set(r.replica_id for r in live) != set(update.target_replica_ids) or any(
+                    r.state != S.READY or r.loaded_policy_version != policy_version for r in live
+                ):
+                    raise PolicyConflict("frozen targets must all have loaded target_version")
+            elif not self._candidate_ready(live):
                 raise PolicyConflict("candidate replicas are no longer all READY")
-            self.committed_policy = PolicySnapshot(policy_version, update.snapshot_path)
+            if not self._external_update():
+                self.bootstrap_snapshot = PolicySnapshot(policy_version, update.snapshot_path)
+            self.serving_policy_version = policy_version
+            # Compatibility view: path is always the durable bootstrap, never a
+            # claim that an in-memory HCCL version has been written to disk.
+            self.committed_policy = PolicySnapshot(
+                policy_version, self.bootstrap_snapshot.model_path
+            )
             for replica in live:
                 replica.serving_policy_version = policy_version
+                replica.loaded_policy_version = policy_version
             self.traffic.sticky.clear()
             update.committed_version = policy_version
             self._update_transition(U.COMMITTED)
@@ -283,6 +341,9 @@ class ReplicaManager:
             self.policy_update.error = str(error)
             self.last_error = str(error)
             self.traffic.pause_routes("policy_update")
+            if self._external_update():
+                self.traffic.pause_routes("generation")
+                self.transfer.fail(str(error))
             self._update_transition(U.FAILED)
         logger.error("policy update FAILED: %s", error)
 
@@ -306,6 +367,8 @@ class ReplicaManager:
 
     def _reconcile_policy(self) -> None:
         update = self.policy_update
+        if self._external_update():
+            return  # Explicit transfer operations own preparation; never restart targets.
         live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
         if any(
             r.state == S.FAILED and r.resource is not None for r in self.traffic.replicas.values()
@@ -353,6 +416,7 @@ class ReplicaManager:
             # A stop error is fatal: never start on possibly occupied devices.
             self.driver.stop(replica)
             replica.loaded_model_path = snapshot_path
+            replica.loaded_policy_version = None  # Snapshot version is supplied at commit.
             replica.started_at = self.clock()
             replica.health_failures = 0
             self._transition(replica, S.STARTING)
@@ -383,6 +447,12 @@ class ReplicaManager:
 
     def _fail(self, replica: ReplicaDescriptor, error: Exception) -> None:
         update = self.policy_update
+        if (
+            self._external_update()
+            and self._update_blocks_topology()
+            and replica.replica_id in update.target_replica_ids
+        ):
+            self._fail_update(error)
         candidate_failure = (
             not self.closing
             and update is not None
@@ -424,11 +494,15 @@ class ReplicaManager:
         )
         if candidate:
             model_path = self.policy_update.snapshot_path
+        elif self.serving_policy_version != self.bootstrap_snapshot.version:
+            self.last_error = "HCCL policy diverged from bootstrap; stale replacement disabled"
+            return False
         replica = ReplicaDescriptor(
             uuid4().hex,
             self.spec.deployment_id,
             self.committed_policy.version,
             loaded_model_path=model_path,
+            loaded_policy_version=self.bootstrap_snapshot.version,
         )
         try:
             replica.resource = self.resources.acquire(replica.replica_id)
@@ -463,7 +537,7 @@ class ReplicaManager:
             if self._update_blocks_topology() and not self.closing:
                 if self._check_update_deadline():
                     return
-                if self.policy_update.state == U.REQUESTED:
+                if self.policy_update.state == U.REQUESTED and not self._external_update():
                     self._update_transition(U.QUIESCING)
             for replica in list(self.traffic.replicas.values()):
                 if self._check_update_deadline():
@@ -553,6 +627,15 @@ class ReplicaManager:
             return {
                 "spec": asdict(self.spec),
                 "policy": asdict(self.committed_policy),
+                "serving_policy_version": self.serving_policy_version,
+                "bootstrap_snapshot": asdict(self.bootstrap_snapshot),
+                "topology_limitation": (
+                    "fixed topology; no stale bootstrap replacement or catch-up"
+                    if self.spec.replica.weight_sync == "hccl"
+                    else None
+                ),
+                "transfer_session": self.transfer.status(),
+                "transport": self.transfer.transport_status(),
                 "policy_update": asdict(self.policy_update) if self.policy_update else None,
                 "accepting_routes": self.traffic.accepting_routes,
                 "generation_paused": self.generation_paused,
@@ -601,11 +684,13 @@ class Controller:
             manager = self.deployments[deployment_id]
             return manager.set_desired(count)
 
-    def begin_policy_update(self, deployment_id: str, snapshot_path: str) -> dict:
+    def begin_policy_update(
+        self, deployment_id: str, snapshot_path: str | None = None, **kwargs
+    ) -> dict:
         with self._lock:
             if self._closed:
                 raise PolicyConflict("controller is closing")
-            return self.deployments[deployment_id].begin_policy_update(snapshot_path)
+            return self.deployments[deployment_id].begin_policy_update(snapshot_path, **kwargs)
 
     def _generation_manager(self, deployment_id: str) -> ReplicaManager:
         with self._lock:

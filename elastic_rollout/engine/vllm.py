@@ -8,9 +8,10 @@ from urllib.request import urlopen
 from elastic_rollout.api import DeploymentSpec, ReplicaDescriptor
 from elastic_rollout.client import request_json
 from elastic_rollout.launcher.base import LaunchPlan, ProcessLauncher
+from elastic_rollout.weight_transfer import WeightTransferControl
 
 
-class VLLMControlPlane(Protocol):
+class VLLMControlPlane(WeightTransferControl, Protocol):
     def health(self, endpoint: str) -> bool: ...
     def warmup(self, endpoint: str, model: str) -> bool: ...
     def idle(self, endpoint: str) -> bool: ...
@@ -19,6 +20,38 @@ class VLLMControlPlane(Protocol):
 
 
 class StandardVLLMControl:
+    def get_world_size(self, endpoint, *, timeout=30):
+        value = request_json(endpoint + "/get_world_size", timeout=timeout)["world_size"]
+        if type(value) is not int or value <= 0:
+            raise ValueError("invalid vLLM world_size")
+        return value
+
+    def init_weight_transfer(self, endpoint, init_info, *, timeout=120):
+        return request_json(
+            endpoint + "/init_weight_transfer_engine",
+            "POST",
+            {"init_info": init_info},
+            timeout=timeout,
+        )
+
+    def start_weight_update(self, endpoint, *, timeout=120):
+        return request_json(
+            endpoint + "/start_weight_update",
+            "POST",
+            {"is_checkpoint_format": True},
+            timeout=timeout,
+        )
+
+    def receive_weight_group(self, endpoint, update_info, *, timeout=120):
+        return request_json(
+            endpoint + "/update_weights", "POST", {"update_info": update_info}, timeout=timeout
+        )
+
+    def finish_weight_update(self, endpoint, *, timeout=120):
+        # v0.23 has no version argument/weight_info endpoint. Successful finish
+        # acknowledges worker load/postprocessing; the Core owns policy version.
+        return request_json(endpoint + "/finish_weight_update", "POST", {}, timeout=timeout)
+
     def is_paused(self, endpoint: str, *, timeout: float = 3) -> bool:
         try:
             result = request_json(endpoint + "/is_paused", timeout=timeout)
@@ -98,6 +131,10 @@ class StandardVLLMControl:
 
 
 class VLLMServiceDriver:
+    @property
+    def weight_transfer_control(self) -> WeightTransferControl:
+        return self.control
+
     def __init__(self, launcher: ProcessLauncher, control: VLLMControlPlane | None = None):
         self.launcher = launcher
         self.control = control or StandardVLLMControl()
@@ -132,6 +169,7 @@ class VLLMServiceDriver:
             "--config",
             "--disable-log-stats",
             "--scheduling-policy",
+            "--weight-transfer-config",
         }
         for arg in shape.vllm_args:
             option = arg.split("=", 1)[0]
@@ -157,9 +195,17 @@ class VLLMServiceDriver:
             "mp",
             "--scheduling-policy",
             "priority",
+            *(
+                ("--weight-transfer-config", '{"backend":"nccl"}')
+                if shape.weight_sync == "hccl"
+                else ()
+            ),
             *shape.vllm_args,
         )
-        return LaunchPlan(argv, env=(("VLLM_SERVER_DEV_MODE", "1"),))
+        env = (("VLLM_SERVER_DEV_MODE", "1"),)
+        if shape.weight_sync == "hccl":
+            env += (("VLLM_ASCEND_ENABLE_NZ", "0"),)
+        return LaunchPlan(argv, env=env)
 
     def start(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> None:
         self.launcher.start(

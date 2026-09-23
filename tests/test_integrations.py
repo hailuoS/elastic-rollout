@@ -307,6 +307,7 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
     assert result.stop_reason == "completed"
     assert result.extra_fields["finish_reason"] == "length"
     assert client.generator.generate.call_args_list[0].args[2]["max_tokens"] == 4
+    config.actor_rollout_ref.rollout.get = lambda key: None
     with pytest.raises(ValueError, match="standalone"):
         service_module.ElasticRolloutService(config, worker_group=object())
     with pytest.raises(ValueError, match="text"):
