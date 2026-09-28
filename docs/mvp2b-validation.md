@@ -16,6 +16,8 @@ actor_rollout_ref:
     use_rollout_log_probs: true
   rollout:
     mode: async
+    multi_turn:
+      enable: false
     calculate_log_probs: true
     free_cache_engine: false
     llm_server_manager_class: elastic_rollout.integrations.verl.rollout_service.ElasticRolloutService
@@ -48,7 +50,7 @@ data:
   gen_batch_size: 1
 ```
 
-初次验收关闭 rollout profiler、trainer-side validation、动态资源调度与 resume-from-checkpoint；保持 `trainer.device=npu`、`actor_rollout_ref.model.path=MODEL_PATH`、独立训练/推理 NPU。verl 的 `rollout.nnodes` / `rollout.n_gpus_per_node` 仍参与资源利用率统计，应与外部推理容量对应；外部副本由 Core 启动。
+初次验收关闭 rollout profiler、trainer-side validation、动态资源调度与 resume-from-checkpoint；保持 `trainer.device=npu`、`actor_rollout_ref.model.path=MODEL_PATH`、独立训练/推理 NPU。首轮 NPU 验收仅覆盖单轮生成，显式设置 `actor_rollout_ref.rollout.multi_turn.enable=false`，不包含 tool/multi-turn trajectory。verl 的 `rollout.nnodes` / `rollout.n_gpus_per_node` 仍参与资源利用率统计，应与外部推理容量对应；外部副本由 Core 启动。
 
 ## CPU 门槛
 
@@ -64,7 +66,7 @@ ruff format --check .
 在相邻 verl 仓执行：
 
 ```bash
-python -m pytest tests/experimental/fully_async_policy/test_external_manager_seams_on_cpu.py -q
+python -m pytest tests/experimental/fully_async_policy/test_external_manager_seams_on_cpu.py tests/experimental/fully_async_policy/test_rollouter_failure_on_cpu.py -q
 ```
 
 组合测试要证明：活动 RouteLease 在 `begin` 后 planned-abort 并释放；`inflight=0` 后才进入权重发送；成功时同一逻辑请求持新租约从 v0 续接到 v1；物理发送失败时 Core 保持旧 serving 版本、关闭路由并毒化 transport。

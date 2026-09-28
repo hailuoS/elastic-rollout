@@ -497,6 +497,13 @@ def test_training_service_keeps_external_ownership(adapters, monkeypatch):
         service.get_client(client_cls=object)
     config["async_training"] = {"partial_rollout": True}
     module.ElasticRolloutService(config)
+    config["global_profiler"] = Config(steps=[])
+    module.ElasticRolloutService(config)
+    config.global_profiler["steps"] = [1]
+    with pytest.raises(ValueError, match="fully-async rollout profiling"):
+        module.ElasticRolloutService(config)
+    config.global_profiler["steps"] = None
+    module.ElasticRolloutService(config)
     for invalid, message in (
         ({"partial_rollout": False}, "partial_rollout=true"),
         ({"partial_rollout": True, "use_dynamic_resource_scheduling": True}, "dynamic resource"),

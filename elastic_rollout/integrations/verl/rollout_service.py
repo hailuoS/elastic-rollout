@@ -39,6 +39,8 @@ class ElasticRolloutService:
                 )
             async_config = config.get("async_training") or {}
             if async_config:
+                if config.get("global_profiler") and config.global_profiler.get("steps"):
+                    raise ValueError("Elastic MVP-2B does not support fully-async rollout profiling")
                 if async_config.get("partial_rollout") is not True:
                     raise ValueError("Elastic fully-async HCCL requires partial_rollout=true")
                 if async_config.get("use_dynamic_resource_scheduling", False):
