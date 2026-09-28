@@ -6,8 +6,11 @@ import time
 from types import SimpleNamespace as NS
 
 import pytest
-from test_hccl_transfer import cleanup_subprocess
+from test_hccl_transfer import GROUP, cleanup_subprocess
 from test_integrations import PACKAGE, ROOT, load_adapter, source_methods, stub_module
+from test_partial_rollout import completion
+
+from elastic_rollout.generation import GenerationClient
 
 
 @pytest.fixture
@@ -118,9 +121,11 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
     monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now))
 
     class Control:
+        inflight = 3
+
         def status(self):
             clock.now += 3
-            return {"inflight": 0}
+            return {"inflight": self.inflight}
 
         def begin_external_update(self, version):
             clock.now += 2
@@ -131,6 +136,7 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
         def pause_generation(self):
             self.pause_started = clock.now
             clock.now += 1
+            self.inflight = 0
             events.append("pause")
 
         def transfer_operation(self, uid, action, **kwargs):
@@ -210,6 +216,140 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
         asyncio.run(manager.update_weights(1))
     assert events[-1] == "fail"
     assert "commit" not in events and "resume" not in events
+
+
+@pytest.mark.parametrize("physical_failure", [False, True])
+def test_fully_async_active_segment_crosses_real_core_hccl_transaction(
+    adapters, receivers, monkeypatch, physical_failure
+):
+    _, manager_module = adapters
+    client, runtime, _ = receivers
+    _, core, driver, _ = runtime
+    first_started, abort_requested = threading.Event(), threading.Event()
+    events, requests, acquired, released = [], [], [], []
+
+    original_pause = driver.pause_generation
+
+    def pause(replica, **kwargs):
+        original_pause(replica, **kwargs)
+        events.append("physical_abort")
+        abort_requested.set()
+
+    monkeypatch.setattr(driver, "pause_generation", pause)
+    original_acquire, original_release = client.acquire, client.release
+
+    def acquire(key):
+        lease = original_acquire(key)
+        acquired.append(lease)
+        events.append("acquire")
+        return lease
+
+    def release(lease_id):
+        result = original_release(lease_id)
+        released.append(lease_id)
+        events.append("release")
+        return result
+
+    monkeypatch.setattr(client, "acquire", acquire)
+    monkeypatch.setattr(client, "release", release)
+
+    def generate(url, method, payload, timeout):
+        requests.append(payload)
+        if len(requests) == 1:
+            first_started.set()
+            assert abort_requested.wait(5)
+            return completion([10, 11])
+        return completion([12, 13], "stop")
+
+    monkeypatch.setattr("elastic_rollout.generation.request_json", generate)
+    session = {}
+
+    def actors(method, **kwargs):
+        if method == "prepare":
+            return [
+                {"master_address": "trainer", "master_port": 12345, "sender_instance_id": "actor"}
+            ]
+        if method == "configure_session":
+            session.update(kwargs["session"])
+            if session["needs_initialize"]:
+                client.transfer_operation(
+                    session["update_id"], "initialize", session_id=session["session_id"]
+                )
+            return [{}]
+        raise AssertionError(method)
+
+    def send_weights(**kwargs):
+        assert kwargs == {"global_steps": 1, "mode": "elastic_hccl"}
+        assert client.status()["inflight"] == 0
+        events.append("send_weights")
+        client.transfer_operation(
+            session["update_id"],
+            "group",
+            session_id=session["session_id"],
+            group_index=0,
+            update_info=GROUP,
+        )
+        if physical_failure:
+            raise RuntimeError("sender failed after physical send")
+        return [{}]
+
+    manager = manager_module.ElasticCheckpointEngineManager(
+        NS(
+            backend="elastic_hccl",
+            engine_kwargs={
+                "elastic_hccl": {
+                    "endpoint": "http://control",
+                    "deployment_id": "test",
+                    "bootstrap_model_path": "model",
+                }
+            },
+        ),
+        NS(update_weights=send_weights),
+        [],
+    )
+    manager.control = client
+    manager._actors = actors
+
+    async def run():
+        task = asyncio.create_task(
+            GenerationClient(client, "policy").generate("logical", [1, 2], {"max_tokens": 6})
+        )
+        try:
+            assert await asyncio.to_thread(first_started.wait, 5)
+            assert client.status()["inflight"] == 1
+            update = asyncio.create_task(asyncio.to_thread(manager._update, 1))
+            if physical_failure:
+                with pytest.raises(RuntimeError, match="sender failed after physical send"):
+                    await asyncio.wait_for(update, 15)
+                assert not task.done()
+                return None, None
+            result, metrics = await asyncio.wait_for(asyncio.gather(task, update), 15)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return result, metrics
+
+    result, metrics = asyncio.run(run())
+    if physical_failure:
+        status = client.status()
+        assert status["serving_policy_version"] == 0
+        assert status["policy_update"]["state"] == "FAILED"
+        assert not status["accepting_routes"]
+        assert core.transfer.transport.state == "POISONED"
+        assert len(acquired) == len(released) == len(requests) == 1
+        return
+    assert result.token_ids == [10, 11, 12, 13]
+    assert result.versions == [0, 0, 1, 1]
+    assert [p["prompt"] for p in requests] == [[1, 2], [1, 2, 10, 11]]
+    assert [p["max_tokens"] for p in requests] == [6, 4]
+    assert len(acquired) == len(released) == 2
+    assert acquired[0].lease_id != acquired[1].lease_id
+    assert acquired[0].serving_policy_version == 0
+    assert acquired[1].serving_policy_version == 1
+    assert events.index("release") < events.index("send_weights") < events.index("acquire", 1)
+    assert client.status()["serving_policy_version"] == 1
+    assert core.transfer.transport.init_count == 1
+    assert "elastic_hccl/weight_sync_total_s" in metrics
 
 
 def test_sender_persistent_identity_and_one_init_across_three_updates(adapters, monkeypatch):
@@ -343,7 +483,9 @@ def test_training_service_keeps_external_ownership(adapters, monkeypatch):
         checkpoint_engine=Config(backend="elastic_hccl", engine_kwargs={"elastic_hccl": options}),
         free_cache_engine=False,
     )
-    config = Config(actor_rollout_ref=Config(rollout=rollout, model=Config(path="model")))
+    config = Config(
+        actor_rollout_ref=Config(rollout=rollout, model=Config(path="model"), hybrid_engine=False)
+    )
     service = module.ElasticRolloutService(
         config, worker_group=object(), rollout_resource_pool=object()
     )
@@ -354,7 +496,18 @@ def test_training_service_keeps_external_ownership(adapters, monkeypatch):
     with pytest.raises(ValueError, match="own external"):
         service.get_client(client_cls=object)
     config["async_training"] = {"partial_rollout": True}
-    with pytest.raises(ValueError, match="MVP-2A"):
+    module.ElasticRolloutService(config)
+    for invalid, message in (
+        ({"partial_rollout": False}, "partial_rollout=true"),
+        ({"partial_rollout": True, "use_dynamic_resource_scheduling": True}, "dynamic resource"),
+        ({"partial_rollout": True, "use_trainer_do_validate": True}, "trainer-side validation"),
+    ):
+        config["async_training"] = invalid
+        with pytest.raises(ValueError, match=message):
+            module.ElasticRolloutService(config)
+    config["async_training"] = {"partial_rollout": True}
+    config.actor_rollout_ref.hybrid_engine = True
+    with pytest.raises(ValueError, match="hybrid_engine=false"):
         module.ElasticRolloutService(config)
 
 

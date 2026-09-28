@@ -10,9 +10,9 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | MVP-0 | 固定权重生成、租约路由、手动扩缩容、故障补建、NPU 资源清理 | 已在你的目标环境验证 |
 | MVP-1 | 持久 HF 快照、重启加载、prepare/commit、更新后扩容和补副本追赶新权重 | 已在你的目标环境验证 |
 | **MVP-1.5A** | AReaL Agent Proxy、Proxy 跟随 committed policy、保守磁盘更新 | **当前需要做真机验证** |
-| **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **代码与本地回归已完成，待真机验收** |
-| MVP-2A | verl 同步 Direct HCCL 权重传输 | 代码与 CPU 测试实现，待 NPU 验收 |
-| MVP-2B | fully-async partial rollout | 未实现，本轮不包含 |
+| **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **用户已在 NPU 环境验证** |
+| MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
+| MVP-2B | verl fully-async + Direct HCCL + partial rollout | 本地接缝与组合测试已实现，待 NPU 验收 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
@@ -22,6 +22,8 @@ verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定
 
 **[MVP-2A 验证指南](docs/mvp2a-validation.md)**：依次运行原生 HCCL、Core 手工 sender、
 verl FSDP2 单/双副本和同步多步训练。此入口不包含 MVP-2B async partial rollout。
+
+**[MVP-2B 验证指南](docs/mvp2b-validation.md)**：沿用固定 HCCL 拓扑，验证 fully-async 训练、活动请求更新和跨策略版本续接。真机验收尚未执行。
 
 > 示例中的 `deployment_id: "mvp0"` 只是部署名称。使用该名称的现有部署也可以验证 MVP-1，
 > 不需要为了阶段名称改动已经跑通的配置。
@@ -80,5 +82,5 @@ ruff format --check .
 - 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
 - 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
 - 副本数手动调整，不含自动扩缩策略。
-- 不支持 verl Trainer 权重同步、HCCL、LoRA、多模态；跨版本 partial rollout 与 Agent Proxy 仍需真机验收。
+- 已接入 verl Direct HCCL；LoRA、多模态与 MVP-2B fully-async 跨版本续接尚未完成相应真机验收。
 - 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。

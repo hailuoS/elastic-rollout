@@ -38,10 +38,15 @@ class ElasticRolloutService:
                     "training requires ElasticCheckpointEngineManager and elastic_hccl"
                 )
             async_config = config.get("async_training") or {}
-            if async_config.get("partial_rollout") or async_config.get(
-                "use_dynamic_resource_scheduling"
-            ):
-                raise ValueError("MVP-2A does not support async partial rollout/dynamic scheduling")
+            if async_config:
+                if async_config.get("partial_rollout") is not True:
+                    raise ValueError("Elastic fully-async HCCL requires partial_rollout=true")
+                if async_config.get("use_dynamic_resource_scheduling", False):
+                    raise ValueError("Elastic MVP-2B does not support dynamic resource scheduling")
+                if async_config.get("use_trainer_do_validate", False):
+                    raise ValueError("Elastic MVP-2B does not support trainer-side validation")
+                if config.actor_rollout_ref.hybrid_engine:
+                    raise ValueError("Elastic MVP-2B fully-async requires hybrid_engine=false")
             if rollout.get("free_cache_engine", False):
                 raise ValueError("external HCCL requires free_cache_engine=false; separate NPUs")
             engine_options = rollout.checkpoint_engine.engine_kwargs["elastic_hccl"]

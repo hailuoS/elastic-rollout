@@ -63,8 +63,6 @@ class ElasticCheckpointEngineManager:
                     "initial v0 equivalence not confirmed; use matching fresh bootstrap"
                 )
             return {}
-        if status["inflight"]:
-            raise ValueError("MVP-2A requires no active rollout before weight sync")
         update = self.control.begin_external_update(version)
         uid = update["update_id"]
         metrics = {}

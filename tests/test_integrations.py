@@ -303,6 +303,18 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
     client.generator.generate.return_value = Completion([10], [-0.4], [9], "stop")
     advanced = asyncio.run(client.generate("id2", prompt_ids=[1], sampling_params={}))
     assert advanced.extra_fields["global_steps"] == 9
+    client.generator.generate.return_value = Completion(
+        [10, 11, 12], [-0.1, -0.2, -0.3], [6, 6, 7], "stop"
+    )
+    mixed = asyncio.run(client.generate("cross-policy", prompt_ids=[1], sampling_params={}))
+    assert mixed.extra_fields["serving_policy_versions"] == [6, 6, 7]
+    assert mixed.extra_fields["min_global_steps"] == 6
+    assert mixed.extra_fields["max_global_steps"] == mixed.extra_fields["global_steps"] == 7
+    assert (
+        len(mixed.token_ids)
+        == len(mixed.log_probs)
+        == len(mixed.extra_fields["serving_policy_versions"])
+    )
     client.generator.generate.return_value = Completion([9], [-0.3], [6], "length")
     assert result.stop_reason == "completed"
     assert result.extra_fields["finish_reason"] == "length"
