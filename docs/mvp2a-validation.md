@@ -1,4 +1,6 @@
-# MVP-2A 验证指南（唯一入口）
+# MVP-2A 验证指南
+
+本文记录 MVP-2A 同步入口；MVP-2B 当前使用 [Trainer V1 separate_async 验证指南](mvp2b-v1-validation.md)。
 
 范围：同步、无活跃 rollout 时，verl FSDP2 → 外部 vLLM Direct HCCL。
 本轮没有实现 MVP-2B fully-async partial rollout、MVP-3、扩缩容或失败重放。

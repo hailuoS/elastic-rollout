@@ -642,3 +642,56 @@ def test_elastic_trainer_selects_external_workers_and_rejects_unsafe_resume(
         control.status.return_value["policy"]["version"] = version
         with pytest.raises(ValueError):
             module.ElasticPPOTrainer(config)
+
+
+def test_verl_v1_agent_loop_publishes_cross_policy_versions_to_transfer_queue():
+    class Tensor:
+        def __init__(self, values):
+            self.values = list(values)
+
+        def size(self, dim):
+            assert dim == 0
+            return len(self.values)
+
+        def unsqueeze(self, _dim):
+            return self
+
+        def squeeze(self, _dim):
+            return self
+
+    tq = NS(async_kv_batch_put=AsyncMock())
+    torch = NS(
+        tensor=lambda values, **_kwargs: Tensor(values),
+        cat=lambda values, **_kwargs: Tensor([item for part in values for item in part.values]),
+        ones_like=lambda values, **_kwargs: Tensor([1] * len(values.values)),
+        int64="int64",
+    )
+    method = source_methods(
+        ROOT / "verl/verl/trainer/ppo/v1/agent_loop_tq.py",
+        "AgentLoopWorkerTQ",
+        ["_agent_loop_postprocess"],
+        {"torch": torch, "tq": tq, "list_of_dict_to_tensordict": lambda fields: fields},
+    )["_agent_loop_postprocess"]
+    output = NS(
+        prompt_ids=[1, 2],
+        response_ids=[10, 11, 12, 13],
+        reward_score=None,
+        extra_fields={"global_steps": 8, "min_global_steps": 7, "max_global_steps": 8},
+        as_dict=lambda: {
+            "prompts": Tensor([1, 2]),
+            "responses": Tensor([10, 11, 12, 13]),
+            "response_mask": Tensor([1, 1, 1, 1]),
+            "extra_fields": {"global_steps": 8, "min_global_steps": 7, "max_global_steps": 8},
+        },
+    )
+    worker = NS(
+        _compute_score=AsyncMock(),
+        _compute_teacher_logprobs=AsyncMock(),
+        _compute_multi_modal_inputs=lambda *_args: None,
+        _compute_position_ids=lambda *_args: Tensor([0] * 6),
+    )
+    asyncio.run(method(worker, output, False, uid="prompt", session_id=0, global_steps=7))
+    tag = tq.async_kv_batch_put.call_args.kwargs["tags"][0]
+    assert tag["global_steps"] == 7  # Prompt submission step: ReplayBuffer staleness input.
+    assert tag["min_global_steps"] == 7
+    assert tag["max_global_steps"] == 8

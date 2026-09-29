@@ -219,7 +219,7 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
 
 
 @pytest.mark.parametrize("physical_failure", [False, True])
-def test_fully_async_active_segment_crosses_real_core_hccl_transaction(
+def test_active_segment_crosses_real_core_hccl_transaction(
     adapters, receivers, monkeypatch, physical_failure
 ):
     _, manager_module = adapters
@@ -482,40 +482,49 @@ def test_training_service_keeps_external_ownership(adapters, monkeypatch):
         checkpoint_manager_class="elastic_rollout.integrations.verl.checkpoint_manager.ElasticCheckpointEngineManager",
         checkpoint_engine=Config(backend="elastic_hccl", engine_kwargs={"elastic_hccl": options}),
         free_cache_engine=False,
+        multi_turn=Config(enable=False),
     )
     config = Config(
-        actor_rollout_ref=Config(rollout=rollout, model=Config(path="model"), hybrid_engine=False)
+        actor_rollout_ref=Config(rollout=rollout, model=Config(path="model"), hybrid_engine=False),
+        trainer=Config(use_v1=True, v1=Config(trainer_mode="separate_async")),
     )
-    service = module.ElasticRolloutService(
-        config, worker_group=object(), rollout_resource_pool=object()
-    )
+    service = module.ElasticRolloutService(config, start_rank=0)
     service.control.status = lambda: {"ready_replicas": 2}
     assert service.get_replicas() == []
     assert service.get_active_server_count() == 2
     assert service.get_client() == "external-client"
     with pytest.raises(ValueError, match="own external"):
         service.get_client(client_cls=object)
+    with pytest.raises(ValueError, match="standalone rollout"):
+        module.ElasticRolloutService(config, worker_group=object())
     config["async_training"] = {"partial_rollout": True}
-    module.ElasticRolloutService(config)
+    with pytest.raises(ValueError, match="experimental fully-async"):
+        module.ElasticRolloutService(config)
+    del config["async_training"]
     config["global_profiler"] = Config(steps=[])
     module.ElasticRolloutService(config)
     config.global_profiler["steps"] = [1]
-    with pytest.raises(ValueError, match="fully-async rollout profiling"):
+    with pytest.raises(ValueError, match="profiling disabled"):
         module.ElasticRolloutService(config)
     config.global_profiler["steps"] = None
     module.ElasticRolloutService(config)
-    for invalid, message in (
-        ({"partial_rollout": False}, "partial_rollout=true"),
-        ({"partial_rollout": True, "use_dynamic_resource_scheduling": True}, "dynamic resource"),
-        ({"partial_rollout": True, "use_trainer_do_validate": True}, "trainer-side validation"),
-    ):
-        config["async_training"] = invalid
-        with pytest.raises(ValueError, match=message):
-            module.ElasticRolloutService(config)
-    config["async_training"] = {"partial_rollout": True}
+    config.trainer.v1.trainer_mode = "sync"
+    with pytest.raises(ValueError, match="V1 separate_async"):
+        module.ElasticRolloutService(config)
+    config.trainer.v1.trainer_mode = "separate_async"
+    rollout.multi_turn.enable = True
+    with pytest.raises(ValueError, match="multi_turn=false"):
+        module.ElasticRolloutService(config)
+    rollout.multi_turn.enable = False
     config.actor_rollout_ref.hybrid_engine = True
     with pytest.raises(ValueError, match="hybrid_engine=false"):
         module.ElasticRolloutService(config)
+    config.trainer.use_v1 = False
+    legacy_service = module.ElasticRolloutService(
+        config, worker_group=object(), rollout_resource_pool=object()
+    )
+    assert legacy_service.training
+    assert legacy_service.get_replicas() == []
 
 
 def test_initial_version_skip_requires_matching_bootstrap(adapters):

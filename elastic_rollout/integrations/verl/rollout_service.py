@@ -1,4 +1,4 @@
-"""External rollout service provider, independent of experimental fully-async managers."""
+"""External rollout service provider for verl Trainer V1."""
 
 import asyncio
 import os
@@ -11,7 +11,9 @@ from .llm_client import ElasticLLMClient
 
 
 class ElasticRolloutService:
-    def __init__(self, config, worker_group=None, rollout_resource_pool=None, **kwargs):
+    def __init__(
+        self, config, worker_group=None, rollout_resource_pool=None, start_rank=0, **kwargs
+    ):
         if kwargs:
             raise ValueError(f"unsupported service options: {sorted(kwargs)}")
         self.config = config
@@ -37,18 +39,21 @@ class ElasticRolloutService:
                 raise ValueError(
                     "training requires ElasticCheckpointEngineManager and elastic_hccl"
                 )
-            async_config = config.get("async_training") or {}
-            if async_config:
-                if config.get("global_profiler") and config.global_profiler.get("steps"):
-                    raise ValueError("Elastic MVP-2B does not support fully-async rollout profiling")
-                if async_config.get("partial_rollout") is not True:
-                    raise ValueError("Elastic fully-async HCCL requires partial_rollout=true")
-                if async_config.get("use_dynamic_resource_scheduling", False):
-                    raise ValueError("Elastic MVP-2B does not support dynamic resource scheduling")
-                if async_config.get("use_trainer_do_validate", False):
-                    raise ValueError("Elastic MVP-2B does not support trainer-side validation")
+            if config.get("async_training"):
+                raise ValueError("experimental fully-async training is not supported")
+            if config.trainer.use_v1:
+                if config.trainer.v1.trainer_mode != "separate_async":
+                    raise ValueError("Elastic MVP-2B requires V1 separate_async trainer")
+                if worker_group is not None or rollout_resource_pool is not None:
+                    raise ValueError("V1 separate_async requires a standalone rollout entrypoint")
                 if config.actor_rollout_ref.hybrid_engine:
-                    raise ValueError("Elastic MVP-2B fully-async requires hybrid_engine=false")
+                    raise ValueError("Elastic MVP-2B requires hybrid_engine=false")
+                if rollout.multi_turn.enable:
+                    raise ValueError("Elastic MVP-2B initial acceptance requires multi_turn=false")
+                if config.get("global_profiler") and config.global_profiler.get("steps"):
+                    raise ValueError(
+                        "Elastic MVP-2B initial acceptance requires profiling disabled"
+                    )
             if rollout.get("free_cache_engine", False):
                 raise ValueError("external HCCL requires free_cache_engine=false; separate NPUs")
             engine_options = rollout.checkpoint_engine.engine_kwargs["elastic_hccl"]
