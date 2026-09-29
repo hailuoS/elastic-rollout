@@ -1,6 +1,7 @@
 """Synchronous external policy transactions using verl's existing manager seam."""
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -8,9 +9,23 @@ import time
 import ray
 from verl.utils.ray_utils import auto_await
 
-from elastic_rollout.client import ControlClient
+from elastic_rollout.client import ControlClient, ControlError
 
 logger = logging.getLogger(__name__)
+_LIFECYCLE_RETRY_WAIT_BUDGET_S = 10.0
+
+
+def _is_retryable_lifecycle_conflict(exc: ControlError) -> bool:
+    if exc.status != 409:
+        return False
+    try:
+        payload = json.loads(str(exc))
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("error") == "deployment lifecycle mutation in progress"
+    )
 
 
 class ElasticCheckpointEngineManager:
@@ -48,6 +63,37 @@ class ElasticCheckpointEngineManager:
             )
         )
 
+    def _begin_external_update_with_retry(self, version):
+        # Only rejected lifecycle-lock acquisitions are safe to retry. This is
+        # cumulative sleep time; individual HTTP calls have their own timeout.
+        remaining_wait = _LIFECYCLE_RETRY_WAIT_BUDGET_S
+        delay = 0.1
+        retries = 0
+        while True:
+            try:
+                update = self.control.begin_external_update(version)
+                if retries:
+                    logger.info(
+                        "external update began after lifecycle contention version=%s retries=%s",
+                        version,
+                        retries,
+                    )
+                return update
+            except ControlError as exc:
+                if not _is_retryable_lifecycle_conflict(exc) or remaining_wait <= 0:
+                    raise
+                if retries == 0:
+                    logger.warning(
+                        "deployment lifecycle busy before external update version=%s; retrying",
+                        version,
+                    )
+                sleep_for = min(delay, remaining_wait)
+                before_sleep = time.monotonic()
+                time.sleep(sleep_for)
+                remaining_wait -= max(sleep_for, time.monotonic() - before_sleep)
+                delay = min(delay * 2, 0.5)
+                retries += 1
+
     def _update(self, version):
         started = time.monotonic()
         status = self.control.status()
@@ -63,7 +109,7 @@ class ElasticCheckpointEngineManager:
                     "initial v0 equivalence not confirmed; use matching fresh bootstrap"
                 )
             return {}
-        update = self.control.begin_external_update(version)
+        update = self._begin_external_update_with_retry(version)
         uid = update["update_id"]
         metrics = {}
 

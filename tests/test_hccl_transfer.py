@@ -48,6 +48,29 @@ def cleanup_subprocess(request):
     return True
 
 
+def test_external_begin_lifecycle_busy_does_not_create_transaction(http_runtime):
+    client, runtime = http_runtime
+    _, manager, _, _ = runtime
+    manager.spec = replace(manager.spec, replica=replace(manager.spec.replica, weight_sync="hccl"))
+    serving_version = manager.serving_policy_version
+
+    with manager.mutation_lock:
+        with pytest.raises(ControlError) as raised:
+            client.begin_external_update(serving_version + 1)
+        assert raised.value.status == 409
+        assert json.loads(str(raised.value)) == {
+            "error": "deployment lifecycle mutation in progress"
+        }
+        assert manager.policy_update is None
+        assert manager.policy_updates == {}
+        assert manager.serving_policy_version == serving_version
+        assert all(
+            replica.serving_policy_version == serving_version
+            for replica in manager.traffic.replicas.values()
+        )
+        assert manager.traffic.accepting_routes
+
+
 @pytest.fixture
 def receivers(http_runtime):
     client, runtime = http_runtime

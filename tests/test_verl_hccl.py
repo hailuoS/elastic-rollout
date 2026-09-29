@@ -4,12 +4,14 @@ import sys
 import threading
 import time
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock
 
 import pytest
 from test_hccl_transfer import GROUP, cleanup_subprocess
 from test_integrations import PACKAGE, ROOT, load_adapter, source_methods, stub_module
 from test_partial_rollout import completion
 
+from elastic_rollout.client import ControlError
 from elastic_rollout.generation import GenerationClient
 
 
@@ -216,6 +218,140 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
         asyncio.run(manager.update_weights(1))
     assert events[-1] == "fail"
     assert "commit" not in events and "resume" not in events
+
+
+def test_manager_retries_lifecycle_conflict_then_completes_update(adapters, monkeypatch):
+    _, module = adapters
+    clock = NS(now=0.0)
+    sleeps, events = [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now, sleep=sleep))
+
+    class Control:
+        begin_calls = 0
+
+        def status(self):
+            return {}
+
+        def begin_external_update(self, version):
+            assert version == 1
+            self.begin_calls += 1
+            events.append("begin")
+            if self.begin_calls <= 2:
+                raise ControlError(
+                    409, json.dumps({"error": "deployment lifecycle mutation in progress"})
+                )
+            return {"update_id": "u"}
+
+        def pause_generation(self):
+            events.append("pause")
+
+        def transfer_operation(self, uid, action, **kwargs):
+            assert uid == "u"
+            events.append(action)
+            if action == "prepare":
+                return {"session_id": "s", "needs_initialize": False}
+            return {}
+
+        def commit_policy_update(self, uid, version):
+            assert (uid, version) == ("u", 1)
+            events.append("commit")
+
+        def resume_generation(self):
+            events.append("resume")
+
+    class Actors:
+        world_size = 1
+
+        def execute_checkpoint_engine(self, method, **kwargs):
+            events.append(method[0])
+            if method[0] == "prepare":
+                return [{"master_address": "trainer", "master_port": 1234}]
+            return []
+
+        def update_weights(self, **kwargs):
+            assert kwargs == {"global_steps": 1, "mode": "elastic_hccl"}
+            events.append("send")
+            return [{}]
+
+    manager = module.ElasticCheckpointEngineManager.__new__(module.ElasticCheckpointEngineManager)
+    manager.control = Control()
+    manager.actor_wg = Actors()
+    metrics = asyncio.run(manager.update_weights(1))
+
+    assert manager.control.begin_calls == 3
+    assert sleeps == [0.1, 0.2]
+    assert metrics["elastic_hccl/hccl_init_s"] == 0.0
+    assert events == [
+        "begin", "begin", "begin", "pause", "prepare", "prepare",
+        "configure_session", "start", "send", "finish", "commit", "resume",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ControlError(409, json.dumps({"error": "policy update active or failed"})),
+        ControlError(409, "not JSON"),
+        ControlError(503, json.dumps({"error": "deployment lifecycle mutation in progress"})),
+    ],
+)
+def test_manager_does_not_retry_other_control_errors(adapters, monkeypatch, error):
+    _, module = adapters
+    begin = MagicMock(side_effect=error)
+    manager = module.ElasticCheckpointEngineManager.__new__(module.ElasticCheckpointEngineManager)
+    manager.control = NS(status=lambda: {}, begin_external_update=begin)
+    manager.actor_wg = MagicMock()
+    monkeypatch.setattr(
+        module,
+        "time",
+        NS(monotonic=lambda: 0.0, sleep=lambda _: pytest.fail("unexpected retry sleep")),
+    )
+
+    with pytest.raises(ControlError) as raised:
+        manager._update(1)
+    assert raised.value is error
+    begin.assert_called_once_with(1)
+    manager.actor_wg.execute_checkpoint_engine.assert_not_called()
+    manager.actor_wg.update_weights.assert_not_called()
+
+
+def test_manager_lifecycle_retry_wait_budget_is_bounded(adapters, monkeypatch):
+    _, module = adapters
+    clock = NS(now=0.0)
+    sleeps = []
+    error = ControlError(409, json.dumps({"error": "deployment lifecycle mutation in progress"}))
+
+    def busy(version):
+        assert version == 1
+        clock.now += 2.0  # HTTP time does not consume the retry wait budget.
+        raise error
+
+    begin = MagicMock(side_effect=busy)
+
+    def sleep(seconds):
+        assert 0 < seconds <= 10.0 - sum(sleeps) + 1e-9
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now, sleep=sleep))
+    manager = module.ElasticCheckpointEngineManager.__new__(module.ElasticCheckpointEngineManager)
+    manager.control = NS(status=lambda: {}, begin_external_update=begin)
+    manager.actor_wg = MagicMock()
+
+    with pytest.raises(ControlError) as raised:
+        manager._update(1)
+    assert raised.value is error
+    assert sum(sleeps) == pytest.approx(10.0)
+    assert begin.call_count == len(sleeps) + 1
+    assert begin.call_count < 30
+    assert clock.now == pytest.approx(10.0 + 2.0 * begin.call_count)
+    manager.actor_wg.execute_checkpoint_engine.assert_not_called()
+    manager.actor_wg.update_weights.assert_not_called()
 
 
 @pytest.mark.parametrize("physical_failure", [False, True])
