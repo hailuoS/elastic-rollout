@@ -1,6 +1,6 @@
 # MVP-2B Trainer V1 separate-async validation
 
-Status: V1 integration code and CPU contract tests are ready for an environment with verl dependencies. NPU acceptance has not run.
+Status: historical V1 validation notes. The user reported that the prior V1 runtime NPU matrix passed. The new single-entry launcher smoke is still pending; use [the current integration guide](verl_separate_async.md) and [final validation checklist](validation/mvp2b_final_validation.md).
 
 ## Entry and ownership
 

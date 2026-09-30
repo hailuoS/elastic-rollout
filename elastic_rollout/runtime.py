@@ -105,6 +105,20 @@ class ReplicaManager:
     def _update_blocks_topology(self) -> bool:
         return self.policy_update is not None and self.policy_update.state != U.COMMITTED
 
+    def _stable_for_policy_update(self, replicas: list) -> bool:
+        """The topology predicate shared by begin and the serving readiness view.
+
+        Call with traffic.lock held. Begin additionally serializes mutations and
+        checks the requested update kind and target version.
+        """
+        return (
+            not self._update_blocks_topology()
+            and self.desired > 0
+            and not any(r.state in STARTUP + DRAIN for r in replicas)
+            and not any(r.state in TERMINAL and r.resource is not None for r in replicas)
+            and sum(r.state == S.READY for r in replicas) == self.desired
+        )
+
     def set_desired(self, count: int) -> dict:
         # Preserve MVP-0 desired-state changes during normal reconciliation.
         # Begin/commit also hold this lock, so the policy gate is atomic here.
@@ -250,16 +264,12 @@ class ReplicaManager:
                 raise PolicyConflict(RECOVERY_REQUIRED)
             if kind == K.EXTERNAL_HCCL and target_version <= self.serving_policy_version:
                 raise ValueError("target_version must exceed serving_policy_version")
+            replicas = list(self.traffic.replicas.values())
             if self._update_blocks_topology():
                 raise PolicyConflict("policy update active or failed")
             if self.desired <= 0:
                 raise PolicyConflict("policy update requires at least one READY replica")
-            replicas = list(self.traffic.replicas.values())
-            if (
-                any(r.state in STARTUP + DRAIN for r in replicas)
-                or any(r.state in TERMINAL and r.resource is not None for r in replicas)
-                or sum(r.state == S.READY for r in replicas) != self.desired
-            ):
+            if not self._stable_for_policy_update(replicas):
                 raise PolicyConflict("deployment must be stable before policy update")
             update = PolicyUpdateDescriptor(
                 uuid4().hex,
@@ -638,6 +648,16 @@ class ReplicaManager:
                 "transport": self.transfer.transport_status(),
                 "policy_update": asdict(self.policy_update) if self.policy_update else None,
                 "accepting_routes": self.traffic.accepting_routes,
+                "serving_ready_for_external_update": (
+                    self.spec.replica.weight_sync == "hccl"
+                    and not self.closing
+                    and not self.generation_paused
+                    and self.traffic.accepting_routes
+                    and not (
+                        self.transfer.transport and self.transfer.transport.state == "POISONED"
+                    )
+                    and self._stable_for_policy_update(replicas)
+                ),
                 "generation_paused": self.generation_paused,
                 "route_pause_reasons": self.traffic.route_pause_reasons,
                 "desired_replicas": self.desired,

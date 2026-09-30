@@ -1,5 +1,15 @@
 # ElasticRollout
 
+## MVP-2B Verl V1 quick start
+
+Fill in the model, data, Ray node and network values in [the single LaunchSpec](examples/verl_v1_launch.json) and [its Core slot template](examples/verl_v1_core.template.json), then run from the NPU environment:
+
+```bash
+elastic-rollout verl run -c examples/verl_v1_launch.json --smoke-report mvp2b-smoke.json
+```
+
+The launcher resolves one concrete Ray cluster address, validates Core and Verl settings, waits for the stable serving topology, supervises both processes and waits for Core cleanup. See [the integration guide](docs/verl_separate_async.md) and [the final smoke checklist](docs/validation/mvp2b_final_validation.md).
+
 独立的 RL 推理弹性组件：公共运行时管理外部 vLLM 副本，AReaL / verl 保留各自的 workflow、
 AgentLoop 和生成语义。Core 不依赖这两个框架。
 
@@ -12,7 +22,7 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | **MVP-1.5A** | AReaL Agent Proxy、Proxy 跟随 committed policy、保守磁盘更新 | **当前需要做真机验证** |
 | **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **用户已在 NPU 环境验证** |
 | MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
-| MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | V1 接缝已实现，待完整 CPU 回归和 NPU 验收 |
+| MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 既有运行时已由用户在 NPU 验证；新单入口 smoke 待执行 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
@@ -23,7 +33,7 @@ verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定
 **[MVP-2A 验证指南](docs/mvp2a-validation.md)**：依次运行原生 HCCL、Core 手工 sender、
 verl FSDP2 单/双副本和同步多步训练。此入口不包含 MVP-2B async partial rollout。
 
-**[MVP-2B Trainer V1 验证指南](docs/mvp2b-v1-validation.md)**：沿用固定 HCCL 拓扑，验证 separate_async 训练、活动请求更新和跨策略版本续接。真机验收尚未执行。
+**[MVP-2B Trainer V1 验证指南](docs/mvp2b-v1-validation.md)**：既有运行时验证记录；新单入口的验收步骤见[最终清单](docs/validation/mvp2b_final_validation.md)。
 
 > 示例中的 `deployment_id: "mvp0"` 只是部署名称。使用该名称的现有部署也可以验证 MVP-1，
 > 不需要为了阶段名称改动已经跑通的配置。

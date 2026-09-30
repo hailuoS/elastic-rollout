@@ -73,11 +73,25 @@ class _ProcessActor:
 
 
 class RayProcessLauncher:
-    def __init__(self, address: str = "auto", namespace: str = "elastic-rollout"):
+    def __init__(
+        self,
+        address: str = "auto",
+        namespace: str = "elastic-rollout",
+        expected_gcs: str | None = None,
+    ):
         import ray
 
         if not ray.is_initialized():
-            ray.init(address=address, namespace=namespace)
+            context = ray.init(address=address, namespace=namespace)
+        else:
+            context = ray.get_runtime_context()
+        if expected_gcs is not None:
+            info = getattr(context, "address_info", None)
+            actual = info.get("gcs_address") if isinstance(info, dict) else None
+            if actual != expected_gcs:
+                raise RuntimeError(
+                    f"Core connected to Ray GCS {actual!r}, expected {expected_gcs!r}"
+                )
         self.ray = ray
         self.actors: dict = {}
         self.starts: dict = {}
