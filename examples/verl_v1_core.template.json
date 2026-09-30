@@ -11,6 +11,7 @@
   ],
   "deployments": [
     {
+      "desired_replicas": 1,
       "replica": {
         "served_model_name": "policy",
         "tensor_parallel_size": 2,

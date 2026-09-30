@@ -29,6 +29,7 @@ def main() -> None:
     run = verl_sub.add_parser("run")
     run.add_argument("-c", "--config", type=Path, required=True)
     run.add_argument("--smoke-report", type=Path)
+    run.add_argument("--smoke-prompt-ids", type=int, nargs="+")
     for command in ("status", "scale"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--endpoint", required=True)
@@ -41,7 +42,13 @@ def main() -> None:
     if args.command == "verl":
         from .integrations.verl.launcher import run_launch
 
-        raise SystemExit(run_launch(args.config, smoke_report=args.smoke_report))
+        raise SystemExit(
+            run_launch(
+                args.config,
+                smoke_report=args.smoke_report,
+                smoke_prompt_ids=args.smoke_prompt_ids,
+            )
+        )
     token = os.environ.get("ELASTIC_ROLLOUT_TOKEN")
     if args.command != "serve":
         client = ControlClient(args.endpoint, args.deployment, token=token)

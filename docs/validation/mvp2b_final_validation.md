@@ -4,14 +4,16 @@
 
 The user reported prior NPU validation of Direct HCCL, active-request safe updates, physical cross-policy continuation, Verl V1 trajectory integration, natural separate_async training, lifecycle 409 recovery, HCCL fail-closed behavior and generation crash handling. Those results predate this single-entry launcher.
 
-Local CPU validation covers LaunchSpec conflicts, stock Verl Hydra composition, Ray address resolution, the Core topology readiness view, post-Ray-init signal handler installation and launcher process supervision. The new single-entry 2–3 step NPU smoke has **not** run in this Windows workspace; the NPU environment is not currently accessible. Do not mark this integration path closed until the smoke assertions below pass there.
+Local CPU validation covers LaunchSpec conflicts, stock Verl Hydra composition, Ray address resolution, the Core topology readiness view, post-Ray-init signal handler installation, launcher process supervision, and the `Controller.close()` admission gate. The new single-entry 2–3 step NPU smoke has **not** run in this Windows workspace; the NPU environment is not currently accessible. MVP-2B remains open until the smoke assertions below pass there.
+
+Latest local result (2026-09-30): ElasticRollout `python -m pytest -q` passed with **421 passed, 10 skipped**. The targeted close/admission and Verl launch tests passed with **34 passed**. Ruff and `git diff --check` passed. The three adjacent Verl V1 CPU tests could not collect in this Windows Python environment because `numpy` and `torch` are absent; rerun them in the equipped NPU environment. The real-Ray SIGTERM test and single-entry NPU smoke remain pending there. No current result closes the MVP-2B NPU gate.
 
 ## CPU gate
 
 In ElasticRollout, with pytest and Hydra installed:
 
 ```bash
-python -m pytest tests/test_verl_launch.py tests/test_verl_hccl.py tests/test_hccl_transfer.py tests/test_policy_updates.py -q
+python -m pytest tests/test_verl_launch.py tests/test_verl_launch_signal.py tests/test_ray_launcher.py tests/test_http.py tests/test_verl_hccl.py tests/test_hccl_transfer.py tests/test_policy_updates.py -q
 python -m pytest -q
 ```
 
@@ -32,7 +34,7 @@ python -m pytest tests/trainer/ppo/v1/test_external_separate_async_on_cpu.py tes
 Use one LaunchSpec, one deployment, one rollout replica, a small shared immutable model, 2–3 trainer steps and `parameter_sync_step=1`. Run the documented `elastic-rollout verl run ... --smoke-report ...` command. Confirm:
 
 1. The logged resolved GCS address is concrete. Core connects to that address, and the composed Verl `ray_kwargs.ray_init.address` equals it. The trainer process appears only after `serving_ready`.
-2. Bootstrap model path, deployment, desired/ready count and serving version v0 match the LaunchSpec. No STARTUP/DRAIN or resource-holding terminal replica, active update, poisoned HCCL transport or closed admission remains at the readiness gate.
+2. Bootstrap model path, deployment and serving version v0 match the LaunchSpec. Desired/ready count matches the Core template, including the final readiness barrier check. No STARTUP/DRAIN or resource-holding terminal replica, active update, poisoned HCCL transport or closed admission remains at the readiness gate.
 3. Verl completes an initial rollout and at least one Direct HCCL commit. The serving version increases beyond v0.
 4. The smoke report contains generated tokens whose per-token versions equal the final committed serving version. This proves a generation after the update actually used the new policy.
 5. Trainer exits zero. Core exits zero after `Controller.close()` and releases its rollout slots. Inspect Ray actors and the configured rollout API ports for orphans.

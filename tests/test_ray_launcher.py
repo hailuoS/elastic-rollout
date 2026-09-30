@@ -31,6 +31,25 @@ def fake_ray(monkeypatch):
     return ray
 
 
+def test_expected_gcs_rejects_already_initialized_ray_driver(fake_ray):
+    with pytest.raises(RuntimeError, match="already initialized driver"):
+        RayProcessLauncher(expected_gcs="10.0.0.3:6379")
+    fake_ray.get_runtime_context.assert_not_called()
+    RayProcessLauncher()
+
+
+@pytest.mark.parametrize("actual,valid", [("10.0.0.3:6379", True), ("10.0.0.4:6379", False)])
+def test_expected_gcs_checks_fresh_ray_context(fake_ray, actual, valid):
+    fake_ray.is_initialized = lambda: False
+    fake_ray.init = MagicMock(return_value=SimpleNamespace(address_info={"gcs_address": actual}))
+    if valid:
+        RayProcessLauncher(expected_gcs="10.0.0.3:6379")
+    else:
+        with pytest.raises(RuntimeError, match="Core connected to Ray GCS"):
+            RayProcessLauncher(expected_gcs="10.0.0.3:6379")
+    fake_ray.init.assert_called_once_with(address="auto", namespace="elastic-rollout")
+
+
 @pytest.mark.parametrize("tp", [2, 4, 8])
 def test_ray_reserves_npu_and_node_before_start(fake_ray, tp):
     launcher = RayProcessLauncher()

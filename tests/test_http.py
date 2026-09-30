@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -47,6 +48,36 @@ def test_control_api_and_auth(http_runtime):
     with pytest.raises(ControlError) as error:
         request_json(client.endpoint + "/elastic/generate", "POST", {}, token=client.token)
     assert error.value.status == 404
+
+
+def test_close_closes_admission_before_waiting_for_generation_lock(http_runtime, monkeypatch):
+    client, (controller, manager, _, _) = http_runtime
+    manager.spec = replace(manager.spec, drain_grace_period=0)
+    lease = client.acquire("existing")
+    gate_closed = threading.Event()
+    pause_routes = manager.traffic.pause_routes
+
+    def observe_pause(reason):
+        pause_routes(reason)
+        if reason == "shutdown":
+            gate_closed.set()
+
+    monkeypatch.setattr(manager.traffic, "pause_routes", observe_pause)
+    manager.generation_lock.acquire()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        closing = pool.submit(controller.close, timeout=5)
+        try:
+            assert gate_closed.wait(5)
+            assert not closing.done()
+            with pytest.raises(ControlError) as error:
+                client.acquire("new")
+            assert error.value.status == 503
+            assert client.renew(lease.lease_id).lease_id == lease.lease_id
+            assert client.release(lease.lease_id)
+        finally:
+            manager.generation_lock.release()
+        assert closing.result(timeout=5) is None
+    assert controller.resources.allocated == 0
 
 
 def test_concurrent_http_route_acquire_and_release(http_runtime):

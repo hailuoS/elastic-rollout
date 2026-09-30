@@ -5,7 +5,7 @@
 Fill in the model, data, Ray node and network values in [the single LaunchSpec](examples/verl_v1_launch.json) and [its Core slot template](examples/verl_v1_core.template.json), then run from the NPU environment:
 
 ```bash
-elastic-rollout verl run -c examples/verl_v1_launch.json --smoke-report mvp2b-smoke.json
+elastic-rollout verl run -c examples/verl_v1_launch.json --smoke-report mvp2b-smoke.json --smoke-prompt-ids 1 2
 ```
 
 The launcher resolves one concrete Ray cluster address, validates Core and Verl settings, waits for the stable serving topology, supervises both processes and waits for Core cleanup. See [the integration guide](docs/verl_separate_async.md) and [the final smoke checklist](docs/validation/mvp2b_final_validation.md).

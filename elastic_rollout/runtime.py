@@ -743,11 +743,14 @@ class Controller:
         with self._lock:
             self._closed = True
             for manager in self.deployments.values():
+                # Stop new leases before waiting for an in-flight generation operation.
+                with manager.traffic.lock:
+                    manager.closing = True
+                    manager.traffic.pause_routes("shutdown")
+            for manager in self.deployments.values():
                 with manager.generation_lock, manager.mutation_lock, manager.traffic.lock:
                     if manager._update_blocks_topology():
                         manager._fail_update(RuntimeError("controller shutting down"))
-                    manager.closing = True
-                    manager.traffic.pause_routes("shutdown")
                     manager.desired = 0
         deadline = time.monotonic() + timeout
         while True:

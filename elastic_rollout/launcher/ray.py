@@ -81,10 +81,14 @@ class RayProcessLauncher:
     ):
         import ray
 
-        if not ray.is_initialized():
-            context = ray.init(address=address, namespace=namespace)
+        if ray.is_initialized():
+            if expected_gcs is not None:
+                raise RuntimeError(
+                    "cannot verify expected Ray GCS in an already initialized driver"
+                )
+            context = None
         else:
-            context = ray.get_runtime_context()
+            context = ray.init(address=address, namespace=namespace)
         if expected_gcs is not None:
             info = getattr(context, "address_info", None)
             actual = info.get("gcs_address") if isinstance(info, dict) else None

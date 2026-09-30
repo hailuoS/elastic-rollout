@@ -13,8 +13,8 @@ from test_runtime import ready
 
 from elastic_rollout import cli
 from elastic_rollout.api import ReplicaState as S
-from elastic_rollout.integrations.verl import launcher
-from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_hydra_config
+from elastic_rollout.integrations.verl import launcher, smoke
+from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_mvp2b_verl_config
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def launch_file(tmp_path):
                         "port": 9001,
                     }
                 ],
-                "deployments": [{"replica": {"tensor_parallel_size": 2}}],
+                "deployments": [{"desired_replicas": 1, "replica": {"tensor_parallel_size": 2}}],
             }
         ),
         encoding="utf-8",
@@ -49,17 +49,27 @@ def launch_file(tmp_path):
                     "advertise_host": "10.0.0.1",
                     "port": 18080,
                 },
-                "deployment": {"id": "rollout", "replicas": 1, "core_template": "core.json"},
-                "model": {"path": str(model), "shared_immutable": True, "initial_version": 0},
+                "deployment": {"id": "rollout", "core_template": "core.json"},
+                "model": {"path": str(model), "initial_version": 0},
                 "verl": {
-                    "base_config": "ppo_trainer",
-                    "trainer_nodes": 1,
-                    "trainer_npus_per_node": 2,
-                    "actor_mini_batch_size": 1,
-                    "parameter_sync_step": 1,
-                    "overrides": ["data.train_files=/tmp/train.parquet"],
+                    "overrides": [
+                        "data.train_files=/tmp/train.parquet",
+                        "data.train_batch_size=1",
+                        "trainer.device=npu",
+                        "trainer.resume_mode=disable",
+                        "trainer.nnodes=1",
+                        "trainer.n_gpus_per_node=2",
+                        "trainer.v1.separate_async.parameter_sync_step=1",
+                        "actor_rollout_ref.actor.strategy=fsdp2",
+                        "actor_rollout_ref.actor.ppo_mini_batch_size=1",
+                        "actor_rollout_ref.rollout.name=vllm",
+                        "actor_rollout_ref.rollout.mode=async",
+                        "actor_rollout_ref.rollout.nnodes=1",
+                        "actor_rollout_ref.rollout.n_gpus_per_node=2",
+                        "actor_rollout_ref.rollout.free_cache_engine=false",
+                        "actor_rollout_ref.rollout.multi_turn.enable=false",
+                    ],
                 },
-                "smoke": {"prompt_ids": [1, 2]},
             }
         ),
         encoding="utf-8",
@@ -83,7 +93,8 @@ def test_launch_spec_owns_core_and_verl_identity(launch_file):
     assert f"actor_rollout_ref.model.path={spec.model_path}" in overrides
     assert f"++actor_rollout_ref.rollout.custom.elastic.endpoint={spec.endpoint}" in overrides
     assert "actor_rollout_ref.rollout.nnodes=1" in overrides
-    assert "actor_rollout_ref.rollout.n_gpus_per_node=2" in overrides
+    assert "trainer.n_gpus_per_node=2" in overrides
+    assert "trainer.n_gpus_per_node" not in spec.integration_values("10.0.0.3:6379")
     assert "data.train_files=/tmp/train.parquet" in overrides
     with pytest.raises(ValueError, match="concrete"):
         spec.trainer_overrides("auto")
@@ -97,7 +108,7 @@ def test_generated_overrides_compose_real_verl_base(launch_file, monkeypatch):
     monkeypatch.syspath_prepend(str(verl_checkout))
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
-    validate_hydra_config(spec.trainer_overrides(address), spec._owned_overrides(address))
+    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 def test_model_path_with_spaces_is_quoted_for_real_hydra(launch_file, monkeypatch):
@@ -111,14 +122,13 @@ def test_model_path_with_spaces_is_quoted_for_real_hydra(launch_file, monkeypatc
     _edit_json(launch_file, lambda data: data["model"].update(path=str(renamed)))
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
-    validate_hydra_config(spec.trainer_overrides(address), spec._owned_overrides(address))
+    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
         ("deployment_id", "other"),
-        ("desired_replicas", 2),
         ("replica.model", "/wrong/model"),
         ("replica.policy_version", 1),
         ("replica.weight_sync", "snapshot"),
@@ -143,7 +153,6 @@ def test_core_template_conflicts_fail(launch_file, field, value):
     "override",
     [
         "actor_rollout_ref.model.path=/other",
-        "trainer.n_gpus_per_node=8",
         "++actor_rollout_ref.rollout.custom.elastic.endpoint=http://other:8000",
         "ray_kwargs.ray_init.address=auto",
         "++actor_rollout_ref.rollout.custom.elastic={endpoint:wrong}",
@@ -153,6 +162,37 @@ def test_verl_override_conflicts_fail(launch_file, override):
     _edit_json(launch_file, lambda data: data["verl"].update(overrides=[override]))
     with pytest.raises(ValueError, match="conflicts|overlaps"):
         LaunchSpec.from_file(launch_file).trainer_overrides("10.0.0.3:6379")
+
+
+def test_trainer_resource_settings_remain_verl_owned(launch_file, monkeypatch):
+    pytest.importorskip("hydra")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "verl"))
+    _edit_json(
+        launch_file,
+        lambda data: data["verl"]["overrides"].append("trainer.n_gpus_per_node=8"),
+    )
+    spec = LaunchSpec.from_file(launch_file)
+    address = "10.0.0.3:6379"
+    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
+
+
+@pytest.mark.parametrize(
+    "override,error",
+    [
+        ("data.train_batch_size=2", "train_batch_size"),
+        ("actor_rollout_ref.rollout.n_gpus_per_node=4", "resource shape"),
+    ],
+)
+def test_verl_owned_training_values_still_validate(launch_file, monkeypatch, override, error):
+    pytest.importorskip("hydra")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "verl"))
+    _edit_json(launch_file, lambda data: data["verl"]["overrides"].append(override))
+    spec = LaunchSpec.from_file(launch_file)
+    address = "10.0.0.3:6379"
+    with pytest.raises(ValueError, match=error):
+        validate_mvp2b_verl_config(
+            spec, address, spec.trainer_overrides(address), spec.core_config()
+        )
 
 
 def test_static_slot_and_unknown_endpoint_conflicts_fail(launch_file):
@@ -181,6 +221,12 @@ def test_unknown_launch_fields_fail_fast(launch_file):
         LaunchSpec.from_file(launch_file)
 
 
+def test_fixed_verl_base_config_is_not_public(launch_file):
+    _edit_json(launch_file, lambda data: data["verl"].update(base_config="ppo_trainer"))
+    with pytest.raises(ValueError, match="unsupported verl fields"):
+        LaunchSpec.from_file(launch_file)
+
+
 def test_smoke_requires_generation_from_committed_version(launch_file, monkeypatch):
     spec = LaunchSpec.from_file(launch_file)
     status = {
@@ -198,12 +244,12 @@ def test_smoke_requires_generation_from_committed_version(launch_file, monkeypat
         async def generate(self, *_args, **_kwargs):
             return SimpleNamespace(token_ids=[42], versions=[status["serving_policy_version"]])
 
-    monkeypatch.setattr(launcher, "GenerationClient", FakeGenerationClient)
-    report = launcher._smoke_probe(client, spec, core, [0])
+    monkeypatch.setattr(smoke, "GenerationClient", FakeGenerationClient)
+    report = smoke.probe_generation(client, spec, core, [0], [1, 2])
     assert report["post_update_token_versions"] == [1]
     status["serving_policy_version"] = 0
     with pytest.raises(TimeoutError, match="newer than bootstrap"):
-        launcher._smoke_probe(client, replace(spec, startup_timeout_s=0.01), core, [0])
+        smoke.probe_generation(client, replace(spec, startup_timeout_s=0.01), core, [0], [1, 2])
 
 
 def test_smoke_detects_open_rollout_port():
@@ -211,8 +257,8 @@ def test_smoke_detects_open_rollout_port():
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         slot = {"host": "127.0.0.1", "port": listener.getsockname()[1], "slot_id": "r0"}
-        assert not launcher._rollout_ports_closed([slot], timeout=0.01)
-    assert launcher._rollout_ports_closed([slot], timeout=0.01)
+        assert not smoke.rollout_ports_closed([slot], timeout=0.01)
+    assert smoke.rollout_ports_closed([slot], timeout=0.01)
 
 
 def test_ready_view_reuses_policy_topology_gate(runtime):
@@ -228,7 +274,7 @@ def test_ready_view_reuses_policy_topology_gate(runtime):
     assert manager.status()["serving_ready_for_external_update"] is False
 
 
-def test_serving_ready_validates_bootstrap_identity(launch_file):
+def test_launcher_validates_bootstrap_once_and_uses_core_readiness(launch_file):
     spec = LaunchSpec.from_file(launch_file)
     status = {
         "spec": {
@@ -247,29 +293,74 @@ def test_serving_ready_validates_bootstrap_identity(launch_file):
         "serving_ready_for_external_update": True,
         "policy_update": None,
     }
-    assert launcher.serving_ready(status, spec)
+    launcher.validate_bootstrap(status, spec, spec.core_config())
     status["serving_ready_for_external_update"] = False
-    assert not launcher.serving_ready(status, spec)
+    assert not status["serving_ready_for_external_update"]
     status["spec"]["replica"]["model"] = "/wrong/model"
     with pytest.raises(RuntimeError, match="bootstrap model"):
-        launcher.serving_ready(status, spec)
+        launcher.validate_bootstrap(status, spec, spec.core_config())
 
 
-def test_ray_auto_is_resolved_and_capacity_checked_before_children(launch_file, monkeypatch):
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("serving_policy_version", 1, "serving version changed"),
+        ("desired_replicas", 2, "desired topology changed"),
+    ],
+)
+def test_readiness_rejects_identity_change_before_trainer(
+    launch_file, monkeypatch, field, value, error
+):
+    spec = LaunchSpec.from_file(launch_file)
+    status = {
+        "spec": {
+            "deployment_id": spec.deployment_id,
+            "replica": {"model": spec.model_path, "policy_version": 0, "weight_sync": "hccl"},
+        },
+        "bootstrap_snapshot": {"model_path": spec.model_path, "version": 0},
+        "desired_replicas": 1,
+        "serving_policy_version": 0,
+        "serving_ready_for_external_update": False,
+    }
+    calls = 0
+
+    def next_status():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            status["serving_ready_for_external_update"] = True
+            status[field] = value
+        return status
+
+    monkeypatch.setattr(launcher.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match=error):
+        launcher._wait_ready(
+            SimpleNamespace(status=next_status),
+            spec,
+            spec.core_config(),
+            SimpleNamespace(poll=lambda: None),
+            [0],
+        )
+
+
+def test_ray_auto_checks_rollout_slots_without_predicting_trainer_placement(
+    launch_file, monkeypatch
+):
     spec = LaunchSpec.from_file(launch_file)
     shutdown = Mock()
     ray = SimpleNamespace(
         is_initialized=lambda: False,
         init=lambda **kwargs: SimpleNamespace(address_info={"gcs_address": "10.0.0.3:6379"}),
-        nodes=lambda: [{"NodeID": "node-0", "Alive": True, "Resources": {"NPU": 4}}],
+        nodes=lambda: [{"NodeID": "node-0", "Alive": True, "Resources": {"NPU": 2}}],
         shutdown=shutdown,
     )
     monkeypatch.setitem(sys.modules, "ray", ray)
     assert launcher.resolve_ray_cluster(spec, spec.core_config()) == "10.0.0.3:6379"
     shutdown.assert_called_once()
-    insufficient = replace(spec, trainer_npus_per_node=3)
-    with pytest.raises(ValueError, match="need 5"):
-        launcher.resolve_ray_cluster(insufficient, insufficient.core_config())
+    core = spec.core_config()
+    core["slots"][0]["num_devices"] = 3
+    with pytest.raises(ValueError, match="rollout slots need 3"):
+        launcher.resolve_ray_cluster(spec, core)
     assert shutdown.call_count == 2
 
 
@@ -347,9 +438,11 @@ def test_launcher_supervises_both_children(
     trainer = Child(trainer_exit, 0)
     processes = iter((core, trainer))
     monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-    monkeypatch.setattr(launcher, "validate_hydra_config", lambda *_: None)
+    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: next(processes))
-    monkeypatch.setattr(launcher, "_wait_ready", lambda *a: {"serving_policy_version": 0})
+    monkeypatch.setattr(
+        launcher, "_wait_ready", lambda *a: {"serving_policy_version": 0, "ready_replicas": 1}
+    )
     monkeypatch.setattr(
         launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
     )
@@ -368,7 +461,7 @@ def test_bootstrap_failure_never_starts_trainer(launch_file, monkeypatch):
     child.pid = 42
     starts = Mock(return_value=child)
     monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-    monkeypatch.setattr(launcher, "validate_hydra_config", lambda *_: None)
+    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", starts)
     monkeypatch.setattr(launcher, "_wait_ready", Mock(side_effect=TimeoutError("not ready")))
     monkeypatch.setattr(
