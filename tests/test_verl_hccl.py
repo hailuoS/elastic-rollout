@@ -120,7 +120,7 @@ def test_manager_order_and_failure_no_resume(adapters, monkeypatch):
     _, module = adapters
     events = []
     clock = NS(now=0.0)
-    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now))
+    monkeypatch.setattr("elastic_rollout.weight_sync.time", NS(monotonic=lambda: clock.now))
 
     class Control:
         inflight = 3
@@ -229,7 +229,9 @@ def test_manager_retries_lifecycle_conflict_then_completes_update(adapters, monk
         sleeps.append(seconds)
         clock.now += seconds
 
-    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now, sleep=sleep))
+    monkeypatch.setattr(
+        "elastic_rollout.weight_sync.time", NS(monotonic=lambda: clock.now, sleep=sleep)
+    )
 
     class Control:
         begin_calls = 0
@@ -287,8 +289,18 @@ def test_manager_retries_lifecycle_conflict_then_completes_update(adapters, monk
     assert sleeps == [0.1, 0.2]
     assert metrics["elastic_hccl/hccl_init_s"] == 0.0
     assert events == [
-        "begin", "begin", "begin", "pause", "prepare", "prepare",
-        "configure_session", "start", "send", "finish", "commit", "resume",
+        "begin",
+        "begin",
+        "begin",
+        "pause",
+        "prepare",
+        "prepare",
+        "configure_session",
+        "start",
+        "send",
+        "finish",
+        "commit",
+        "resume",
     ]
 
 
@@ -307,7 +319,7 @@ def test_manager_does_not_retry_other_control_errors(adapters, monkeypatch, erro
     manager.control = NS(status=lambda: {}, begin_external_update=begin)
     manager.actor_wg = MagicMock()
     monkeypatch.setattr(
-        module,
+        sys.modules["elastic_rollout.weight_sync"],
         "time",
         NS(monotonic=lambda: 0.0, sleep=lambda _: pytest.fail("unexpected retry sleep")),
     )
@@ -338,7 +350,9 @@ def test_manager_lifecycle_retry_wait_budget_is_bounded(adapters, monkeypatch):
         sleeps.append(seconds)
         clock.now += seconds
 
-    monkeypatch.setattr(module, "time", NS(monotonic=lambda: clock.now, sleep=sleep))
+    monkeypatch.setattr(
+        "elastic_rollout.weight_sync.time", NS(monotonic=lambda: clock.now, sleep=sleep)
+    )
     manager = module.ElasticCheckpointEngineManager.__new__(module.ElasticCheckpointEngineManager)
     manager.control = NS(status=lambda: {}, begin_external_update=begin)
     manager.actor_wg = MagicMock()
@@ -530,7 +544,7 @@ def test_sender_persistent_identity_and_one_init_across_three_updates(adapters, 
     def forbidden_bind():
         raise AssertionError("rendezvous must not be chosen/bound again")
 
-    monkeypatch.setattr(module, "socket", NS(socket=forbidden_bind))
+    monkeypatch.setattr("elastic_rollout.hccl_sender.socket", NS(socket=forbidden_bind))
     for version in (1, 2, 3):
         assert engine.prepare() == metadata
         session = dict(

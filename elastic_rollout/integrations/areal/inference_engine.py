@@ -290,3 +290,29 @@ class ElasticEvaluationEngine(ElasticInferenceEngine):
         if version < self._version or self.control.status()["policy"]["version"] != version:
             raise RuntimeError("evaluation version must match the committed training policy")
         self._version = version
+
+
+class ElasticHCCLInferenceEngine(ElasticInferenceEngine):
+    """HCCL is committed by the actor controller; workflows observe that commit."""
+
+    @classmethod
+    def prepare_weight_update_meta(cls, meta):
+        if meta.type != "xccl" or meta.use_lora or meta.colocate_mode:
+            raise ValueError("MVP-3 requires full-model non-colocated xccl metadata")
+        return meta
+
+    def initialize(self, *args, **kwargs):
+        super().initialize(*args, **kwargs)
+        if self.control.status()["spec"]["replica"]["weight_sync"] != "hccl":
+            raise ValueError("MVP-3 requires a Core deployment with weight_sync=hccl")
+
+    def set_version(self, version: int) -> None:
+        nonnegative_int(version, "version")
+        with self._weight_lock:
+            status = self.control.status()
+            if version < self._version or status["serving_policy_version"] != version:
+                raise RuntimeError("HCCL workflow version must match the committed serving policy")
+            self._version = version
+
+    def update_weights_from_disk(self, meta):
+        raise ValueError("MVP-3 HCCL workflows observe commits; disk updates are unsupported")

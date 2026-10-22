@@ -22,11 +22,20 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | **MVP-1.5A** | AReaL Agent Proxy、Proxy 跟随 committed policy、保守磁盘更新 | **当前需要做真机验证** |
 | **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **用户已在 NPU 环境验证** |
 | MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
-| MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 既有运行时已由用户在 NPU 验证；新单入口 smoke 待执行 |
+| MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
+| MVP-3 | AReaL FSDP2 Direct HCCL，与 verl 复用 sender 和策略事务 | 已实现；CPU contract 验证，NPU 验收待执行 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
 verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定权重生成入口保留。
+
+## MVP-3：AReaL Direct HCCL
+
+[MVP-3 接入与验收指南](docs/mvp3-validation.md) 包含 Core 配置、AReaL 启动方式、
+支持边界和 NPU 验收清单。`ElasticPPOTrainer` 默认保留快照更新；传入
+`HCCLWeightSyncConfig(master_address=...)` 可启用共享 Direct HCCL 路径，
+并将 AReaL `actor.weight_update_mode` 配为 `xccl`。现有 Agent 训练示例新增
+`--weight-sync hccl --hccl-master-address ...`。
 
 ## 验证 MVP-2A
 
@@ -92,5 +101,6 @@ ruff format --check .
 - 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
 - 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
 - 副本数手动调整，不含自动扩缩策略。
-- 已接入 verl Direct HCCL；LoRA、多模态与 MVP-2B Trainer V1 跨版本续接尚未完成相应真机验收。
+- AReaL/verl Direct HCCL 当前支持 dense BF16 FSDP2、固定副本成员；AReaL NPU 验收待执行。
+- LoRA、多模态不在当前外部训练接入范围。
 - 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。

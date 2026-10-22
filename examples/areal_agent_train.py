@@ -1,4 +1,4 @@
-"""Run AReaL's native math Agents with ElasticPPOTrainer and persistent disk updates."""
+"""Run AReaL math Agents with external replicas and snapshot or Direct HCCL updates."""
 
 import argparse
 import os
@@ -14,11 +14,21 @@ def main(args):
     from areal.utils.hf_utils import load_hf_tokenizer
 
     from elastic_rollout.integrations.areal.trainer import ElasticPPOTrainer
+    from elastic_rollout.integrations.areal.weight_sync import HCCLWeightSyncConfig
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--agent", choices=AGENT_WORKFLOWS, default="math")
     parser.add_argument("--workflow-worker-count", type=int, default=2)
+    parser.add_argument("--weight-sync", choices=("snapshot", "hccl"), default="snapshot")
+    parser.add_argument("--hccl-master-address")
+    parser.add_argument("--hccl-bucket-size-mb", type=int, default=1024)
     options, config_args = parser.parse_known_args(args)
+    sync_config = None
+    if options.weight_sync == "hccl":
+        sync_config = HCCLWeightSyncConfig(
+            master_address=options.hccl_master_address,
+            bucket_size=options.hccl_bucket_size_mb * 1024 * 1024,
+        )
     config, _ = load_expr_config(config_args, GRPOConfig)
     if os.environ.get("AREAL_PROXY_ADMIN_KEY"):
         config.rollout.agent.admin_api_key = os.environ["AREAL_PROXY_ADMIN_KEY"]
@@ -54,6 +64,7 @@ def main(args):
         train_dataset=train,
         valid_dataset=valid,
         workflow_worker_count=options.workflow_worker_count,
+        weight_sync_config=sync_config,
     ) as trainer:
         trainer.train(
             workflow=AGENT_WORKFLOWS[options.agent],
