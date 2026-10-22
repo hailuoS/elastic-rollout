@@ -82,6 +82,18 @@ def test_unreachable_actor_quarantines_slot(fake_ray):
     fake_ray.kill.assert_not_called()
 
 
+def test_unconfirmed_supervisor_cleanup_preserves_actor_and_slot(fake_ray):
+    launcher = RayProcessLauncher()
+    replica, _ = replica_and_spec()
+    launcher.start("r", replica.resource, LaunchPlan(("python",)))
+    fake_ray.get.side_effect = RuntimeError("supervisor cleanup unconfirmed")
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        launcher.stop("r")
+    assert launcher.leases["r"] is replica.resource
+    assert "r" in launcher.actors
+    fake_ray.kill.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "assigned,expected", [(["5", "4"], "4,5"), (["3", "2"], "2,3"), (["10", "2"], "2,10")]
 )
@@ -106,9 +118,35 @@ def test_child_devices_come_from_ray_not_actor_environment(
     assert set(result) == set(assigned)
     fake_ray.get_runtime_context.return_value.get_accelerator_ids.assert_called_once_with()
     child_env = popen.call_args.kwargs["env"]
+    cleanup_fd = child_env.pop("ELASTIC_ROLLOUT_CLEANUP_FD")
+    assert popen.call_args.kwargs["pass_fds"] == (int(cleanup_fd),)
+    assert popen.call_args.kwargs["start_new_session"] is True
     assert child_env == before | {"ASCEND_RT_VISIBLE_DEVICES": expected}
+    os.close(actor.cleanup_fd)
     assert dict(os.environ) == before
     assert "elastic_rollout.launcher.supervisor" in popen.call_args.args[0]
+
+
+@pytest.mark.parametrize("exit_code,ack", [(0, b"CLEAN\n"), (0, b""), (-9, b""), (1, b"CLEAN\n")])
+def test_actor_requires_cleanup_acknowledgement(exit_code, ack):
+    actor = _ProcessActor()
+    reader, writer = os.pipe()
+    os.write(writer, ack)
+    os.close(writer)
+    actor.cleanup_fd = reader
+    actor.actual_device_ids = ("4", "5")
+    actor.process = MagicMock()
+    actor.process.wait.return_value = exit_code
+    try:
+        if exit_code == 0 and ack:
+            assert actor.stop() == ("4", "5")
+            assert actor.stop() == ("4", "5")  # Cleanup retries remain idempotent.
+        else:
+            with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+                actor.stop()
+    finally:
+        if actor.cleanup_fd is not None:
+            os.close(actor.cleanup_fd)
 
 
 @pytest.mark.parametrize(

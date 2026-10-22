@@ -447,6 +447,7 @@ def test_launcher_supervises_both_children(
         launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
     )
     monkeypatch.setattr(launcher.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
     assert launcher.run_launch(launch_file) == expected
     if core_exit is None:
         assert core.terminated
@@ -464,9 +465,59 @@ def test_bootstrap_failure_never_starts_trainer(launch_file, monkeypatch):
     monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", starts)
     monkeypatch.setattr(launcher, "_wait_ready", Mock(side_effect=TimeoutError("not ready")))
+    monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
     monkeypatch.setattr(
         launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
     )
     assert launcher.run_launch(launch_file) == 1
     starts.assert_called_once()
     child.terminate.assert_called_once()
+
+
+@pytest.mark.parametrize("ports_closed,stop_error", [(True, False), (False, False), (True, True)])
+def test_interrupted_launch_reports_cleanup_and_always_stops_core(
+    launch_file, tmp_path, monkeypatch, ports_closed, stop_error
+):
+    core, trainer = Mock(pid=101), Mock(pid=102)
+    core.poll.return_value = trainer.poll.return_value = None
+    children = iter((core, trainer))
+    events = []
+
+    def spawn(*args, **kwargs):
+        assert kwargs["start_new_session"] == (launcher.os.name == "posix")
+        child = next(children)
+        if child is trainer:
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        return child
+
+    def stop(child, timeout):
+        events.append(child.pid)
+        if child is trainer and stop_error:
+            raise OSError("termination failed")
+        return -15 if child is trainer else 0
+
+    monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
+    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+    monkeypatch.setattr(launcher.subprocess, "Popen", spawn)
+    monkeypatch.setattr(launcher, "_stop_child", stop)
+    monkeypatch.setattr(
+        launcher, "_wait_ready", lambda *_: {"serving_policy_version": 0, "ready_replicas": 1}
+    )
+    monkeypatch.setattr(
+        launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
+    )
+    port_check = Mock(return_value=ports_closed)
+    monkeypatch.setattr(smoke, "rollout_ports_closed", port_check)
+    original = signal.getsignal(signal.SIGTERM)
+    report_path = tmp_path / "run-b.json"
+    code = launcher.run_launch(launch_file, smoke_report=report_path, smoke_prompt_ids=[1, 2])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert events == [102, 101]
+    assert code == (143 if ports_closed and not stop_error else 1)
+    assert report["interrupted_signal"] == signal.SIGTERM
+    assert report["core_graceful_cleanup"] is True
+    assert report["rollout_ports_closed"] is ports_closed
+    assert report["cleanup_success"] == (ports_closed and not stop_error)
+    assert "generated_tokens" not in report
+    assert signal.getsignal(signal.SIGTERM) == original
+    port_check.assert_called_once()

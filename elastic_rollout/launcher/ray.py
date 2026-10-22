@@ -13,6 +13,7 @@ from .base import LaunchPlan
 class _ProcessActor:
     def __init__(self):
         self.process = None
+        self.cleanup_fd = None
         self.actual_device_ids: tuple[str, ...] = ()
 
     def start(
@@ -55,11 +56,22 @@ class _ProcessActor:
                 raise OSError(
                     exc.errno, f"vLLM API port {port} unavailable on this node: {exc.strerror}"
                 ) from exc
-        self.process = subprocess.Popen(
-            [sys.executable, "-m", "elastic_rollout.launcher.supervisor", *argv],
-            stdin=subprocess.PIPE,
-            env=child_env,
-        )
+        reader, writer = os.pipe()
+        child_env["ELASTIC_ROLLOUT_CLEANUP_FD"] = str(writer)
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "elastic_rollout.launcher.supervisor", *argv],
+                stdin=subprocess.PIPE,
+                env=child_env,
+                pass_fds=(writer,),
+                start_new_session=True,
+            )
+            self.cleanup_fd = reader
+        except BaseException:
+            os.close(reader)
+            raise
+        finally:
+            os.close(writer)
         return self.actual_device_ids
 
     def alive(self) -> bool:
@@ -68,7 +80,17 @@ class _ProcessActor:
     def stop(self) -> tuple[str, ...]:
         if self.process is not None:
             self.process.stdin.close()
-            self.process.wait(timeout=20)
+            code = self.process.wait(timeout=20)
+            acknowledgement = b""
+            if self.cleanup_fd is not None:
+                acknowledgement = os.read(self.cleanup_fd, 64)
+            if code != 0 or acknowledgement != b"CLEAN\n":
+                raise RuntimeError(
+                    f"supervisor cleanup unconfirmed (exit {code}); physical slot quarantined"
+                )
+            os.close(self.cleanup_fd)
+            self.cleanup_fd = None
+            self.process = None
         return self.actual_device_ids
 
 

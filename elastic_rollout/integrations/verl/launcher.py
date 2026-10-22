@@ -83,7 +83,11 @@ def _stop_child(child: subprocess.Popen | None, timeout: float) -> int | None:
     code = child.poll()
     if code is not None:
         return code
-    child.terminate()
+    logger.info("requesting child shutdown pid=%s timeout=%.1fs", child.pid, timeout)
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        return child.wait(timeout=timeout)
     try:
         return child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -149,7 +153,15 @@ def run_launch(
     env["ELASTIC_ROLLOUT_EXPECTED_GCS_ADDRESS"] = ray_address
     core = None
     trainer = None
-    report = None
+    report = (
+        {
+            "ray_gcs_address": ray_address,
+            "deployment_id": spec.deployment_id,
+            "initial_version": spec.initial_version,
+        }
+        if smoke_report is not None
+        else None
+    )
     interrupted = [0]
     previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
     for signum in previous:
@@ -185,6 +197,7 @@ def run_launch(
                     str(spec.shutdown_timeout_s),
                 ],
                 env=env,
+                start_new_session=os.name == "posix",
             )
             ready_status = _wait_ready(client, spec, core_config, core, interrupted)
             logger.info(
@@ -197,11 +210,16 @@ def run_launch(
             if interrupted[0]:
                 raise InterruptedError("launch interrupted before trainer start")
             trainer = subprocess.Popen(
-                [sys.executable, "-m", "verl.trainer.main_ppo", *trainer_overrides], env=env
+                [sys.executable, "-m", "verl.trainer.main_ppo", *trainer_overrides],
+                env=env,
+                start_new_session=os.name == "posix",
             )
             logger.info("started Verl trainer pid=%s on Ray GCS %s", trainer.pid, ray_address)
             while True:
                 if interrupted[0]:
+                    logger.info(
+                        "launcher received signal %s; stopping trainer first", interrupted[0]
+                    )
                     failed = True
                     break
                 core_code = core.poll()
@@ -219,35 +237,57 @@ def run_launch(
             if not failed and smoke_report is not None:
                 from .smoke import probe_generation
 
-                report = probe_generation(client, spec, core, interrupted, smoke_prompt_ids)
-                report["ray_gcs_address"] = ray_address
-                report["deployment_id"] = spec.deployment_id
+                report.update(probe_generation(client, spec, core, interrupted, smoke_prompt_ids))
                 report["initial_ready_replicas"] = ready_status["ready_replicas"]
     except (Exception, KeyboardInterrupt):
         logger.exception("MVP-2B launch failed")
         failed = True
     finally:
-        trainer_code = _stop_child(trainer, spec.trainer_shutdown_timeout_s)
-        if trainer is not None and trainer_code is None:
-            failed = True
-        core_code = _stop_child(core, spec.shutdown_timeout_s + 30)
-        core_cleanup_ok = core is not None and core_code == 0
-        if core is not None and not core_cleanup_ok:
-            failed = True
-            logger.error("Core graceful cleanup failed or timed out (exit %s)", core_code)
-        if report is not None:
-            from .smoke import rollout_ports_closed
+        cleanup_ok = True
+        ports_closed = None
+        trainer_code = core_code = None
+        try:
+            try:
+                trainer_code = _stop_child(trainer, spec.trainer_shutdown_timeout_s)
+                if trainer is not None and trainer_code is None:
+                    cleanup_ok = False
+            except Exception:
+                cleanup_ok = False
+                logger.exception("trainer termination failed; still attempting Core cleanup")
+            try:
+                core_code = _stop_child(core, spec.shutdown_timeout_s + 30)
+                core_cleanup_ok = core is not None and core_code == 0
+                if core is not None and not core_cleanup_ok:
+                    cleanup_ok = False
+                    logger.error("Core graceful cleanup failed or timed out (exit %s)", core_code)
+            except Exception:
+                cleanup_ok = False
+                logger.exception("Core termination failed")
+            if core is not None:
+                from .smoke import rollout_ports_closed
 
-            report["rollout_ports_closed"] = rollout_ports_closed(core_config["slots"])
-            if not report["rollout_ports_closed"]:
-                failed = True
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
-    if interrupted[0]:
-        return 128 + interrupted[0]
+                try:
+                    ports_closed = rollout_ports_closed(core_config["slots"])
+                    if not ports_closed:
+                        cleanup_ok = False
+                except Exception:
+                    cleanup_ok = False
+                    logger.exception("rollout port cleanup check failed")
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+        failed = failed or not cleanup_ok
+        if report is not None:
+            report.update(
+                trainer_exit_code=trainer_code,
+                core_exit_code=core_code,
+                core_graceful_cleanup=core_cleanup_ok,
+                rollout_ports_closed=ports_closed,
+                interrupted_signal=interrupted[0],
+                cleanup_success=cleanup_ok,
+            )
     if smoke_report is not None and report is not None:
-        report["trainer_exit_code"] = trainer.returncode
-        report["core_exit_code"] = core.returncode
-        report["core_graceful_cleanup"] = core_cleanup_ok
         smoke_report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if interrupted[0]:
+        return 128 + interrupted[0] if cleanup_ok else 1
     return 1 if failed else 0

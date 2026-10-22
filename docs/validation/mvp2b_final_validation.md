@@ -4,7 +4,7 @@
 
 The user reported prior NPU validation of Direct HCCL, active-request safe updates, physical cross-policy continuation, Verl V1 trajectory integration, natural separate_async training, lifecycle 409 recovery, HCCL fail-closed behavior and generation crash handling. Those results predate this single-entry launcher.
 
-Local CPU validation covers LaunchSpec conflicts, stock Verl Hydra composition, Ray address resolution, the Core topology readiness view, post-Ray-init signal handler installation, launcher process supervision, and the `Controller.close()` admission gate. The new single-entry 2–3 step NPU smoke has **not** run in this Windows workspace; the NPU environment is not currently accessible. MVP-2B remains open until the smoke assertions below pass there.
+Local CPU validation covers LaunchSpec conflicts, stock Verl Hydra composition, Ray address resolution, the Core topology readiness view, post-Ray-init signal handler installation, launcher process supervision, and the `Controller.close()` admission gate. On 2026-10-23 the user reported that single-entry Run A passed on NPU (three training steps, Direct HCCL updates and post-update generation). Run B SIGTERM cleanup failed with a surviving vLLM process. MVP-2B remains open pending successful Run B; this Windows workspace has not independently repeated the NPU runs.
 
 Latest local result (2026-09-30): ElasticRollout `python -m pytest -q` passed with **421 passed, 10 skipped**. The targeted close/admission and Verl launch tests passed with **34 passed**. Ruff and `git diff --check` passed. The three adjacent Verl V1 CPU tests could not collect in this Windows Python environment because `numpy` and `torch` are absent; rerun them in the equipped NPU environment. The real-Ray SIGTERM test and single-entry NPU smoke remain pending there. No current result closes the MVP-2B NPU gate.
 
@@ -30,6 +30,44 @@ python -m pytest tests/trainer/ppo/v1/test_external_separate_async_on_cpu.py tes
 ```
 
 ## NPU smoke gate
+
+### Run B shutdown hardening (2026-10-23)
+
+Windows CPU regression: full suite **433 passed, 13 skipped**; the final targeted
+guardian/Ray launcher/Verl launcher regression **76 passed, 6 skipped**. Ruff lint,
+format checks for changed Python files and `git diff --check` passed. Linux process
+group tests and the real Ray signal test were skipped here and remain required on
+the equipped host. The installed Ruff version also reports formatting differences
+in two unchanged test files; those files were left untouched.
+
+Run A was reported successful: three training steps, Direct HCCL updates and
+post-update generation passed. Run B remains open after a SIGTERM run left a
+vLLM API server alive. The exact origin of that run's supervisor death is not
+yet established; a trainer topology conflict alone does not prove Core closed
+before the trainer.
+
+The shutdown path now isolates Core, trainer and guardian process sessions,
+installs guardian signal handlers before spawning vLLM, and requires a separate
+cleanup acknowledgement after the vLLM process group disappears. A dead guardian
+without that acknowledgement cannot release its slot. SIGTERM runs also check
+rollout ports and write the requested report even without post-update generation.
+Trainer-stop errors do not bypass Core cleanup. Guardian logs include its PID,
+the vLLM PID/PGID and TERM/KILL/cleanup phases.
+
+Run the Linux process-level regression before repeating Run B:
+
+```bash
+python -m pytest tests/test_supervisor.py tests/test_ray_launcher.py tests/test_verl_launch.py tests/test_verl_launch_signal.py -q
+```
+
+Use `--smoke-report run-b.json` for Run B. After sending SIGTERM to the launcher
+PID, expect exit 143 only when shutdown checks succeeded. Cleanup failure returns
+1. Inspect `interrupted_signal`, `trainer_exit_code`, `core_exit_code`,
+`core_graceful_cleanup`, `rollout_ports_closed` and `cleanup_success`. This report
+does not independently prove remote trainer actors or all NPU workers are gone:
+also inspect Ray actors, OS processes and device memory. Preserve timestamped
+launcher/Core/guardian/trainer logs and the exact signal command. Run A need not
+be repeated for this acceptance; MVP-2B remains open pending Run B.
 
 Use one LaunchSpec, one deployment, one rollout replica, a small shared immutable model, 2–3 trainer steps and `parameter_sync_step=1`. Run the documented `elastic-rollout verl run ... --smoke-report ...` command. Confirm:
 
