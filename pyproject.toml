@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elastic-rollout"
+version = "0.1.0"
+description = "Framework-independent external vLLM replica runtime"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+ray = ["ray>=2.40,<3"]
+test = ["pytest>=8", "ruff>=0.9"]
+
+[project.scripts]
+elastic-rollout = "elastic_rollout.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["elastic_rollout*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["cluster: requires installed RL frameworks, Ray and Ascend vLLM servers"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
