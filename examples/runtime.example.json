@@ -1,0 +1,25 @@
+{
+  "slots": [
+    {"slot_id": "slot0", "node_id": "REPLACE_RAY_NODE_ID_0", "host": "REPLACE_NODE_IP_0", "num_devices": 8, "port": 8000},
+    {"slot_id": "slot1", "node_id": "REPLACE_RAY_NODE_ID_1", "host": "REPLACE_NODE_IP_1", "num_devices": 8, "port": 8000},
+    {"slot_id": "slot2", "node_id": "REPLACE_RAY_NODE_ID_2", "host": "REPLACE_NODE_IP_2", "num_devices": 8, "port": 8000},
+    {"slot_id": "slot3", "node_id": "REPLACE_RAY_NODE_ID_3", "host": "REPLACE_NODE_IP_3", "num_devices": 8, "port": 8000}
+  ],
+  "deployments": [
+    {
+      "deployment_id": "elastic-inference",
+      "desired_replicas": 2,
+      "lease_ttl": 120,
+      "drain_grace_period": 30,
+      "replica": {
+        "model": "REPLACE_WITH_MODEL_PATH_VISIBLE_ON_EVERY_NODE",
+        "served_model_name": "policy",
+        "policy_version": 0,
+        "tensor_parallel_size": 8,
+        "pipeline_parallel_size": 1,
+        "startup_timeout": 600,
+        "vllm_args": ["--dtype", "bfloat16", "--max-model-len", "4096", "--enforce-eager"]
+      }
+    }
+  ]
+}
