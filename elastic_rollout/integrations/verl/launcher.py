@@ -176,6 +176,10 @@ def run_launch(
             # readiness barrier before the new serve child has bound its port.
             family = socket.AF_INET6 if ":" in spec.bind_host else socket.AF_INET
             with socket.socket(family, socket.SOCK_STREAM) as probe:
+                # Match the HTTP server's Linux TIME_WAIT reuse on a quick
+                # restart; a live listener still makes bind fail.
+                if os.name == "posix":
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind((spec.bind_host, spec.port))
             config_path = Path(temp) / "core.json"
             config_path.write_text(json.dumps(core_config), encoding="utf-8")

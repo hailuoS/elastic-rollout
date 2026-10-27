@@ -471,7 +471,9 @@ def test_launcher_supervises_both_children(
         launcher, "_wait_ready", lambda *a: {"serving_policy_version": 0, "ready_replicas": 1}
     )
     monkeypatch.setattr(
-        launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
+        launcher.socket,
+        "socket",
+        lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None, setsockopt=lambda *_: None)),
     )
     monkeypatch.setattr(launcher.time, "sleep", lambda *_: None)
     monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
@@ -494,7 +496,9 @@ def test_bootstrap_failure_never_starts_trainer(launch_file, monkeypatch):
     monkeypatch.setattr(launcher, "_wait_ready", Mock(side_effect=TimeoutError("not ready")))
     monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
     monkeypatch.setattr(
-        launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
+        launcher.socket,
+        "socket",
+        lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None, setsockopt=lambda *_: None)),
     )
     assert launcher.run_launch(launch_file) == 1
     starts.assert_called_once()
@@ -531,7 +535,9 @@ def test_interrupted_launch_reports_cleanup_and_always_stops_core(
         launcher, "_wait_ready", lambda *_: {"serving_policy_version": 0, "ready_replicas": 1}
     )
     monkeypatch.setattr(
-        launcher.socket, "socket", lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None))
+        launcher.socket,
+        "socket",
+        lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None, setsockopt=lambda *_: None)),
     )
     port_check = Mock(return_value=ports_closed)
     monkeypatch.setattr(smoke, "rollout_ports_closed", port_check)
@@ -548,3 +554,40 @@ def test_interrupted_launch_reports_cleanup_and_always_stops_core(
     assert "generated_tokens" not in report
     assert signal.getsignal(signal.SIGTERM) == original
     port_check.assert_called_once()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux TCP TIME_WAIT semantics")
+@pytest.mark.parametrize("live", [False, True])
+def test_launch_port_reuses_closed_server_but_rejects_live_listener(launch_file, monkeypatch, live):
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        if not live:
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+                accepted, _ = server.accept()
+                with accepted:
+                    accepted.settimeout(2)
+                    accepted.shutdown(socket.SHUT_WR)
+                    assert client.recv(1) == b""
+                    client.shutdown(socket.SHUT_WR)
+                    assert accepted.recv(1) == b""
+            server.close()
+            # Confirm this exercises TIME_WAIT, rather than a plain unused port.
+            with socket.socket() as old_probe, pytest.raises(OSError):
+                old_probe.bind(("127.0.0.1", port))
+        _edit_json(launch_file, lambda data: data["controller"].update(port=port))
+        core, trainer = Mock(pid=101), Mock(pid=102)
+        core.poll.return_value, trainer.poll.return_value = None, 0
+        starts = Mock(side_effect=[core, trainer])
+        monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
+        monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+        monkeypatch.setattr(launcher.subprocess, "Popen", starts)
+        monkeypatch.setattr(launcher, "_stop_child", lambda *_: 0)
+        monkeypatch.setattr(
+            launcher, "_wait_ready", lambda *_: {"serving_policy_version": 0, "ready_replicas": 1}
+        )
+        monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
+        assert launcher.run_launch(launch_file) == (1 if live else 0)
+        assert starts.call_count == (0 if live else 2)
