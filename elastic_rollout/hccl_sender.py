@@ -238,7 +238,7 @@ class HCCLSender:
                 self.transport_init_count += 1
 
                 def initialize():
-                    self.group = self.backend.engine().trainer_init(session)
+                    self.group = self.backend.initialize(session)
                     return self.group
 
                 self._overlap("initialize", initialize)

@@ -151,10 +151,14 @@ def test_gpu_core_real_http_policy_transaction(receivers):
 
 def test_cuda_sender_does_not_import_or_touch_npu(monkeypatch):
     sent, controls = [], []
+    initialization = []
     stub_module(
         monkeypatch,
         "torch",
-        cuda=NS(current_stream=lambda: NS(synchronize=lambda: None), synchronize=lambda: None),
+        cuda=NS(
+            synchronize=lambda: initialization.append("synchronize"),
+            empty_cache=lambda: initialization.append("empty_cache"),
+        ),
     )
     for name in ("vllm", "vllm.distributed", "vllm.distributed.weight_transfer"):
         stub_module(monkeypatch, name)
@@ -163,7 +167,7 @@ def test_cuda_sender_does_not_import_or_touch_npu(monkeypatch):
         monkeypatch,
         "vllm.distributed.weight_transfer.nccl_engine",
         NCCLWeightTransferEngine=NS(
-            trainer_init=lambda session: group,
+            trainer_init=lambda session: initialization.append("native_init") or group,
             trainer_send_weights=lambda weights, args: sent.extend(name for name, _ in weights),
         ),
     )
@@ -178,9 +182,12 @@ def test_cuda_sender_does_not_import_or_touch_npu(monkeypatch):
         sender_instance_id=sender.sender_instance_id,
     )
     sender.configure_session(session)
+    assert initialization == ["synchronize", "empty_cache", "native_init"]
+    initialization.clear()
     metrics = asyncio.run(sender.send_weights(iter([("weight", Tensor())]), 1))
     assert metrics["elastic_nccl/bytes_transferred"] == 8
     sender.configure_session(dict(session, needs_initialize=False))
+    assert "empty_cache" not in initialization and "native_init" not in initialization
     assert controls == ["initialize", "group"] and sent == ["weight"]
     assert sender.group is group and sender.transport_init_count == 1
 

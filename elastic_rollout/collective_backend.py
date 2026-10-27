@@ -24,6 +24,17 @@ class CollectiveBackend:
         # fence cannot protect bucket lifetime or the next FSDP allocation.
         getattr(torch, self.device).synchronize()
 
+    def initialize(self, session):
+        if self.name == "nccl":
+            import torch
+
+            # NCCL allocates outside PyTorch's caching allocator. Training can
+            # retain almost all free VRAM in that cache before a dynamic join.
+            # Reclaim unused blocks once per new group, never on group reuse.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return self.engine().trainer_init(session)
+
     def destroy(self, group):
         """Confirm native teardown on the actor's device thread before slot reuse."""
         library = getattr(group, self.name, None)
