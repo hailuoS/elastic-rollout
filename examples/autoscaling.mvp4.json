@@ -1,0 +1,18 @@
+{
+  "policy_mode": "pipeline",
+  "wait_high": 0.10,
+  "wait_low": 0.05,
+  "high_reports": 2,
+  "queue_high": 8,
+  "wait_high_s": 5,
+  "kv_high": 0.85,
+  "kv_low": 0.30,
+  "projected_kv_limit": 0.60,
+  "window_s": 30,
+  "sample_ttl_s": 30,
+  "scale_out_persistence_s": 30,
+  "scale_in_persistence_s": 120,
+  "scale_out_cooldown_s": 60,
+  "scale_in_cooldown_s": 300,
+  "pipeline_enabled": false
+}

@@ -33,7 +33,7 @@ class AReaLWeightSync(ElasticWeightSync):
         # Scalar RPC results contain rank0's result. Every rank is dispatched and
         # awaited by the native controller; any failure keeps the Core fail-closed.
         result = self.controller._custom_function_call("elastic_hccl_control", method, **kwargs)
-        return [result] if method == "prepare" else []
+        return [result] if method in ("prepare", "retire_transports") else []
 
     def _send_weights(self, version):
         result = self.controller._custom_function_call("elastic_hccl_send", meta=self.meta)
@@ -95,7 +95,7 @@ class ElasticHCCLFSDPActor(FSDPPPOActor):
         dist.barrier(group=self.cpu_group)
 
     def elastic_hccl_control(self, method, **kwargs):
-        if method not in ("prepare", "configure_session"):
+        if method not in ("prepare", "configure_session", "retire_transports", "settle_optional"):
             raise ValueError("unsupported external HCCL producer operation")
         return getattr(self._elastic_sender, method)(**kwargs)
 

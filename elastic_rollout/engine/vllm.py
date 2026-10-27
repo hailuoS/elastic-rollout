@@ -1,6 +1,8 @@
 """Stock vLLM serving and planned-abort control; no framework-specific worker APIs."""
 
+import math
 import re
+import threading
 import time
 from typing import Protocol
 from urllib.request import urlopen
@@ -20,6 +22,71 @@ class VLLMControlPlane(WeightTransferControl, Protocol):
 
 
 class StandardVLLMControl:
+    def __init__(self):
+        self._histograms = {}
+        self._metrics_lock = threading.Lock()
+
+    def pressure(self, endpoint):
+        with urlopen(endpoint + "/metrics", timeout=3) as response:
+            text = response.read().decode()
+
+        def samples(name):
+            return [
+                float(v)
+                for v in re.findall(
+                    rf"^vllm:{name}(?:\{{[^\n]*\}})?\s+(\S+)", text, flags=re.MULTILINE
+                )
+            ]
+
+        result = {}
+        waiting = samples("num_requests_waiting")
+        kv = samples("kv_cache_usage_perc") or samples("gpu_cache_usage_perc")
+        if waiting:
+            result["queue_per_replica"] = sum(waiting)
+        if kv:
+            result["kv_usage"] = max(kv)
+        # Quantile absent in pinned builds is unknown, never synthetic zero.
+        quantiles = re.findall(
+            r'^vllm:request_queue_time_seconds\{[^\n]*quantile="0\.95"[^\n]*\}\s+(\S+)',
+            text,
+            re.MULTILINE,
+        )
+        if quantiles:
+            result["wait_p95_s"] = max(float(v) for v in quantiles)
+        else:
+            buckets = {}
+            for labels, raw in re.findall(
+                r"^vllm:request_queue_time_seconds_bucket\{([^\n]*)\}\s+(\S+)",
+                text,
+                re.MULTILINE,
+            ):
+                match = re.search(r'\ble="([^"]+)"', labels)
+                if match:
+                    bound, count = float(match[1]), float(raw)
+                    if math.isnan(bound) or not math.isfinite(count) or count < 0:
+                        buckets = {}
+                        break
+                    buckets[bound] = buckets.get(bound, 0) + count
+            with self._metrics_lock:
+                previous = self._histograms.get(endpoint)
+                self._histograms[endpoint] = buckets
+            if previous and buckets.keys() == previous.keys() and math.inf in buckets:
+                delta = {bound: count - previous[bound] for bound, count in buckets.items()}
+                ordered = sorted(delta)
+                if all(delta[b] >= 0 for b in ordered) and all(
+                    delta[a] <= delta[b] for a, b in zip(ordered, ordered[1:])
+                ):
+                    total = delta[math.inf]
+                    if total == 0 and result.get("queue_per_replica") == 0:
+                        result["wait_p95_s"] = 0.0
+                    elif total > 0:
+                        # Conservative upper bucket bound, never pretend the +Inf
+                        # tail has finite latency. Missing remains a scale-in veto.
+                        bound = next(b for b in ordered if delta[b] >= 0.95 * total)
+                        if math.isfinite(bound):
+                            result["wait_p95_s"] = bound
+        return result
+
     def get_world_size(self, endpoint, *, timeout=30):
         value = request_json(endpoint + "/get_world_size", timeout=timeout)["world_size"]
         if type(value) is not int or value <= 0:
@@ -131,6 +198,9 @@ class StandardVLLMControl:
 
 
 class VLLMServiceDriver:
+    def pressure(self, replica):
+        return self.control.pressure(replica.endpoint)
+
     @property
     def weight_transfer_control(self) -> WeightTransferControl:
         return self.control

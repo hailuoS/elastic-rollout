@@ -15,6 +15,10 @@ from elastic_rollout.weight_transfer import (
 )
 
 
+class OptionalTransportError(RuntimeError):
+    """Returned optional control operation; native health still needs proof."""
+
+
 def weight_groups(weights, bucket_size, metadata_limit, packed, num_buffers):
     """One bounded bucket plus one lookahead tensor; never retain a full model."""
     bucket, size = [], 0
@@ -83,8 +87,47 @@ class HCCLSender:
         self._rendezvous = None
         self._poisoned = False
         self.transport_init_count = 0
+        self._children = {}
+        self._active_transports = None
+        self._transport_key = None
+        self._retirement_acks = set()
+        self._optional = False
 
-    def prepare(self):
+    def prepare(self, transport_plan=None):
+        if transport_plan is not None:
+            sources = {}
+            for entry in transport_plan:
+                key = entry["transport_key"]
+                if key == "base":
+                    child = self
+                else:
+                    if key not in self._children:
+                        self._children[key] = HCCLSender(
+                            self.bucket_size,
+                            self.is_master,
+                            endpoint=self.control.endpoint,
+                            deployment_id=self.control.deployment_id,
+                            packed=self.packed,
+                            packed_num_buffers=self.num_buffers,
+                            metadata_group_limit_bytes=self.metadata_limit,
+                            master_address=self.master_address
+                            or (self._node_ip() if self.is_master else None),
+                        )
+                    child = self._children[key]
+                sources[key] = child.prepare()
+                if self.is_master:
+                    used = {
+                        (s["master_address"], s["master_port"])
+                        for k, s in sources.items()
+                        if k != key
+                    }
+                    while (sources[key]["master_address"], sources[key]["master_port"]) in used:
+                        if child.transport_id is not None:
+                            raise RuntimeError("live transport rendezvous collision")
+                        child._rendezvous = None
+                        child.master_port = None
+                        sources[key] = child.prepare()
+            return {"transports": sources} if self.is_master else {}
         if not self.is_master:
             return {}
         if self._poisoned:
@@ -118,13 +161,27 @@ class HCCLSender:
             self.session["update_id"],
             action,
             session_id=self.session["session_id"],
+            **({"transport_key": self._transport_key} if self._transport_key else {}),
             **body,
         )
         try:
             result = send()
-            future.result(timeout=155)
+            response = future.result(timeout=155)
+            if isinstance(response, dict) and response.get("optional_failure"):
+                raise OptionalTransportError(response["optional_failure"])
             return result
         except BaseException as exc:
+            if self._optional:
+                # Do not abandon a receiver call and then claim isolation. An
+                # explicit returned failure can be settled on the native thread;
+                # an unfinished HTTP operation remains globally unsafe.
+                if not future.done():
+                    try:
+                        future.result(timeout=155)
+                    except Exception:
+                        pass
+                if future.done() and not future.cancelled():
+                    raise OptionalTransportError(str(exc)) from exc
             self._fail(exc)
             raise
         finally:
@@ -143,6 +200,28 @@ class HCCLSender:
         return self.configure_session(session)
 
     def configure_session(self, session):
+        if "transports" in session:
+            self._active_transports = []
+            planned = {entry["transport_key"] for entry in session["transports"]}
+            for key, child in list(self._children.items()):
+                if key not in planned and child.group is None and child.transport_id is None:
+                    # Discovery can fail before a communicator exists. Do not
+                    # retain one empty sender per failed dynamic incarnation.
+                    del self._children[key]
+            # The base sender also holds the aggregate session for version checks.
+            for entry in session["transports"]:
+                key = entry["transport_key"]
+                child = self if key == "base" else self._children[key]
+                child._transport_key = key
+                child._optional = entry["optional"]
+                try:
+                    child.configure_session(entry["session"])
+                except OptionalTransportError as exc:
+                    self._isolate_optional(child, exc)
+                else:
+                    self._active_transports.append(child)
+            self.session = session
+            return
         self.session = session
         if not self.is_master:
             return
@@ -157,9 +236,12 @@ class HCCLSender:
                 )
 
                 self.transport_init_count += 1
-                self.group = self._overlap(
-                    "initialize", lambda: HCCLWeightTransferEngine.trainer_init(session)
-                )
+
+                def initialize():
+                    self.group = HCCLWeightTransferEngine.trainer_init(session)
+                    return self.group
+
+                self._overlap("initialize", initialize)
                 self.transport_id = session["transport_id"]
             elif self.group is None or self.transport_id != session["transport_id"]:
                 raise RuntimeError(
@@ -167,6 +249,8 @@ class HCCLSender:
                     + RECOVERY_REQUIRED
                 )
         except BaseException as exc:
+            if isinstance(exc, OptionalTransportError):
+                raise
             self._fail(exc)
             raise
 
@@ -174,6 +258,104 @@ class HCCLSender:
         # Never drop a live communicator at a per-policy boundary. Actor exit
         # owns physical teardown; no communicator repair/re-init in MVP-2A.
         self.session = None
+
+    @staticmethod
+    def _destroy_group(child):
+        import torch
+
+        group = child.group
+        destroy = getattr(getattr(group, "hccl", None), "hcclCommDestroy", None)
+        if not callable(destroy) or getattr(group, "comm", None) is None:
+            raise RuntimeError("native HCCL destroy unavailable; receiver remains quarantined")
+        # This must return successfully on the NPU RPC thread. There is no
+        # background timeout escape from an ambiguous native collective.
+        torch.npu.current_stream().synchronize()
+        result = destroy(group.comm)
+        if result not in (None, 0):
+            raise RuntimeError(f"native HCCL destroy failed: {result}")
+        group.comm, group.available = None, False
+
+    def _isolate_optional(self, child, error):
+        try:
+            if not child._optional:
+                raise RuntimeError("required transport cannot be isolated")
+            self._destroy_group(child)
+            session = child.session
+            self.control.transfer_operation(
+                session["update_id"],
+                "isolate",
+                transport_key=child._transport_key,
+                session_id=session["session_id"],
+                transport_id=session["transport_id"],
+                sender_destroyed=True,
+                error=str(error),
+            )
+            child._poisoned = True
+            self._children.pop(child._transport_key, None)
+        except BaseException as exc:
+            self._fail(exc)
+            raise
+
+    def settle_optional(self, session):
+        failures = session.get("optional_failures", {})
+        for key, error in failures.items():
+            child = self._children.get(key)
+            if child is not None:
+                if self.is_master:
+                    self._isolate_optional(child, error)
+                else:
+                    self._children.pop(key, None)
+        if self._active_transports is not None:
+            self._active_transports = [
+                child
+                for child in self._active_transports
+                if child is self or child._transport_key in self._children
+            ]
+        return {}
+
+    def retire_transports(self, requests):
+        """Called on native producer RPC thread, outside a policy transaction."""
+        if self._poisoned:
+            raise RuntimeError("ambiguous sender state; clean restart required")
+        acknowledgements = []
+        for request in requests:
+            token, key = request["retirement_id"], request["transport_key"]
+            if token not in self._retirement_acks:
+                child = self._children.get(key)
+                if child is None:
+                    raise RuntimeError("retirement sender group missing; clean restart required")
+                if self.is_master:
+                    if child.transport_id != request["transport_id"]:
+                        raise RuntimeError("retirement transport identity mismatch")
+                    try:
+                        self._destroy_group(child)
+                    except BaseException:
+                        self._poisoned = True
+                        raise
+                del self._children[key]
+                self._retirement_acks.add(token)
+            acknowledgements.append({"transport_key": key, "retirement_id": token})
+        return {"acknowledgements": acknowledgements} if self.is_master else {}
+
+    def _fanout_bucket(self, bucket, info, index):
+        if self._active_transports is None:
+            return self._send_bucket(bucket, info, index)
+        aggregate = self.session
+        try:
+            for child in list(self._active_transports):
+                if child is self:
+                    self.session = next(
+                        e["session"]
+                        for e in aggregate["transports"]
+                        if e["transport_key"] == "base"
+                    )
+                try:
+                    child._send_bucket(bucket, info, index)
+                except OptionalTransportError as exc:
+                    self._isolate_optional(child, exc)
+                    self._active_transports.remove(child)
+        finally:
+            self.session = aggregate
 
     def send_weights_sync(self, weights, global_steps=None, synchronize_group=None):
         if self._poisoned:
@@ -203,7 +385,7 @@ class HCCLSender:
                     break
                 materialization_s += time.monotonic() - before
                 before = time.monotonic()
-                self._send_bucket(bucket, info, count)
+                self._fanout_bucket(bucket, info, count)
                 transfer_s += time.monotonic() - before
                 total += validate_group(info)
                 count += 1
@@ -248,7 +430,7 @@ class HCCLSender:
                 error = None
                 try:
                     if self.is_master:
-                        self._send_bucket(bucket, info, count)
+                        self._fanout_bucket(bucket, info, count)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                 # Required even on rank0 failure, before peers advance lazy export.

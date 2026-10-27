@@ -123,7 +123,11 @@ class LaunchSpec:
             _match(replica, key, value, "Core replica")
         spec = DeploymentSpec.from_dict(deployment)
         deployment["desired_replicas"] = spec.desired_replicas
-        if spec.desired_replicas != len(slots) or not slots:
+        if (
+            (not spec.elastic_scaling and spec.desired_replicas != len(slots))
+            or not slots
+            or spec.desired_replicas > len(slots)
+        ):
             raise ValueError("static rollout slots must equal Core desired_replicas")
         if any(slot.num_devices != spec.replica.tensor_parallel_size for slot in slots):
             raise ValueError("every rollout slot must match replica tensor_parallel_size")
@@ -137,7 +141,7 @@ class LaunchSpec:
     def integration_values(self, ray_address: str) -> dict[str, str]:
         if ray_address in ("", "auto", "local"):
             raise ValueError("Ray address must be concrete before rendering trainer config")
-        return {
+        values = {
             "ray_kwargs.ray_init.address": ray_address,
             "trainer.use_v1": "true",
             "trainer.v1.trainer_mode": "separate_async",
@@ -163,6 +167,14 @@ class LaunchSpec:
             f"{ROLLOUT}.custom.elastic.fixed_policy": "false",
             f"{ROLLOUT}.custom.elastic.weight_sync": "hccl",
         }
+        if self.core_config()["deployments"][0].get("elastic_scaling"):
+            values.update(
+                {
+                    "trainer.v1.sampler.custom_sampler.path": "pkg://elastic_rollout.integrations.verl.pipeline_sampler",
+                    "trainer.v1.sampler.custom_sampler.name": "ElasticPipelineReplayBuffer",
+                }
+            )
+        return values
 
     def trainer_overrides(self, ray_address: str) -> list[str]:
         owned = self.integration_values(ray_address)

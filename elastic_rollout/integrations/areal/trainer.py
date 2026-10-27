@@ -80,6 +80,19 @@ class ElasticPPOTrainer(PPOTrainer):
                 )
             self._hccl_bootstrap_path = bootstrap["model_path"]
         super().__init__(config, train_dataset, valid_dataset)
+        self._pipeline_observer = None
+        if status.get("spec", {}).get("elastic_scaling"):
+            from .pipeline_observer import AReaLPipelineObserver
+
+            self._pipeline_observer = AReaLPipelineObserver(
+                self,
+                ControlClient(
+                    os.environ["ELASTIC_ROLLOUT_ENDPOINT"],
+                    os.environ["ELASTIC_ROLLOUT_DEPLOYMENT"],
+                    os.environ.get("ELASTIC_ROLLOUT_TOKEN"),
+                    timeout=2,
+                ),
+            )
 
     def _create_train_engine(self, actor_config, alloc):
         if not self._hccl or actor_config is not self.config.actor:

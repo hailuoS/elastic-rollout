@@ -63,15 +63,24 @@ class TrafficManager:
             if not self.accepting_routes:
                 raise RoutingPaused(self.route_pause_reasons)
             replica = self.replicas.get(self.sticky.get(routing_key, ""))
-            if replica is not None and not (
-                replica.state == ReplicaState.READY
-                or (
-                    replica.state == ReplicaState.DRAINING and self.clock() < replica.drain_deadline
+            if replica is not None and (
+                replica.admission_disabled
+                or not (
+                    replica.state == ReplicaState.READY
+                    or (
+                        not self.spec.elastic_scaling
+                        and replica.state == ReplicaState.DRAINING
+                        and self.clock() < replica.drain_deadline
+                    )
                 )
             ):
                 replica = None
             if replica is None:
-                ready = [r for r in self.replicas.values() if r.state == ReplicaState.READY]
+                ready = [
+                    r
+                    for r in self.replicas.values()
+                    if r.state == ReplicaState.READY and not r.admission_disabled
+                ]
                 if not ready:
                     raise NoReadyReplica("no READY replica; retry after capacity becomes ready")
                 replica = min(ready, key=lambda r: self.inflight.get(r.replica_id, 0))

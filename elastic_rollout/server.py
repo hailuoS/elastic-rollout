@@ -39,6 +39,20 @@ def make_server(
                 if token and not hmac.compare_digest(
                     self.headers.get("Authorization", ""), f"Bearer {token}"
                 ):
+                    # Closing with an unread POST body can reset TCP before the
+                    # client receives the 401 (notably on Windows). Drain only
+                    # bounded bodies with a finite read deadline; never parse
+                    # or execute an unauthenticated payload.
+                    try:
+                        rejected_length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        rejected_length = 0
+                    if 0 < rejected_length <= 65536:
+                        self.connection.settimeout(2)
+                        try:
+                            self.rfile.read(rejected_length)
+                        except OSError:
+                            pass
                     self._reply(401, {"error": "unauthorized"})
                     return
                 length = int(self.headers.get("Content-Length", "0"))
@@ -67,6 +81,40 @@ def make_server(
                     manager = controller.deployments[deployment_id]
                     if not tail and self.command == "GET":
                         result = manager.status()
+                    elif tail == ["transport-maintenance"] and self.command == "POST":
+                        if not manager.spec.elastic_scaling:
+                            raise ValueError("transport maintenance requires elastic_scaling=true")
+                        result = manager.transfer.maintenance(body)
+                    elif tail == ["scaling"] and self.command in ("GET", "PUT"):
+                        if not manager.spec.elastic_scaling:
+                            raise ValueError("scaling policy requires elastic_scaling=true")
+                        result = manager.scaling(body if self.command == "PUT" else None)
+                    elif tail == ["scaling", "workload"] and self.command == "PUT":
+                        if not manager.spec.elastic_scaling:
+                            raise ValueError("workload signals require elastic_scaling=true")
+                        from .autoscaling import WorkloadSignal
+
+                        signal = WorkloadSignal(**body)
+                        from dataclasses import replace
+
+                        if signal.phase not in (
+                            "rollout",
+                            "compute",
+                            "sync",
+                            "paused",
+                            "shutdown",
+                            "unknown",
+                        ) or not replace(signal, phase="rollout").valid(manager.clock(), 30):
+                            raise ValueError(
+                                "workload signal invalid, stale or outside rollout phase"
+                            )
+                        with manager.traffic.lock:
+                            manager.workload_signal = asdict(signal)
+                        result = {"accepted": True}
+                    elif tail == ["scaling", "pipeline"] and self.command == "PUT":
+                        if not manager.spec.elastic_scaling:
+                            raise ValueError("pipeline reports require elastic_scaling=true")
+                        result = manager.publish_pipeline(body)
                     elif tail == ["replicas"] and self.command == "GET":
                         with manager.traffic.lock:
                             result = {
@@ -135,7 +183,10 @@ def make_server(
             except NoReadyReplica as exc:
                 self._reply(503, {"error": str(exc)})
             except PolicyConflict as exc:
-                self._reply(409, {"error": str(exc)})
+                payload = {"error": str(exc)}
+                if getattr(exc, "code", None):
+                    payload["code"] = exc.code
+                self._reply(409, payload)
             except KeyError as exc:
                 self._reply(404, {"error": f"unknown deployment, lease or missing field: {exc}"})
             except (ValueError, TypeError) as exc:

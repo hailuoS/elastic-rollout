@@ -111,6 +111,33 @@ def test_generated_overrides_compose_real_verl_base(launch_file, monkeypatch):
     validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
+def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatch):
+    pytest.importorskip("hydra")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "verl"))
+    template = launch_file.parent / "core.json"
+
+    def edit_core(data):
+        data["deployments"][0]["elastic_scaling"] = True
+        data["slots"].append(dict(data["slots"][0], slot_id="rollout-1", port=9002))
+
+    _edit_json(template, edit_core)
+
+    def edit_launch(data):
+        data["verl"]["overrides"] = [
+            "actor_rollout_ref.rollout.n_gpus_per_node=4"
+            if item.startswith("actor_rollout_ref.rollout.n_gpus_per_node=")
+            else item
+            for item in data["verl"]["overrides"]
+        ]
+
+    _edit_json(launch_file, edit_launch)
+    spec = LaunchSpec.from_file(launch_file)
+    address = "10.0.0.3:6379"
+    overrides = spec.trainer_overrides(address)
+    assert any("ElasticPipelineReplayBuffer" in item for item in overrides)
+    validate_mvp2b_verl_config(spec, address, overrides, spec.core_config())
+
+
 def test_model_path_with_spaces_is_quoted_for_real_hydra(launch_file, monkeypatch):
     pytest.importorskip("hydra")
     verl_checkout = Path(__file__).resolve().parents[2] / "verl"

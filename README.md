@@ -24,12 +24,19 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
 | MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
 | MVP-3 | AReaL FSDP2 Direct HCCL，与 verl 复用 sender 和策略事务 | 已实现；CPU contract 验证，NPU 验收待执行 |
+| MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 框架接入及 CPU 回归；NPU 验收待执行 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
 verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定权重生成入口保留。
 
 ## MVP-3：AReaL Direct HCCL
+
+[MVP-3 中文真机操作手册](docs/mvp3-npu-validation-zh.md) 固定测试提交 `1aad77f`，
+包含独立测试目录、AReaL/verl 命令、故障清理检查和验收记录表。
+
+[MVP-4 配置与验收指南](docs/mvp4-validation.md) 说明 `elastic_scaling=true`、
+独立 autoscale 命令、通信组销毁确认、手动模式和当前未闭环的验收项。
 
 [MVP-3 接入与验收指南](docs/mvp3-validation.md) 包含 Core 配置、AReaL 启动方式、
 支持边界和 NPU 验收清单。`ElasticPPOTrainer` 默认保留快照更新；传入
@@ -100,7 +107,7 @@ ruff format --check .
 
 - 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
 - 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
-- 副本数手动调整，不含自动扩缩策略。
-- AReaL/verl Direct HCCL 当前支持 dense BF16 FSDP2、固定副本成员；AReaL NPU 验收待执行。
+- 默认固定拓扑；显式 `elastic_scaling=true` 启用已有 slots 内的手动/自动扩缩。
+- AReaL/verl Direct HCCL 当前支持 dense BF16 FSDP2；动态 transport 和 AReaL NPU 验收待执行。
 - LoRA、多模态不在当前外部训练接入范围。
 - 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。

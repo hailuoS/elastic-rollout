@@ -1,0 +1,17 @@
+{
+  "slots": [
+    {"slot_id": "rollout-0", "node_id": "REPLACE_NODE_0", "host": "REPLACE_HOST_0", "num_devices": 2, "port": 8000},
+    {"slot_id": "rollout-1", "node_id": "REPLACE_NODE_1", "host": "REPLACE_HOST_1", "num_devices": 2, "port": 8000},
+    {"slot_id": "rollout-2", "node_id": "REPLACE_NODE_2", "host": "REPLACE_HOST_2", "num_devices": 2, "port": 8000},
+    {"slot_id": "rollout-3", "node_id": "REPLACE_NODE_3", "host": "REPLACE_HOST_3", "num_devices": 2, "port": 8000}
+  ],
+  "deployments": [{
+    "deployment_id": "mvp4", "desired_replicas": 2, "elastic_scaling": true,
+    "drain_grace_period": 30, "retirement_timeout_s": 120, "scale_retry_limit": 3,
+    "replica": {
+      "model": "/shared/models/REPLACE_IMMUTABLE_MODEL", "served_model_name": "policy",
+      "tensor_parallel_size": 2, "pipeline_parallel_size": 1, "weight_sync": "hccl",
+      "vllm_args": ["--dtype", "bfloat16", "--max-model-len", "4096", "--enforce-eager"]
+    }
+  }]
+}

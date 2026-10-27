@@ -24,6 +24,12 @@ def main() -> None:
     serve.add_argument("--ray-address", default="auto")
     serve.add_argument("--expected-gcs-address")
     serve.add_argument("--shutdown-timeout", type=float, default=900)
+    autoscale = sub.add_parser("autoscale", help="MVP-4 pressure controller (advisory by default)")
+    autoscale.add_argument("--endpoint", required=True)
+    autoscale.add_argument("--deployment", required=True)
+    autoscale.add_argument("--config", type=Path)
+    autoscale.add_argument("--once", action="store_true")
+    autoscale.add_argument("--activate", action="store_true")
     verl = sub.add_parser("verl", help="MVP-2B V1 separate_async integration")
     verl_sub = verl.add_subparsers(dest="verl_command", required=True)
     run = verl_sub.add_parser("run")
@@ -52,6 +58,14 @@ def main() -> None:
     token = os.environ.get("ELASTIC_ROLLOUT_TOKEN")
     if args.command != "serve":
         client = ControlClient(args.endpoint, args.deployment, token=token)
+        if args.command == "autoscale":
+            from .autoscaling import AutoscalingConfig, run_autoscaler
+
+            config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            run_autoscaler(
+                client, AutoscalingConfig(**config), once=args.once, activate=args.activate
+            )
+            return
         if args.command == "scale":
             client.set_desired_replicas(args.count)
             if args.wait:

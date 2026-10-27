@@ -32,6 +32,8 @@ class ReplicaState(str, Enum):
     SYNCING = "SYNCING"
     WARMING = "WARMING"
     READY = "READY"
+    JOIN_PENDING = "JOIN_PENDING"
+    RETIRE_PENDING = "RETIRE_PENDING"
     DRAINING = "DRAINING"
     QUIESCED = "QUIESCED"
     STOPPING = "STOPPING"
@@ -78,6 +80,8 @@ class PolicyUpdateDescriptor:
     candidate_failure_count: int = 0
     preparation_kind: PolicyPreparationKind = PolicyPreparationKind.SNAPSHOT_RESTART
     target_version: int | None = None
+    optional_replica_ids: tuple[str, ...] = ()
+    transport_plan: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -117,8 +121,20 @@ class DeploymentSpec:
     policy_update_runtime_timeout_s: float = DEFAULT_POLICY_UPDATE_TIMEOUT_S
     candidate_start_max_failures: int = 8
     generation_control_timeout_s: float = MAX_GENERATION_CONTROL_TIMEOUT_S
+    elastic_scaling: bool = False
+    retirement_timeout_s: float = 120.0
+    scale_retry_limit: int = 3
 
     def __post_init__(self) -> None:
+        if type(self.elastic_scaling) is not bool:
+            raise ValueError("elastic_scaling must be boolean")
+        if self.elastic_scaling and (
+            self.replica.weight_sync != "hccl" or self.desired_replicas < 1
+        ):
+            raise ValueError("elastic scaling requires HCCL and a nonempty base cohort")
+        positive_seconds(self.retirement_timeout_s, "retirement_timeout_s")
+        if type(self.scale_retry_limit) is not int or self.scale_retry_limit < 1:
+            raise ValueError("scale_retry_limit must be positive")
         if not self.deployment_id or any(
             c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
             for c in self.deployment_id
@@ -218,6 +234,12 @@ class ReplicaDescriptor:
     error: str | None = None
     health_failures: int = 0
     history: list[str] = field(default_factory=lambda: ["REQUESTED"])
+
+    is_base: bool = False
+    cancel_requested: bool = False
+    prepared_update_id: str | None = None
+    prepared_policy_version: int | None = None
+    admission_disabled: bool = False
 
     def transition(self, state: ReplicaState) -> None:
         self.state = state

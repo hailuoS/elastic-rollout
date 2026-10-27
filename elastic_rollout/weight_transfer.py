@@ -126,8 +126,11 @@ class WeightTransferSession:
 
 
 class TransferCoordinator:
-    def __init__(self, manager):
+    def __init__(self, manager, target_ids=None, optional=False, cohort=False):
         self.manager = manager
+        self.target_ids = target_ids
+        self.optional = optional
+        self.cohort = cohort
         self.session = None
         self.transport = None
         self.operation_lock = threading.Lock()
@@ -175,8 +178,11 @@ class TransferCoordinator:
             raise PolicyConflict("external update deadline exceeded")
         if not m._generation_pause_verified or sum(m.traffic.inflight.values()):
             raise PolicyConflict("verified generation pause and inflight=0 required")
-        targets = [m.traffic.replicas[rid] for rid in u.target_replica_ids]
-        if any(r.state != S.READY for r in targets):
+        targets = [m.traffic.replicas[rid] for rid in (self.target_ids or u.target_replica_ids)]
+        if any(
+            r.state not in ((S.READY, S.JOIN_PENDING) if self.optional else (S.READY,))
+            for r in targets
+        ):
             raise RuntimeError("frozen transfer target is no longer READY")
         if self.transport and self.transport.state == "POISONED":
             raise PolicyConflict(RECOVERY_REQUIRED)
@@ -240,7 +246,8 @@ class TransferCoordinator:
                         or not body["sender_instance_id"]
                     ):
                         raise ValueError("stable sender_instance_id required")
-                    m._update_transition(U.PREPARING)
+                    if not self.cohort:
+                        m._update_transition(U.PREPARING)
                 else:
                     if not self.session or body.get("session_id") != self.session.session_id:
                         raise PolicyConflict("transfer session identity mismatch")
@@ -362,16 +369,23 @@ class TransferCoordinator:
                     self.transport.state = "READY"
                 elif action == "start":
                     session.state = "STARTED"
-                    m._update_transition(U.TRANSFERRING)
+                    if not self.cohort:
+                        m._update_transition(U.TRANSFERRING)
                 elif action == "group":
                     session.num_weight_groups += 1
                     session.bytes_transferred += byte_count
                 else:
-                    m._update_transition(U.VERIFYING)
+                    if not self.cohort:
+                        m._update_transition(U.VERIFYING)
                     for r in replicas:
-                        r.loaded_policy_version = session.target_version
+                        if self.optional:
+                            r.prepared_update_id = update_id
+                            r.prepared_policy_version = session.target_version
+                        else:
+                            r.loaded_policy_version = session.target_version
                     session.state = "PREPARED"
-                    m._update_transition(U.PREPARED)
+                    if not self.cohort:
+                        m._update_transition(U.PREPARED)
                 session.timings[action] = (
                     session.timings.get(action, 0) + time.monotonic() - started
                 )
@@ -395,7 +409,10 @@ class TransferCoordinator:
                 return result
         except Exception as exc:
             if executing or (self.transport and self.transport.state == "POISONED"):
-                m._fail_update(exc)
+                if self.optional:
+                    self.fail(str(exc))
+                else:
+                    m._fail_update(exc)
                 raise RuntimeError(f"transfer {action} failed: {exc}") from exc
             raise
         finally:

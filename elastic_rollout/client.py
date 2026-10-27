@@ -77,11 +77,11 @@ async def complete_on_cancel(awaitable):
     task = asyncio.ensure_future(awaitable)
     try:
         return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancelled:
         try:
             await task
         finally:
-            raise
+            raise cancelled
 
 
 class ControlClient:
@@ -96,6 +96,18 @@ class ControlClient:
     @property
     def path(self) -> str:
         return f"/v1/deployments/{quote(self.deployment_id, safe='')}"
+
+    def transport_maintenance(self, body=None):
+        return self._request(self.path + "/transport-maintenance", "POST", body or {})
+
+    def scaling(self, body=None):
+        return self._request(self.path + "/scaling", "GET" if body is None else "PUT", body)
+
+    def publish_workload(self, signal):
+        return self._request(self.path + "/scaling/workload", "PUT", signal)
+
+    def publish_pipeline(self, snapshot):
+        return self._request(self.path + "/scaling/pipeline", "PUT", snapshot)
 
     def _request(
         self,
@@ -350,13 +362,13 @@ class ControlClient:
         acquire_task = asyncio.create_task(_control_io(self.acquire, routing_key))
         try:
             lease = await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # Recover a successful but cancelled acquire and release its lease.
             try:
                 lease = await acquire_task
                 await complete_on_cancel(_control_io(self.release, lease.lease_id))
             finally:
-                raise
+                raise cancelled
 
         task = asyncio.create_task(self._heartbeat(lease))
         try:

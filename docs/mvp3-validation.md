@@ -1,5 +1,7 @@
 # MVP-3: AReaL and verl share Direct HCCL
 
+中文真机操作步骤、固定提交与验收记录见 [MVP-3 真机验证操作手册](mvp3-npu-validation-zh.md)。
+
 Status: implementation and CPU contracts; **real NPU acceptance is pending**.
 MVP-2B Run B remains a separate open acceptance gate. This implementation does
 not claim to fix launcher SIGKILL ownership or close MVP-2B.

@@ -36,6 +36,10 @@ class PolicyConflict(RuntimeError):
     pass
 
 
+class ElasticTopologyNotReady(PolicyConflict):
+    code = "ELASTIC_TOPOLOGY_NOT_READY"
+
+
 class GenerationControlTimeout(TimeoutError):
     pass
 
@@ -103,7 +107,9 @@ class ReplicaManager:
         return replace(self.spec, replica=replace(self.spec.replica, model=model_path))
 
     def _update_blocks_topology(self) -> bool:
-        return self.policy_update is not None and self.policy_update.state != U.COMMITTED
+        return bool(getattr(self, "transaction_owned", False)) or (
+            self.policy_update is not None and self.policy_update.state != U.COMMITTED
+        )
 
     def _stable_for_policy_update(self, replicas: list) -> bool:
         """The topology predicate shared by begin and the serving readiness view.
@@ -173,7 +179,11 @@ class ReplicaManager:
             with self.traffic.lock:
                 if self.closing:
                     raise PolicyConflict("controller is closing")
-                if not paused and self._external_update() and self._update_blocks_topology():
+                if (
+                    not paused
+                    and self._external_update()
+                    and self.policy_update.state != U.COMMITTED
+                ):
                     raise PolicyConflict("external update must COMMIT before generation resume")
                 gated = "generation" in self.traffic.route_pause_reasons
                 if (
@@ -185,7 +195,9 @@ class ReplicaManager:
                 self.traffic.pause_routes("generation")
                 timeout_epoch = self._generation_timeout_epoch
                 targets = [
-                    r for r in self.traffic.replicas.values() if r.state in (S.READY, S.DRAINING)
+                    r
+                    for r in self.traffic.replicas.values()
+                    if r.state in (S.READY, S.DRAINING) or (paused and r.state == S.JOIN_PENDING)
                 ]
             logger.info(
                 "generation %s requested deployment_id=%s targets=%s reason=generation",
@@ -227,6 +239,8 @@ class ReplicaManager:
                 self._generation_control_failed = False
                 if not paused:
                     self.traffic.resume_routes("generation")
+                    if hasattr(self, "transaction_owned"):
+                        self.transaction_owned = False
                 status = self.status()
             logger.info(
                 "generation %s complete deployment_id=%s targets=%s route_pause_reasons=%s",
@@ -270,6 +284,15 @@ class ReplicaManager:
             if self.desired <= 0:
                 raise PolicyConflict("policy update requires at least one READY replica")
             if not self._stable_for_policy_update(replicas):
+                if (
+                    self.spec.elastic_scaling
+                    and not self.transfer.poisoned
+                    and not any(r.state == S.FAILED and (r.is_base or r.resource) for r in replicas)
+                    and any(r.state in STARTUP + DRAIN + (S.RETIRE_PENDING,) for r in replicas)
+                ):
+                    raise ElasticTopologyNotReady(
+                        "elastic topology changing; BEGIN created no transaction"
+                    )
                 raise PolicyConflict("deployment must be stable before policy update")
             update = PolicyUpdateDescriptor(
                 uuid4().hex,
@@ -504,7 +527,10 @@ class ReplicaManager:
         )
         if candidate:
             model_path = self.policy_update.snapshot_path
-        elif self.serving_policy_version != self.bootstrap_snapshot.version:
+        elif (
+            self.serving_policy_version != self.bootstrap_snapshot.version
+            and not self.spec.elastic_scaling
+        ):
             self.last_error = "HCCL policy diverged from bootstrap; stale replacement disabled"
             return False
         replica = ReplicaDescriptor(
@@ -690,7 +716,12 @@ class Controller:
                 if replace(old, desired_replicas=spec.desired_replicas) != spec:
                     raise ValueError("deployment configuration is immutable in MVP-0")
             else:
-                self.deployments[spec.deployment_id] = ReplicaManager(
+                manager_type = ReplicaManager
+                if spec.elastic_scaling:
+                    from .elastic_runtime import ElasticReplicaManager
+
+                    manager_type = ElasticReplicaManager
+                self.deployments[spec.deployment_id] = manager_type(
                     spec, self.resources, self.driver, self.clock
                 )
             # Ensure is idempotent; it must not undo a separate SetDesiredReplicas.
