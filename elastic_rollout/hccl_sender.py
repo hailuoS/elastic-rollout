@@ -236,6 +236,7 @@ class HCCLSender:
                 if self.group is not None or self.transport_id is not None:
                     raise RuntimeError("sender HCCL group already exists; " + RECOVERY_REQUIRED)
                 self.transport_init_count += 1
+
                 def initialize():
                     self.group = self.backend.engine().trainer_init(session)
                     return self.group
@@ -262,12 +263,30 @@ class HCCLSender:
     def _destroy_group(child):
         child.backend.destroy(child.group)
 
+    def _destroy_with_receivers(self, child, function, *args, token, **kwargs):
+        future = submit_hccl_control(function, *args, **kwargs)
+        try:
+            self._destroy_group(child)
+            if future.result(timeout=155).get("receiver_destroyed") != token:
+                raise RuntimeError("receiver retirement acknowledgement missing")
+        finally:
+            future.cancel()
+
     def _isolate_optional(self, child, error):
         try:
             if not child._optional:
                 raise RuntimeError("required transport cannot be isolated")
-            self._destroy_group(child)
             session = child.session
+            self._destroy_with_receivers(
+                child,
+                self.control.transfer_operation,
+                session["update_id"],
+                "destroy",
+                transport_key=child._transport_key,
+                session_id=session["session_id"],
+                transport_id=session["transport_id"],
+                token=session["session_id"],
+            )
             self.control.transfer_operation(
                 session["update_id"],
                 "isolate",
@@ -315,7 +334,13 @@ class HCCLSender:
                     if child.transport_id != request["transport_id"]:
                         raise RuntimeError("retirement transport identity mismatch")
                     try:
-                        self._destroy_group(child)
+                        self._destroy_with_receivers(
+                            child,
+                            self.control.transport_maintenance,
+                            {"destroy_receivers": request},
+                            token=token,
+                            timeout=155,
+                        )
                     except BaseException:
                         self._poisoned = True
                         raise

@@ -28,6 +28,7 @@ class PipelineObserver:
         self.lock = RLock()
         self.phase, self.version = "paused", 0
         self.active = False
+        self.discard_cycle = False
         self.acquiring = False
         self.segment = None
         self.segment_at = self.clock()
@@ -59,6 +60,7 @@ class PipelineObserver:
             if self.active:
                 raise RuntimeError("overlapping training consumption cycles")
             self.active, self.acquiring, self.phase = True, True, "training"
+            self.discard_cycle = False
             self.timings = dict.fromkeys(self.timings, 0.0)
             self.consumed, self.consumed_version = 0, None
             self.consumed_known = True
@@ -102,8 +104,10 @@ class PipelineObserver:
                     wait_unknown_s=self.timings["unknown"],
                     train_path_s=self.timings["train"],
                     consumed_units=self.consumed,
+                    include_timing=not self.discard_cycle,
                 )
-                self.versions.append(self.consumed_version if self.consumed_known else None)
+                if not self.discard_cycle:
+                    self.versions.append(self.consumed_version if self.consumed_known else None)
             self.active = self.acquiring = False
             self.phase = "training" if success else "unknown"
 
@@ -132,8 +136,8 @@ class PipelineObserver:
                 self.versions.clear()
                 # A cycle spanning a topology change cannot prove its effect.
                 if self.active:
+                    self.discard_cycle = True
                     self.timings = dict.fromkeys(self.timings, 0.0)
-                    self.timings["unknown"] = 1e-9
                     self.segment_at = self.clock()
             self.revision = revision
             elapsed = sum(sum(c) for c in self.window.cycles)
@@ -158,7 +162,7 @@ class PipelineObserver:
             )
             # Include unfinished starvation in expansion evidence, never in
             # completed-cycle counters or the evidence for low-wait scale-in.
-            if self.active and self.phase == "training":
+            if self.active and self.phase == "training" and not self.discard_cycle:
                 partial = dict(self.timings)
                 if self.segment is not None:
                     partial[self.segment] += max(0.0, self.clock() - self.segment_at)

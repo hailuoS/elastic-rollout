@@ -286,7 +286,9 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
         "elastic_rollout.integrations.verl.rollout_service",
         PACKAGE / "integrations/verl/rollout_service.py",
     )
-    config = NS(actor_rollout_ref=NS(rollout=NS(response_length=4)))
+    config = NS(
+        actor_rollout_ref=NS(rollout=NS(response_length=4, ignore_eos=True, repetition_penalty=1.1))
+    )
     client = client_module.ElasticLLMClient(config, MagicMock(), "policy")
     client.generator = NS(generate=AsyncMock(return_value=Completion([9], [-0.3], [6], "length")))
     result = asyncio.run(
@@ -319,6 +321,8 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
     assert result.stop_reason == "completed"
     assert result.extra_fields["finish_reason"] == "length"
     assert client.generator.generate.call_args_list[0].args[2]["max_tokens"] == 4
+    assert client.generator.generate.call_args_list[0].args[2]["ignore_eos"] is True
+    assert client.generator.generate.call_args_list[0].args[2]["repetition_penalty"] == 1.1
     config.actor_rollout_ref.rollout.get = lambda key: None
     with pytest.raises(ValueError, match="standalone"):
         service_module.ElasticRolloutService(config, worker_group=object())

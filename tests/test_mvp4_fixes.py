@@ -1,6 +1,6 @@
 import json
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,8 +14,29 @@ from elastic_rollout.server import make_server
 from elastic_rollout.weight_sync import ElasticWeightSync
 
 
-def test_begin_retries_drain_race_and_services_retirement_over_http(elastic):
+@pytest.mark.parametrize("closing", [False, True])
+def test_pending_start_stops_without_waiting_for_unavailable_metrics(elastic, closing):
+    c, m, driver, _ = elastic
+    driver.healthy = False
+    m.set_desired(3)
+    c.reconcile()
+    candidate = next(r for r in m.traffic.replicas.values() if not r.is_base)
+    assert candidate.state == S.STARTING
+    driver.busy.add(candidate.replica_id)
+    if closing:
+        m.closing = True
+    else:
+        m.set_desired(2)
+    c.reconcile()
+    assert candidate.replica_id in driver.stopped and candidate.resource is None
+
+
+@pytest.mark.parametrize("backend,accelerator", [("hccl", "npu"), ("nccl", "gpu")])
+def test_begin_retries_drain_race_and_services_retirement_over_http(elastic, backend, accelerator):
     c, m, _, _ = elastic
+    m.spec = replace(
+        m.spec, replica=replace(m.spec.replica, weight_sync=backend, accelerator=accelerator)
+    )
     grow(c, m, 3)
     update(m, 1)
     server = make_server(c, port=0)
@@ -25,13 +46,13 @@ def test_begin_retries_drain_race_and_services_retirement_over_http(elastic):
     original_begin, original_status = client.begin_external_update, client.status
     attempts, codes = [], []
 
-    def begin(version):
+    def begin(version, **kwargs):
         attempts.append(version)
         if len(attempts) == 1:
             m.set_desired(2)
             c.reconcile()
         try:
-            return original_begin(version)
+            return original_begin(version, **kwargs)
         except ControlError as exc:
             codes.append(json.loads(str(exc))["code"])
             assert len(m.policy_updates) == 1
@@ -48,10 +69,14 @@ def test_begin_retries_drain_race_and_services_retirement_over_http(elastic):
 
         def _actors(self, method, **kwargs):
             assert method == "retire_transports"
+            for request in kwargs["requests"]:
+                client.transport_maintenance({"destroy_receivers": request})
             return [{"acknowledgements": kwargs["requests"]}, {}]
 
     try:
-        result = Sync()._begin_elastic_update(2, asdict(m.spec))
+        sync = Sync()
+        sync.backend = backend
+        result = sync._begin_elastic_update(2, asdict(m.spec))
         assert codes == ["ELASTIC_TOPOLOGY_NOT_READY"]
         assert attempts == [2, 2]
         assert result["target_version"] == 2

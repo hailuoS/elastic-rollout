@@ -38,7 +38,14 @@ class ElasticWeightSync:
                 raise RuntimeError("controller is shutting down")
             if current["scaling"]["policy_safe_point"]:
                 try:
-                    return self.control.begin_external_update(version)
+                    return self.control.begin_external_update(
+                        version,
+                        **(
+                            {"backend": "nccl"}
+                            if getattr(self, "backend", "hccl") == "nccl"
+                            else {}
+                        ),
+                    )
                 except ControlError as exc:
                     try:
                         code = json.loads(str(exc)).get("code")

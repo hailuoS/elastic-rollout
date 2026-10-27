@@ -212,7 +212,9 @@ class ElasticReplicaManager(ReplicaManager):
                         raise RuntimeError("replica process exited; no stale replacement")
                     if r.cancel_requested or self.closing:
                         self.traffic.forget_replica(r.replica_id)
-                        if not self.traffic.inflight.get(r.replica_id, 0) and self.driver.idle(r):
+                        if r.state in STARTUP or (
+                            not self.traffic.inflight.get(r.replica_id, 0) and self.driver.idle(r)
+                        ):
                             self._cleanup(r)
                         continue
                     if r.state in STARTUP:
@@ -281,9 +283,7 @@ class ElasticReplicaManager(ReplicaManager):
 
     def _elastic_status(self):
         result = super().status()
-        result["topology_limitation"] = (
-            "immutable base plus per-replica transports; NPU acceptance pending"
-        )
+        result["topology_limitation"] = "immutable base plus per-replica persistent transports"
         result["scaling"] = {
             "mode": self.scaling_mode,
             "revision": self.scaling_revision,
@@ -453,7 +453,7 @@ class ElasticReplicaManager(ReplicaManager):
         p = snapshot_from_body(self.pipeline_signal or {})
         if (
             not p.usable(self.clock(), self.policy_config.sample_ttl_s, self.scaling_revision)
-            or p.policy_version != self.serving_policy_version
+            or p.policy_version > self.serving_policy_version
             or p.total_fraction >= self.policy_config.wait_low
             or p.ongoing_wait_s
             or not p.eligibility_known
@@ -486,7 +486,9 @@ class ElasticReplicaManager(ReplicaManager):
                 "run_id": p.run_id,
                 "unit": p.unit,
                 "completed_cycles": p.completed_cycles,
-                "policy_version": p.policy_version,
+                # The cached report can predate a recent weight commit. The
+                # turnover fence must start at admission change, never backdate.
+                "policy_version": self.serving_policy_version,
                 "consumed_total": p.consumed_total,
                 "eligible_units": p.eligible_units,
             }
@@ -499,6 +501,10 @@ class ElasticReplicaManager(ReplicaManager):
             or p.run_id != t["run_id"]
             or p.unit != t["unit"]
             or p.completed_cycles < t["completed_cycles"] + self.policy_config.trial_min_cycles
+            or (
+                p.window_cycles is not None
+                and p.window_cycles < self.policy_config.trial_min_cycles
+            )
             or p.policy_version < t["policy_version"] + self.policy_config.trial_policy_advances
             or p.consumed_total < t["consumed_total"] + t["eligible_units"]
             or p.oldest_buffer_policy_version is None

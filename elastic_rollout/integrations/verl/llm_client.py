@@ -27,8 +27,11 @@ class ElasticLLMClient(LLMServerClient):
         if any(x is not None for x in (image_data, video_data, audio_data)) or mm_processor_kwargs:
             raise ValueError("MVP-0 supports text token prompts only")
         params = dict(sampling_params)
+        rollout = self.config.actor_rollout_ref.rollout
+        params.setdefault("ignore_eos", getattr(rollout, "ignore_eos", False))
+        params.setdefault("repetition_penalty", getattr(rollout, "repetition_penalty", 1.0))
         if "max_tokens" not in params and "max_new_tokens" not in params:
-            params["max_tokens"] = self.config.actor_rollout_ref.rollout.response_length
+            params["max_tokens"] = rollout.response_length
         priority = kwargs.pop("priority", 0)
         if priority:
             params["priority"] = priority

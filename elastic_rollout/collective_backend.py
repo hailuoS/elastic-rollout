@@ -32,7 +32,11 @@ class CollectiveBackend:
             )
         # vLLM's NCCL destroy() uses a background abort with a timeout. That
         # cannot prove retirement completed. Our transfer groups use no graphs.
-        self.synchronize()
+        import torch
+
+        # Packed transfers can use auxiliary streams. Retirement must fence
+        # all device work, not just the current stream's enqueue boundary.
+        getattr(torch, self.device).synchronize()
         result = destroy(group.comm)
         if result not in (None, 0):
             raise RuntimeError(f"native {self.name.upper()} destroy failed: {result}")

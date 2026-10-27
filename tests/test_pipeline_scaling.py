@@ -132,6 +132,44 @@ def test_low_wait_requests_trial_not_direct_scale_in():
     assert d["target"] == s["desired_replicas"]
 
 
+def test_frequent_commits_and_sync_do_not_reset_fresh_capacity_windows():
+    p, s = TrainingPipelinePolicy(), status()
+    for i in range(8):
+        now = 100 + 20 * i
+        s["serving_policy_version"] = i + 2
+        body = asdict(report(now, sequence=i + 1, completed_cycles=10 + i, policy_version=i + 1))
+        d = p.decide(s, {}, body, now=now)
+        if i < 7:
+            s["scaling"]["transaction_owned"] = True
+            assert p.decide(s, {}, None, now=now + 1)["action"] == "HOLD"
+            s["scaling"]["transaction_owned"] = False
+            assert p.decide(s, {}, dict(body, phase="sync"), now=now + 2)["action"] == "HOLD"
+    assert d["action"] == "TRIAL_START"
+
+
+def test_lagged_report_trial_anchors_current_commit_and_counts_new_window(elastic):
+    c, m, _, _ = elastic
+    grow(c, m, 3)
+    update(m, 1)
+    m.scaling({"mode": "AUTO"})
+    publish(m)
+    update(m, 2)
+    m.scaling({"trial_action": "TRIAL_START", "revision": m.scaling_revision})
+    assert m.trial["policy_version"] == 2
+    update(m, 3)
+    update(m, 4)
+    publish(m, 2, completed_cycles=20, consumed_total=1000, window_cycles=2)
+    body = dict(
+        trial_action="TRIAL_COMMIT", trial_id=m.trial["trial_id"], revision=m.scaling_revision
+    )
+    with pytest.raises(PolicyConflict):
+        m.scaling(body)
+    publish(m, 3, completed_cycles=21, consumed_total=1100, window_cycles=3)
+    update(m, 5)
+    m.scaling(body)
+    assert m.last_trial["outcome"] == "COMMITTED" and m.desired == 2
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -219,7 +257,10 @@ def test_trial_requires_fresh_turnover_then_uses_retirement_ack(elastic):
     assert candidate.resource
     c.reconcile()
     assert candidate.state == S.RETIRE_PENDING and candidate.resource
-    m.transfer.maintenance({"acknowledgements": m.transfer.maintenance()["requests"]})
+    requests = m.transfer.maintenance()["requests"]
+    for request in requests:
+        m.transfer.maintenance({"destroy_receivers": request})
+    m.transfer.maintenance({"acknowledgements": requests})
     c.reconcile()
     assert candidate.resource is None
 

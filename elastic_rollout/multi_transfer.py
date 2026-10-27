@@ -20,6 +20,8 @@ class MultiTransferCoordinator:
         self._session = None
         self.retirements = {}
         self.retired = set()
+        self.receiver_destroying = set()
+        self.receiver_destroyed = set()
         self.poisoned = False
         self.operation_lock = threading.Lock()
 
@@ -81,6 +83,14 @@ class MultiTransferCoordinator:
 
     def maintenance(self, body=None):
         m = self.manager
+        if body and "destroy_receivers" in body:
+            request = body["destroy_receivers"]
+            with m.traffic.lock:
+                key = request["transport_key"]
+                if m.transaction_owned or request != self.retirements.get(key):
+                    raise PolicyConflict("retirement identity or lifecycle changed")
+                child = self.children[key]
+            return self._destroy_receivers(child, request["retirement_id"], request["deadline_at"])
         with m.traffic.lock:
             if body:
                 if body.get("error"):
@@ -95,6 +105,8 @@ class MultiTransferCoordinator:
                     request = self.retirements[key]
                     if request["retirement_id"] != token:
                         raise PolicyConflict("retirement identity mismatch")
+                    if token not in self.receiver_destroyed:
+                        raise PolicyConflict("receiver destroy acknowledgement required")
                     if request["deadline_at"] <= m.clock():
                         self.poisoned = True
                         raise PolicyConflict("retirement deadline expired; clean restart required")
@@ -110,6 +122,32 @@ class MultiTransferCoordinator:
                 if request["deadline_at"] <= m.clock():
                     self.poisoned = True
             return {"requests": list(self.retirements.values()), "poisoned": self.poisoned}
+
+    def _destroy_receivers(self, child, token, deadline):
+        m = self.manager
+        with m.traffic.lock:
+            if token in self.receiver_destroyed:
+                return {"receiver_destroyed": token}
+            if token in self.receiver_destroying or deadline <= m.clock():
+                raise PolicyConflict("receiver retirement in progress or expired")
+            self.receiver_destroying.add(token)
+        try:
+            child._fanout(
+                child.transport.targets,
+                lambda target: m.driver.weight_transfer_control.destroy_weight_transfer(
+                    target.endpoint,
+                    m.spec.replica.weight_sync,
+                    token,
+                    target.worker_world_size,
+                    timeout=min(120, deadline - m.clock()),
+                ),
+            )
+        except BaseException:
+            self.poisoned = True
+            raise
+        with m.traffic.lock:
+            self.receiver_destroyed.add(token)
+        return {"receiver_destroyed": token}
 
     def request_retirement(self, replica):
         with self.manager.traffic.lock:
@@ -156,10 +194,10 @@ class MultiTransferCoordinator:
         m = self.manager
         if self.poisoned:
             raise PolicyConflict("multi-transport poisoned; clean restart required")
-        if action == "isolate":
+        if action in ("destroy", "isolate"):
             key = body.get("transport_key")
             plan = next((p for p in self.entries if p["transport_key"] == key), None)
-            if not plan or not plan["optional"] or body.get("sender_destroyed") is not True:
+            if not plan or not plan["optional"]:
                 raise PolicyConflict(
                     "only an optional transport with sender destroy proof may isolate"
                 )
@@ -174,6 +212,11 @@ class MultiTransferCoordinator:
                 raise PolicyConflict(
                     "optional transport identity changed or operation still running"
                 )
+            token = child.session.session_id
+            if action == "destroy":
+                return self._destroy_receivers(child, token, m.policy_update.deadline_at)
+            if body.get("sender_destroyed") is not True or token not in self.receiver_destroyed:
+                raise PolicyConflict("sender and receiver destroy acknowledgements required")
             with m.traffic.lock:
                 error = str(body.get("error", "optional transfer failed"))
                 self.optional_failures[key] = error

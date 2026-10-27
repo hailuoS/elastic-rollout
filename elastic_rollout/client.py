@@ -97,8 +97,10 @@ class ControlClient:
     def path(self) -> str:
         return f"/v1/deployments/{quote(self.deployment_id, safe='')}"
 
-    def transport_maintenance(self, body=None):
-        return self._request(self.path + "/transport-maintenance", "POST", body or {})
+    def transport_maintenance(self, body=None, *, timeout=None):
+        return self._request(
+            self.path + "/transport-maintenance", "POST", body or {}, timeout=timeout
+        )
 
     def scaling(self, body=None):
         return self._request(self.path + "/scaling", "GET" if body is None else "PUT", body)

@@ -1,15 +1,22 @@
 # MVP-4：已有资源池内扩缩容
 
-状态：CPU 实现及测试，NPU 验收尚未完成，不能标记 CLOSED。
-默认配置继续使用固定 HCCL 拓扑；通过 `deployment.elastic_scaling=true`
-显式启用新路径。MVP-3 的 verl FSDP2 和 AReaL FSDP 共用此实现。
+状态：支持 NPU/HCCL 与 GPU/NCCL，GPU 真机验收进行中，NPU 专项尚未完成。
+默认配置继续使用固定拓扑；通过 `deployment.elastic_scaling=true`
+显式启用新路径。MVP-3 的 verl FSDP2 和 AReaL FSDP2 共用此实现。
 
 ## 启动与控制
 
 使用 `examples/runtime.mvp4.example.json` 替换节点、地址和模型路径。
-四个 slot 是已经存在的 Ray/NPU 资源，初始仅创建两个基础副本；
-基础副本数也是最小副本数。每个 slot 的 NPU 数必须等于 TP。
+四个 slot 是已经存在的 Ray 设备资源，初始仅创建两个基础副本；
+基础副本数也是最小副本数。每个 slot 的设备数必须等于 TP。
 同节点多个 slot 必须使用不同端口。
+
+GPU 配置：verl LaunchSpec 设置 `runtime.accelerator="gpu"`，Hydra override
+设置 `trainer.device=cuda`。如果 Core 模板显式配置了 `weight_sync="hccl"`，
+同时改为 `weight_sync="nccl"`、`accelerator="gpu"`。AReaL 的 Core 也使用
+这两个字段，trainer 使用 `NCCLWeightSyncConfig(master_address=...)`。
+其余弹性配置、策略阈值和控制命令共用。训练与推理仍须使用独立卡。
+单机 8 卡可配置 2 张训练卡、4 个 TP1 推理 slot；TP2 可配置 3 个推理 slot。
 
 ```bash
 elastic-rollout serve --config examples/runtime.mvp4.example.json --host 0.0.0.0 --ray-address auto
@@ -77,8 +84,14 @@ DRAINING 即刻停止所有新 lease（包括 sticky），已有 lease 可续租
 并让下一次 policy update 优先完成。
 
 RETIRE_PENDING 不可回退。Core 发布带唯一 retirement_id 的销毁请求，trainer 在
-下一次 BEGIN 之前，通过原生 actor RPC 线程同步调用 `hcclCommDestroy`，全 rank RPC
-成功后回传唯一主 rank 确认。Core 再执行 stop，并在 supervisor 确认退出后释放 slot。
+下一次 BEGIN 之前，sender 原生 actor RPC 与 vLLM 全部接收 rank 同时进入
+`hcclCommDestroy` / `ncclCommDestroy`。vLLM 的 worker extension 由 Core 自动注入，
+通过字符串 `/collective_rpc` 调用；不传递 Python callable、张量或 native 指针。
+Core 必须收齐匹配 retirement_id 的全接收 rank 确认，以及全训练 rank RPC 成功后的
+唯一主 rank 确认，才执行 stop，并在 supervisor 确认退出后释放 slot。
+仅 sender 调用 NCCL destroy 会阻塞等待接收 rank，不能先等 sender 完成再停 vLLM。
+此约束与 [NCCL 销毁接口的同节点集体调用要求](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2287/user-guide/docs/api/comms.html#ncclcommdestroy)一致。
+接收端退出能力在 warmup 检查；旧版本或 extension 不匹配会阻止 READY。
 也可在 trainer 安全点显式调用共享 coordinator 的 `maintain_transports()`，无需生成
 新 policy。销毁能力缺失、超时或异常会隔离资源并阻止新事务，要求干净重启。
 整个任务关闭时，按已有 supervisor 进程退出确认执行整体 teardown。
@@ -176,4 +189,5 @@ sender 与 receiver 日志、Ray Actor/supervisor/vLLM PID、slot 与 NPU 显存
 真实销毁可能阻塞在 native HCCL，必须保留训练任务外部 watchdog；不能用 Python
 超时线程把尚未完成的 NPU 调用藏起来。
 
-MVP-2B Run B 原 SIGTERM 验收仍需补齐；SIGKILL 不能触发 Launcher 的 Python 清理。
+Linux Launcher 的子进程使用父进程死亡通知；Launcher SIGKILL 后 Core/Trainer
+仍会收到 SIGTERM。GPU 已覆盖该公共机制，NPU 的物理退出和显存释放仍需补验。

@@ -140,14 +140,34 @@ class PipelineWindow:
         self.lock = RLock()
 
     def record(
-        self, *, wait_data_s, wait_staleness_s, train_path_s, consumed_units, wait_unknown_s=0
+        self,
+        *,
+        wait_data_s,
+        wait_staleness_s,
+        train_path_s,
+        consumed_units,
+        wait_unknown_s=0,
+        include_timing=True,
     ):
         with self.lock:
             return self._record(
-                wait_data_s, wait_staleness_s, train_path_s, consumed_units, wait_unknown_s
+                wait_data_s,
+                wait_staleness_s,
+                train_path_s,
+                consumed_units,
+                wait_unknown_s,
+                include_timing,
             )
 
-    def _record(self, wait_data_s, wait_staleness_s, train_path_s, consumed_units, wait_unknown_s):
+    def _record(
+        self,
+        wait_data_s,
+        wait_staleness_s,
+        train_path_s,
+        consumed_units,
+        wait_unknown_s,
+        include_timing,
+    ):
         values = (wait_data_s, wait_staleness_s, train_path_s, wait_unknown_s)
         if any(
             isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0
@@ -156,7 +176,10 @@ class PipelineWindow:
             raise ValueError("invalid cycle timings")
         if type(consumed_units) is not int or consumed_units < 0:
             raise ValueError("invalid native consumed count")
-        self.cycles.append(values)
+        if type(include_timing) is not bool:
+            raise ValueError("include_timing must be boolean")
+        if include_timing:
+            self.cycles.append(values)
         self.completed_cycles += 1
         self.consumed_total += consumed_units
 

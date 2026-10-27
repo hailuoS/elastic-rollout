@@ -9,7 +9,10 @@ from elastic_rollout.runtime import PolicyConflict
 
 
 @pytest.mark.parametrize("destroy_fails", [False, True])
-def test_optional_sender_failure_isolates_only_after_native_destroy(monkeypatch, destroy_fails):
+@pytest.mark.parametrize("backend,device", [("hccl", "npu"), ("nccl", "cuda")])
+def test_optional_sender_failure_isolates_only_after_native_destroy(
+    monkeypatch, destroy_fails, backend, device
+):
     import threading
 
     from test_integrations import stub_module
@@ -25,19 +28,34 @@ def test_optional_sender_failure_isolates_only_after_native_destroy(monkeypatch,
         if destroy_fails:
             raise RuntimeError("destroy failed")
 
-    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
-    sender = HCCLSender(1024, True, endpoint="http://unused", deployment_id="test")
-    child = HCCLSender(1024, True, endpoint="http://unused", deployment_id="test")
+    stub_module(
+        monkeypatch,
+        "torch",
+        **{
+            device: NS(
+                current_stream=lambda: NS(synchronize=lambda: None), synchronize=lambda: None
+            )
+        },
+    )
+    sender = HCCLSender(1024, True, endpoint="http://unused", deployment_id="test", backend=backend)
+    child = HCCLSender(1024, True, endpoint="http://unused", deployment_id="test", backend=backend)
     base = dict(update_id="u", session_id="base", transport_id="t0", target_version=1)
     sender.session = dict(base, transports=[{"transport_key": "base", "session": base}])
     child.session = dict(base, session_id="child", transport_id="t1")
-    child.group = NS(comm=123, available=True, hccl=NS(hcclCommDestroy=destroy))
+    child.group = NS(
+        comm=123, available=True, **{backend: NS(**{f"{backend}CommDestroy": destroy})}
+    )
     child._optional, child._transport_key = True, "candidate"
     sender._children = {"candidate": child}
     sender._active_transports = [sender, child]
     sender._send_bucket = lambda *args: calls.append("base")
     child.control.transfer_operation = lambda *args, **kwargs: {"optional_failure": "send error"}
-    sender.control.transfer_operation = lambda uid, action, **kwargs: calls.append(action)
+
+    def control(uid, action, **kwargs):
+        calls.append(action)
+        return {"receiver_destroyed": "child"}
+
+    sender.control.transfer_operation = control
     child._send_bucket = lambda *args: child._overlap("group", lambda: None)
     if destroy_fails:
         with pytest.raises(RuntimeError, match="destroy failed"):
@@ -46,7 +64,7 @@ def test_optional_sender_failure_isolates_only_after_native_destroy(monkeypatch,
     else:
         sender._fanout_bucket([], {}, 0)
         sender._fanout_bucket([], {}, 1)
-        assert calls == ["base", "destroy", "isolate", "base"]
+        assert calls == ["base", "destroy", "destroy", "isolate", "base"]
         assert not sender._poisoned and not sender._children
 
 
@@ -200,10 +218,10 @@ def test_verl_sampler_uses_native_wait_predicate_and_committed_version_floor(mon
                 hybrid_engine=False,
                 rollout=NS(
                     checkpoint_engine=NS(
-                            backend=backend,
+                        backend=backend,
                         engine_kwargs={
-                                backend: {"endpoint": "http://unused", "deployment_id": "test"}
-                        }
+                            backend: {"endpoint": "http://unused", "deployment_id": "test"}
+                        },
                     )
                 ),
             ),
@@ -315,6 +333,30 @@ def test_revision_discards_old_capacity_evidence_without_resetting_counters():
     assert body["oldest_consumed_policy_version"] is None
 
 
+def test_revision_mid_cycle_waits_for_complete_new_cycles_without_poisoning_window():
+    o, clock, status, _ = observer()
+    o.report_once()
+    o.begin()
+    o.consumed_groups(2, 0)
+    clock[0] += 10
+    status["scaling"]["revision"] += 1
+    body = o.report_once()
+    assert body["train_path_s"] == body["wait_unknown_s"] == 0
+    clock[0] += 2
+    o.finish()
+    body = o.report_once()
+    assert body["window_cycles"] == 0 and body["completed_cycles"] == 1
+    assert body["consumed_total"] == 2
+    o.begin()
+    o.consumed_groups(2, 0)
+    clock[0] += 3
+    o.finish()
+    body = o.report_once()
+    assert body["window_cycles"] == 1 and body["completed_cycles"] == 2
+    assert body["train_path_s"] == 3 and body["consumed_total"] == 4
+    assert body["wait_unknown_s"] == 0
+
+
 def test_missing_version_is_not_replaced_by_later_known_group():
     o, clock, _, _ = observer()
     o.begin()
@@ -349,6 +391,9 @@ def test_optional_finish_failure_requires_native_destroy_ack_before_commit(elast
             transport_id=child.transport.transport_id,
             sender_destroyed=True,
         )
+        with pytest.raises(PolicyConflict, match="sender and receiver"):
+            m.transfer.execute(uid, "isolate", body)
+        m.transfer.execute(uid, "destroy", body)
         m.transfer.execute(uid, "isolate", body)
 
     update(m, 2, before_commit=before_commit)

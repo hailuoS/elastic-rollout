@@ -271,7 +271,7 @@ class TrainingPipelinePolicy:
             self.low_start_cycles = None
             return decision("TRIAL_CANCEL" if trial else "HOLD", reason)
 
-        if trial and s["transaction_owned"]:
+        if s["transaction_owned"]:
             return decision(
                 "HOLD", "required weight update in progress; Core watchdog retains deadline"
             )
@@ -280,11 +280,10 @@ class TrainingPipelinePolicy:
         except (TypeError, ValueError):
             return invalid("missing or invalid native pipeline measurements")
         if (
-            trial
-            and p.phase == "sync"
+            p.phase == "sync"
             and 0 <= now - p.observed_at <= c.sample_ttl_s
             and p.topology_revision == s.get("revision")
-            and p.run_id == trial["run_id"]
+            and (not trial or p.run_id == trial["run_id"])
         ):
             return decision("HOLD", "weight synchronization excluded from trial evidence")
         if (
@@ -297,7 +296,7 @@ class TrainingPipelinePolicy:
             and p.topology_revision == s.get("revision")
             and p.run_id == trial["run_id"]
             and p.unit == trial["unit"]
-            and p.policy_version == status["serving_policy_version"]
+            and p.policy_version <= status["serving_policy_version"]
         ):
             if (
                 p.ongoing_wait_s > c.ongoing_wait_limit_s
@@ -308,10 +307,10 @@ class TrainingPipelinePolicy:
             return decision("HOLD", "collecting first complete cycle after admission revision")
         if not p.usable(now, c.sample_ttl_s, s.get("revision")):
             return invalid("stale, unknown or mismatched pipeline window")
-        if p.policy_version != status["serving_policy_version"]:
-            if trial and p.policy_version < status["serving_policy_version"]:
-                return decision("HOLD", "awaiting fresh report after weight commit")
-            return invalid("pipeline policy version does not match Core")
+        # Core validated the version when it accepted this report. A normal
+        # weight commit cannot invalidate a still-fresh capacity measurement.
+        if p.policy_version > status["serving_policy_version"]:
+            return invalid("pipeline policy version is ahead of Core")
         identity = (p.run_id, p.topology_revision)
         if identity != self.identity:
             self.identity, self.sequence = identity, -1
@@ -350,6 +349,7 @@ class TrainingPipelinePolicy:
             if (
                 p.total_fraction < c.wait_low
                 and p.ongoing_wait_s == 0
+                and (p.window_cycles is None or p.window_cycles >= c.trial_min_cycles)
                 and p.completed_cycles >= trial["completed_cycles"] + c.trial_min_cycles
                 and p.policy_version >= trial["policy_version"] + c.trial_policy_advances
                 and p.consumed_total >= trial["consumed_total"] + trial["eligible_units"]

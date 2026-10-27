@@ -156,6 +156,9 @@ def test_retirement_ack_required_and_sticky_drain_rejected(elastic):
     assert candidate.state == S.RETIRE_PENDING
     assert candidate.replica_id not in driver.stopped
     (request,) = m.transfer.maintenance()["requests"]
+    with pytest.raises(PolicyConflict, match="receiver destroy"):
+        m.transfer.maintenance({"acknowledgements": [request]})
+    m.transfer.maintenance({"destroy_receivers": request})
     m.transfer.maintenance({"acknowledgements": [request]})
     c.reconcile()
     assert candidate.resource is None
@@ -317,7 +320,8 @@ def test_sender_fans_same_bucket_once_and_destroys_on_native_thread(monkeypatch,
         SimpleNamespace(
             **{
                 device: SimpleNamespace(
-                    current_stream=lambda: SimpleNamespace(synchronize=lambda: None)
+                    current_stream=lambda: SimpleNamespace(synchronize=lambda: None),
+                    synchronize=lambda: None,
                 )
             }
         ),
@@ -336,6 +340,7 @@ def test_sender_fans_same_bucket_once_and_destroys_on_native_thread(monkeypatch,
         },
     )
     request = {"retirement_id": "retire", "transport_key": "extra", "transport_id": "transport"}
+    sender.control.transport_maintenance = lambda *args, **kwargs: {"receiver_destroyed": "retire"}
     assert sender.retire_transports([request]) == sender.retire_transports([request])
     assert destroyed == [(123, thread)]
 
@@ -355,6 +360,8 @@ def test_repeated_scale_cycles_keep_base_transport(elastic, backend, accelerator
             c.reconcile()
         requests = m.transfer.maintenance()["requests"]
         if requests:
+            for request in requests:
+                m.transfer.maintenance({"destroy_receivers": request})
             m.transfer.maintenance({"acknowledgements": requests})
             c.reconcile()
         version += 1

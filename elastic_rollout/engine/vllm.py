@@ -119,6 +119,31 @@ class StandardVLLMControl:
         # acknowledges worker load/postprocessing; the Core owns policy version.
         return request_json(endpoint + "/finish_weight_update", "POST", {}, timeout=timeout)
 
+    def destroy_weight_transfer(self, endpoint, backend, retirement_id, world_size, *, timeout=120):
+        result = request_json(
+            endpoint + "/collective_rpc",
+            "POST",
+            {
+                "method": "elastic_destroy_weight_transfer",
+                "args": [backend, retirement_id],
+                "timeout": timeout,
+            },
+            timeout=timeout + 5,
+        )
+        expected = {"retirement_id": retirement_id}
+        if result.get("results") != [expected] * world_size:
+            raise RuntimeError("receiver retirement requires matching proof from every worker")
+
+    def check_retirement_capability(self, endpoint, world_size):
+        result = request_json(
+            endpoint + "/collective_rpc",
+            "POST",
+            {"method": "elastic_weight_transfer_capability", "timeout": 10},
+            timeout=15,
+        )
+        if result.get("results") != [{"retirement_protocol": 1}] * world_size:
+            raise RuntimeError("synchronous retirement capability missing on a vLLM worker")
+
     def is_paused(self, endpoint: str, *, timeout: float = 3) -> bool:
         try:
             result = request_json(endpoint + "/is_paused", timeout=timeout)
@@ -270,6 +295,14 @@ class VLLMServiceDriver:
                 if shape.weight_sync in ("hccl", "nccl")
                 else ()
             ),
+            *(
+                (
+                    "--worker-extension-cls",
+                    "elastic_rollout.engine.weight_transfer_worker.WeightTransferWorker",
+                )
+                if spec.elastic_scaling
+                else ()
+            ),
             *shape.vllm_args,
         )
         env = (("VLLM_SERVER_DEV_MODE", "1"),)
@@ -289,7 +322,12 @@ class VLLMServiceDriver:
         return self.launcher.started(replica.replica_id) and self.control.health(replica.endpoint)
 
     def warmup(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> bool:
-        return self.control.warmup(replica.endpoint, spec.replica.served_model_name)
+        ready = self.control.warmup(replica.endpoint, spec.replica.served_model_name)
+        if ready and spec.elastic_scaling:
+            self.control.check_retirement_capability(
+                replica.endpoint, spec.replica.tensor_parallel_size
+            )
+        return ready
 
     def idle(self, replica: ReplicaDescriptor) -> bool:
         return self.control.idle(replica.endpoint)
