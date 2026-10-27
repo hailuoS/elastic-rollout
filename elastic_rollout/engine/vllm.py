@@ -197,7 +197,7 @@ class VLLMServiceDriver:
             "priority",
             *(
                 ("--weight-transfer-config", '{"backend":"nccl"}')
-                if shape.weight_sync == "hccl"
+                if shape.weight_sync in ("hccl", "nccl")
                 else ()
             ),
             *shape.vllm_args,
@@ -205,7 +205,7 @@ class VLLMServiceDriver:
         env = (("VLLM_SERVER_DEV_MODE", "1"),)
         if shape.weight_sync == "hccl":
             env += (("VLLM_ASCEND_ENABLE_NZ", "0"),)
-        return LaunchPlan(argv, env=env)
+        return LaunchPlan(argv, env=env, accelerator=shape.accelerator)
 
     def start(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> None:
         self.launcher.start(

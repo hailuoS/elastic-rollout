@@ -303,7 +303,7 @@ class ElasticHCCLInferenceEngine(ElasticInferenceEngine):
 
     def initialize(self, *args, **kwargs):
         super().initialize(*args, **kwargs)
-        if self.control.status()["spec"]["replica"]["weight_sync"] != "hccl":
+        if self.control.status()["spec"]["replica"]["weight_sync"] not in ("hccl", "nccl"):
             raise ValueError("MVP-3 requires a Core deployment with weight_sync=hccl")
 
     def set_version(self, version: int) -> None:

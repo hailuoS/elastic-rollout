@@ -1,4 +1,4 @@
-"""Ray actors reserve single-node NPU slots and own independent vLLM processes."""
+"""Ray actors reserve device slots and own independent vLLM processes."""
 
 import os
 import socket
@@ -17,17 +17,47 @@ class _ProcessActor:
         self.actual_device_ids: tuple[str, ...] = ()
 
     def start(
-        self, argv: tuple[str, ...], num_devices: int, port: int, env: dict | None = None
+        self,
+        argv: tuple[str, ...],
+        num_devices: int,
+        port: int,
+        env: dict | None = None,
+        accelerator: str = "npu",
     ) -> tuple[str, ...]:
         import ray
 
         if os.name != "posix":
-            raise RuntimeError("RayProcessLauncher requires Linux Ascend worker nodes")
+            raise RuntimeError("RayProcessLauncher requires Linux worker nodes")
         if self.process is not None:
             raise RuntimeError("process already started")
+        if accelerator not in ("npu", "gpu"):
+            raise ValueError("accelerator must be npu or gpu")
         # NOSET actors may see the whole node. Only Ray's runtime assignment owns
         # the device set; sort these local IDs without selecting any other NPUs.
-        assigned = ray.get_runtime_context().get_accelerator_ids().get("NPU", [])
+        resource = "NPU" if accelerator == "npu" else "GPU"
+        assigned = ray.get_runtime_context().get_accelerator_ids().get(resource, [])
+        if accelerator == "gpu":
+            mask = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            visible = [item.strip() for item in mask.split(",")]
+            if (
+                len(assigned) != num_devices
+                or len(set(assigned)) != num_devices
+                or len(visible) != num_devices
+                or len(set(visible)) != num_devices
+                or any(not item for item in visible)
+            ):
+                raise RuntimeError("Ray GPU assignment and CUDA_VISIBLE_DEVICES must match slot")
+            self.actual_device_ids = tuple(assigned)
+            child_env = os.environ.copy()
+            child_env.update(env or {})
+            # Preserve Ray's device mask; do not confuse child-local ordinals
+            # with the physical GPU IDs owned by the scheduler.
+            child_env["CUDA_VISIBLE_DEVICES"] = mask
+        else:
+            child_env = self._npu_environment(assigned, num_devices, env)
+        return self._start_process(argv, port, child_env)
+
+    def _npu_environment(self, assigned, num_devices, env):
         if (
             len(assigned) != num_devices
             or any(not isinstance(x, str) or not x.isascii() or not x.isdecimal() for x in assigned)
@@ -42,6 +72,9 @@ class _ProcessActor:
         child_env.update(env or {})
         # Launch capabilities cannot override Ray's physical device assignment.
         child_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(self.actual_device_ids)
+        return child_env
+
+    def _start_process(self, argv, port, child_env):
         # Refuse an already occupied API port before any health probe can
         # accidentally identify a pre-existing server as our new replica.
         with socket.socket() as probe:
@@ -133,7 +166,11 @@ class RayProcessLauncher:
             self.ray.remote(_ProcessActor)
             .options(
                 num_cpus=slot.num_cpus,
-                resources={"NPU": slot.num_devices},
+                **(
+                    {"num_gpus": slot.num_devices}
+                    if plan.accelerator == "gpu"
+                    else {"resources": {"NPU": slot.num_devices}}
+                ),
                 scheduling_strategy=NodeAffinitySchedulingStrategy(slot.node_id, soft=False),
                 max_restarts=0,
                 max_task_retries=0,
@@ -143,7 +180,11 @@ class RayProcessLauncher:
         self.actors[replica_id] = actor
         self.leases[replica_id] = lease
         self.starts[replica_id] = actor.start.remote(
-            plan.argv, slot.num_devices, slot.port, dict(plan.env)
+            plan.argv,
+            slot.num_devices,
+            slot.port,
+            dict(plan.env),
+            **({"accelerator": "gpu"} if plan.accelerator == "gpu" else {}),
         )
 
     def started(self, replica_id: str) -> bool:

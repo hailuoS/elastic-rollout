@@ -38,7 +38,10 @@ def cleanup_subprocess(request):
             env=dict(os.environ, ELASTIC_HCCL_CLEANUP_CHILD=request.node.nodeid),
             capture_output=True,
             text=True,
-            timeout=10,
+            # Windows cold imports plus four HTTP fixture shutdowns can exceed
+            # 10s. The abandoned I/O still blocks for 120s, and the operation
+            # itself retains its separate <3s assertion below.
+            timeout=30 if os.name == "nt" else 10,
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(f"child failed to exit with abandoned control I/O: {exc.stdout!r}")

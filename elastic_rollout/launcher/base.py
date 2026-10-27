@@ -8,6 +8,7 @@ from elastic_rollout.api import ResourceLease
 class LaunchPlan:
     argv: tuple[str, ...]
     env: tuple[tuple[str, str], ...] = ()
+    accelerator: str = "npu"
 
 
 class ProcessLauncher(Protocol):

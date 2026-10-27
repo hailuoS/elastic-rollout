@@ -69,7 +69,7 @@ class ElasticPPOTrainer(PPOTrainer):
         if self._hccl:
             bootstrap = status["bootstrap_snapshot"]
             if (
-                status["spec"]["replica"]["weight_sync"] != "hccl"
+                status["spec"]["replica"]["weight_sync"] != self._weight_sync_config.backend
                 or bootstrap["version"] != 0
                 or Path(config.actor.path).resolve().as_posix() != bootstrap["model_path"]
                 or status["serving_policy_version"] != 0

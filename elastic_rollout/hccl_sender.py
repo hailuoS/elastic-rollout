@@ -7,6 +7,7 @@ import time
 from uuid import uuid4
 
 from elastic_rollout.client import ControlClient
+from elastic_rollout.collective_backend import CollectiveBackend
 from elastic_rollout.weight_transfer import (
     METADATA_LIMIT,
     RECOVERY_REQUIRED,
@@ -61,6 +62,7 @@ class HCCLSender:
         master_address=None,
         master_port=None,
         bootstrap_model_path=None,
+        backend="hccl",
     ):
         if type(bucket_size) is not int or bucket_size <= 0:
             raise ValueError("bucket_size must be positive")
@@ -73,6 +75,7 @@ class HCCLSender:
         ):
             raise ValueError("invalid packing options")
         self.control = ControlClient(endpoint, deployment_id, os.getenv("ELASTIC_ROLLOUT_TOKEN"))
+        self.backend = CollectiveBackend(backend)
         self.bucket_size, self.is_master = bucket_size, is_master
         self.packed, self.num_buffers = packed, packed_num_buffers
         self.metadata_limit = metadata_group_limit_bytes
@@ -152,13 +155,9 @@ class HCCLSender:
             if session["needs_initialize"]:
                 if self.group is not None or self.transport_id is not None:
                     raise RuntimeError("sender HCCL group already exists; " + RECOVERY_REQUIRED)
-                from vllm_ascend.distributed.weight_transfer.hccl_engine import (
-                    HCCLWeightTransferEngine,
-                )
-
                 self.transport_init_count += 1
                 self.group = self._overlap(
-                    "initialize", lambda: HCCLWeightTransferEngine.trainer_init(session)
+                    "initialize", lambda: self.backend.engine().trainer_init(session)
                 )
                 self.transport_id = session["transport_id"]
             elif self.group is None or self.transport_id != session["transport_id"]:
@@ -212,13 +211,14 @@ class HCCLSender:
             self._fail(exc)
             raise
         return {
-            "elastic_hccl/bytes_transferred": total,
-            "elastic_hccl/num_weight_groups": count,
-            "elastic_hccl/materialization_and_transfer_s": time.monotonic() - started,
-            "elastic_hccl/parameter_materialization_s": materialization_s,
-            "elastic_hccl/hccl_transfer_s": transfer_s,
-            "elastic_hccl/effective_GBps": total / max(transfer_s, 1e-9) / 1e9,
-            "elastic_hccl/transport_init_count": self.transport_init_count,
+            f"elastic_{self.backend.name}/bytes_transferred": total,
+            f"elastic_{self.backend.name}/num_weight_groups": count,
+            f"elastic_{self.backend.name}/materialization_and_transfer_s": time.monotonic()
+            - started,
+            f"elastic_{self.backend.name}/parameter_materialization_s": materialization_s,
+            f"elastic_{self.backend.name}/{self.backend.name}_transfer_s": transfer_s,
+            f"elastic_{self.backend.name}/effective_GBps": total / max(transfer_s, 1e-9) / 1e9,
+            f"elastic_{self.backend.name}/transport_init_count": self.transport_init_count,
         }
 
     def _send_coordinated(self, weights, synchronize_group):
@@ -264,21 +264,23 @@ class HCCLSender:
             close = getattr(weights, "close", None)
             if close is not None:
                 close()
+        if not self.is_master:
+            # Adapters merge rank results. A peer's zero counters must not
+            # overwrite the sender's transferred bytes or persistent init count.
+            return {}
         return {
-            "elastic_hccl/bytes_transferred": total if self.is_master else 0,
-            "elastic_hccl/num_weight_groups": count,
-            "elastic_hccl/materialization_and_transfer_s": time.monotonic() - started,
-            "elastic_hccl/transport_init_count": self.transport_init_count,
+            f"elastic_{self.backend.name}/bytes_transferred": total,
+            f"elastic_{self.backend.name}/num_weight_groups": count,
+            f"elastic_{self.backend.name}/materialization_and_transfer_s": time.monotonic()
+            - started,
+            f"elastic_{self.backend.name}/transport_init_count": self.transport_init_count,
         }
 
     def _send_bucket(self, bucket, info, group_index):
-        import torch
-        from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLWeightTransferEngine
-
-        torch.npu.current_stream().synchronize()
+        self.backend.synchronize()
 
         def send():
-            HCCLWeightTransferEngine.trainer_send_weights(
+            self.backend.engine().trainer_send_weights(
                 iter(bucket),
                 {
                     "group": self.group,
@@ -287,7 +289,7 @@ class HCCLSender:
                     "packed_num_buffers": self.num_buffers,
                 },
             )
-            torch.npu.current_stream().synchronize()
+            self.backend.synchronize()
 
         self._overlap("group", send, group_index=group_index, update_info=info)
 

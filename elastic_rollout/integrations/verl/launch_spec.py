@@ -34,6 +34,7 @@ class LaunchSpec:
     startup_timeout_s: float
     shutdown_timeout_s: float
     trainer_shutdown_timeout_s: float
+    accelerator: str = "npu"
 
     @classmethod
     def from_file(cls, path: Path) -> "LaunchSpec":
@@ -44,7 +45,7 @@ class LaunchSpec:
         runtime, control = data["runtime"], data["controller"]
         deployment, model, verl = data["deployment"], data["model"], data["verl"]
         fields = {
-            "runtime": "ray_address",
+            "runtime": "ray_address accelerator",
             "controller": "bind_host advertise_host port startup_timeout_s shutdown_timeout_s",
             "deployment": "id core_template",
             "model": "path initial_version",
@@ -83,7 +84,10 @@ class LaunchSpec:
             control.get("startup_timeout_s", 900),
             control.get("shutdown_timeout_s", 900),
             verl.get("shutdown_timeout_s", 120),
+            runtime.get("accelerator", "npu"),
         )
+        if spec.accelerator not in ("npu", "gpu"):
+            raise ValueError("runtime.accelerator must be npu or gpu")
         if any(
             not isinstance(x, str) or not x
             for x in (spec.ray_address, spec.bind_host, spec.deployment_id)
@@ -98,6 +102,10 @@ class LaunchSpec:
                 raise ValueError(f"{name} must be finite and positive")
             positive_seconds(value, name)
         return spec
+
+    @property
+    def backend(self):
+        return "nccl" if self.accelerator == "gpu" else "hccl"
 
     @property
     def endpoint(self) -> str:
@@ -118,7 +126,8 @@ class LaunchSpec:
         for key, value in (
             ("model", self.model_path),
             ("policy_version", self.initial_version),
-            ("weight_sync", "hccl"),
+            ("weight_sync", self.backend),
+            ("accelerator", self.accelerator),
         ):
             _match(replica, key, value, "Core replica")
         spec = DeploymentSpec.from_dict(deployment)
@@ -150,18 +159,18 @@ class LaunchSpec:
             f"{ROLLOUT}.checkpoint_manager_class": (
                 "elastic_rollout.integrations.verl.checkpoint_manager.ElasticCheckpointEngineManager"
             ),
-            f"{ENGINE}.backend": "elastic_hccl",
+            f"{ENGINE}.backend": f"elastic_{self.backend}",
             f"{ENGINE}.custom_backend_module": (
-                "elastic_rollout.integrations.verl.hccl_checkpoint_engine"
+                f"elastic_rollout.integrations.verl.{self.backend}_checkpoint_engine"
             ),
-            f"{ENGINE}.engine_kwargs.elastic_hccl.endpoint": self.endpoint,
-            f"{ENGINE}.engine_kwargs.elastic_hccl.deployment_id": self.deployment_id,
-            f"{ENGINE}.engine_kwargs.elastic_hccl.bootstrap_model_path": self.model_path,
-            f"{ENGINE}.engine_kwargs.elastic_hccl.packed": "true",
+            f"{ENGINE}.engine_kwargs.elastic_{self.backend}.endpoint": self.endpoint,
+            f"{ENGINE}.engine_kwargs.elastic_{self.backend}.deployment_id": self.deployment_id,
+            f"{ENGINE}.engine_kwargs.elastic_{self.backend}.bootstrap_model_path": self.model_path,
+            f"{ENGINE}.engine_kwargs.elastic_{self.backend}.packed": "true",
             f"{ROLLOUT}.custom.elastic.endpoint": self.endpoint,
             f"{ROLLOUT}.custom.elastic.deployment_id": self.deployment_id,
             f"{ROLLOUT}.custom.elastic.fixed_policy": "false",
-            f"{ROLLOUT}.custom.elastic.weight_sync": "hccl",
+            f"{ROLLOUT}.custom.elastic.weight_sync": self.backend,
         }
 
     def trainer_overrides(self, ray_address: str) -> list[str]:
@@ -184,7 +193,7 @@ class LaunchSpec:
         for key, value in owned.items():
             prefix = (
                 "++"
-                if ".elastic_hccl." in key or ".custom.elastic." in key
+                if ".elastic_hccl." in key or ".elastic_nccl." in key or ".custom.elastic." in key
                 else "+"
                 if key in ("ray_kwargs.ray_init.address", f"{ROLLOUT}.checkpoint_manager_class")
                 else ""
@@ -215,7 +224,7 @@ def validate_mvp2b_verl_config(
         if str(get(key)).lower() != value.lower():
             raise ValueError(f"resolved Verl config {key} conflicts with LaunchSpec")
     required = {
-        "trainer.device": "npu",
+        "trainer.device": "cuda" if spec.accelerator == "gpu" else "npu",
         "trainer.resume_mode": "disable",
         "actor_rollout_ref.actor.strategy": "fsdp2",
         f"{ROLLOUT}.name": "vllm",

@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from elastic_rollout.client import ControlClient
+from elastic_rollout.launcher.owned_exec import owned_command
 
 from .launch_spec import LaunchSpec, validate_mvp2b_verl_config
 
@@ -44,10 +45,11 @@ def resolve_ray_cluster(spec: LaunchSpec, core_config: dict) -> str:
                 raise ValueError(f"rollout slot refers to missing Ray node {node_id}")
             slots_by_node[node_id] = slots_by_node.get(node_id, 0) + slot["num_devices"]
         for node_id, count in slots_by_node.items():
-            available = nodes[node_id].get("Resources", {}).get("NPU", 0)
+            resource = "GPU" if spec.accelerator == "gpu" else "NPU"
+            available = nodes[node_id].get("Resources", {}).get(resource, 0)
             if count > available:
                 raise ValueError(
-                    f"rollout slots need {count} NPUs on {node_id}, Ray has {available}"
+                    f"rollout slots need {count} {resource}s on {node_id}, Ray has {available}"
                 )
         logger.info("resolved Ray cluster GCS %s with %d live nodes", address, len(nodes))
         return address
@@ -61,7 +63,7 @@ def validate_bootstrap(status: dict, spec: LaunchSpec, core_config: dict) -> Non
     replica = deployment.get("replica", {})
     if deployment.get("deployment_id") != spec.deployment_id:
         raise RuntimeError("Core deployment identity differs from LaunchSpec")
-    if replica.get("model") != spec.model_path or replica.get("weight_sync") != "hccl":
+    if replica.get("model") != spec.model_path or replica.get("weight_sync") != spec.backend:
         raise RuntimeError("Core bootstrap model or transport differs from LaunchSpec")
     if replica.get("policy_version") != spec.initial_version:
         raise RuntimeError("Core bootstrap replica version differs from LaunchSpec")
@@ -178,24 +180,26 @@ def run_launch(
             config_path = Path(temp) / "core.json"
             config_path.write_text(json.dumps(core_config), encoding="utf-8")
             core = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "elastic_rollout.cli",
-                    "serve",
-                    "--config",
-                    str(config_path),
-                    "--host",
-                    spec.bind_host,
-                    "--port",
-                    str(spec.port),
-                    "--ray-address",
-                    ray_address,
-                    "--expected-gcs-address",
-                    ray_address,
-                    "--shutdown-timeout",
-                    str(spec.shutdown_timeout_s),
-                ],
+                owned_command(
+                    [
+                        sys.executable,
+                        "-m",
+                        "elastic_rollout.cli",
+                        "serve",
+                        "--config",
+                        str(config_path),
+                        "--host",
+                        spec.bind_host,
+                        "--port",
+                        str(spec.port),
+                        "--ray-address",
+                        ray_address,
+                        "--expected-gcs-address",
+                        ray_address,
+                        "--shutdown-timeout",
+                        str(spec.shutdown_timeout_s),
+                    ]
+                ),
                 env=env,
                 start_new_session=os.name == "posix",
             )
@@ -210,7 +214,7 @@ def run_launch(
             if interrupted[0]:
                 raise InterruptedError("launch interrupted before trainer start")
             trainer = subprocess.Popen(
-                [sys.executable, "-m", "verl.trainer.main_ppo", *trainer_overrides],
+                owned_command([sys.executable, "-m", "verl.trainer.main_ppo", *trainer_overrides]),
                 env=env,
                 start_new_session=os.name == "posix",
             )

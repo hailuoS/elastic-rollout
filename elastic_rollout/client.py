@@ -77,11 +77,11 @@ async def complete_on_cancel(awaitable):
     task = asyncio.ensure_future(awaitable)
     try:
         return await asyncio.shield(task)
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancelled:
         try:
             await task
         finally:
-            raise
+            raise cancelled
 
 
 class ControlClient:
@@ -145,12 +145,14 @@ class ControlClient:
     def get_policy_update(self, update_id: str) -> dict:
         return self._request(self.path + f"/policy-updates/{quote(update_id, safe='')}")
 
-    def begin_external_update(self, target_version: int) -> dict:
+    def begin_external_update(self, target_version: int, backend: str = "hccl") -> dict:
+        if backend not in ("hccl", "nccl"):
+            raise ValueError("external backend must be hccl or nccl")
         return self._request(
             self.path + "/policy-updates",
             "POST",
             {
-                "preparation_kind": "EXTERNAL_HCCL",
+                "preparation_kind": "EXTERNAL_" + backend.upper(),
                 "target_version": target_version,
             },
         )
@@ -350,13 +352,13 @@ class ControlClient:
         acquire_task = asyncio.create_task(_control_io(self.acquire, routing_key))
         try:
             lease = await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             # Recover a successful but cancelled acquire and release its lease.
             try:
                 lease = await acquire_task
                 await complete_on_cancel(_control_io(self.release, lease.lease_id))
             finally:
-                raise
+                raise cancelled
 
         task = asyncio.create_task(self._heartbeat(lease))
         try:
