@@ -44,6 +44,39 @@ def test_cuda_bucket_fence_waits_for_auxiliary_stream():
         torch.cuda.synchronize()
 
 
+@pytest.mark.skipif(
+    os.environ.get("ELASTIC_ROLLOUT_REAL_GPU") != "1",
+    reason="requires explicitly reserved CUDA devices and AReaL",
+)
+@pytest.mark.parametrize("method", ["compute_logp", "compute_advantages"])
+def test_areal_cuda_results_complete_before_rpc_return(monkeypatch, method):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("areal")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from areal.engine.fsdp_engine import FSDPPPOActor
+
+    from elastic_rollout.integrations.areal.hccl_actor import ElasticHCCLFSDPActor
+
+    value = torch.zeros((), device="cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+
+    def native(self, data):
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(200_000_000)
+            value.fill_(42)
+        return value
+
+    monkeypatch.setattr(FSDPPPOActor, method, native)
+    try:
+        actor = object.__new__(ElasticHCCLFSDPActor)
+        result = getattr(actor, method)(None)
+        assert stream.query() and result.item() == 42
+    finally:
+        torch.cuda.synchronize()
+
+
 def test_device_backend_pairs_are_explicit():
     assert ReplicaSpec("model").accelerator == "npu"
     assert ReplicaSpec("model", accelerator="gpu", weight_sync="nccl").weight_sync == "nccl"

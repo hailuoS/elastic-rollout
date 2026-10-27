@@ -107,6 +107,35 @@ def actor_adapter(monkeypatch):
     return module, local, rendezvous
 
 
+@pytest.mark.parametrize("method", ["compute_logp", "compute_advantages"])
+def test_actor_gpu_results_complete_before_rpc_handoff(actor_adapter, monkeypatch, method):
+    module, _, _ = actor_adapter
+    result = NS(value=None)
+    pending = []
+
+    def native(self, data):
+        pending.append(lambda: setattr(result, "value", 7))
+        return result
+
+    monkeypatch.setattr(module.FSDPPPOActor, method, native, raising=False)
+    module.current_platform.synchronize.side_effect = lambda: pending.pop()()
+    actor = module.ElasticHCCLFSDPActor()
+    returned = getattr(actor, method)(object())
+    # Model the HTTP thread reading the returned tensor after the engine RPC.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(lambda: returned.value).result() == 7
+    assert returned is result and not pending
+
+
+@pytest.mark.parametrize("method", ["compute_logp", "compute_advantages"])
+def test_actor_sync_failure_does_not_publish_gpu_results(actor_adapter, monkeypatch, method):
+    module, _, _ = actor_adapter
+    monkeypatch.setattr(module.FSDPPPOActor, method, lambda self, data: object(), raising=False)
+    module.current_platform.synchronize.side_effect = RuntimeError("device work failed")
+    with pytest.raises(RuntimeError, match="device work failed"):
+        getattr(module.ElasticHCCLFSDPActor(), method)(object())
+
+
 @pytest.fixture
 def producer(actor_adapter, receivers, monkeypatch):
     module, local, tensor_barrier = actor_adapter

@@ -62,6 +62,18 @@ class ElasticHCCLActorController(PPOActorController):
 
 
 class ElasticHCCLFSDPActor(FSDPPPOActor):
+    def compute_logp(self, data):
+        result = super().compute_logp(data)
+        # AReaL remotizes GPU results on the HTTP thread after this engine RPC
+        # returns. Complete device work before that cross-thread CPU copy.
+        current_platform.synchronize()
+        return result
+
+    def compute_advantages(self, data):
+        result = super().compute_advantages(data)
+        current_platform.synchronize()
+        return result
+
     @classmethod
     def as_controller(cls, config, scheduler):
         return ElasticHCCLActorController(train_engine=cls, config=config, scheduler=scheduler)
