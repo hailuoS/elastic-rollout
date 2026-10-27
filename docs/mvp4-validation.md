@@ -1,8 +1,10 @@
 # MVP-4：已有资源池内扩缩容
 
-状态：支持 NPU/HCCL 与 GPU/NCCL，GPU 真机验收进行中，NPU 专项尚未完成。
+状态：支持 NPU/HCCL 与 GPU/NCCL；单机 GPU FSDP2 核心路径已通过真机验收，NPU 专项尚未完成。
 默认配置继续使用固定拓扑；通过 `deployment.elastic_scaling=true`
 显式启用新路径。MVP-3 的 verl FSDP2 和 AReaL FSDP2 共用此实现。
+真实负载、设备结果和失败记录见 [GPU 验收记录](mvp4-gpu-validation.md)；
+Ascend 环境按 [NPU 补充验收手册](mvp4-npu-supplement-zh.md) 操作。
 
 ## 启动与控制
 
@@ -71,11 +73,16 @@ finish 只为 optional 记录本事务 prepared 版本，COMMIT 才能把未取�
 置为 READY；该副本从下一个更新开始属于 required。所有训练 rank 仍参与 FSDP 导出。
 
 新副本的启动、发现失败不阻断基础副本提交。optional 的 init/send/start/finish 明确返回失败后，
-只有控制操作已返回、trainer 原生 NPU stream synchronize 成功、sender communicator
+只有控制操作已返回、trainer 原生设备 synchronize 成功、sender communicator
 同步 destroy 成功，并由 Core 确认同一 transport/session 无在途控制操作时，才隔离该副本，
 跳过后续 bucket 并允许 required 继续 COMMIT。COMMIT 会拒绝尚未确认隔离的 optional 故障。
 原生调用未返回、无可销毁 group、设备同步失败、控制响应丢失或隔离确认失败仍全局 fail closed。
 没有后台 NPU 调用、通信组修复、全模型缓存或失败权重回滚。
+
+packed 传输的 bucket 生命周期边界等待整个设备，覆盖 native 引擎创建的额外 stream。
+新建 NCCL 通信组前释放闲置 PyTorch 缓存，避免训练缓存挤占 NCCL 自身的显存分配；
+已有组的每步复用不清缓存。AReaL 的 GPU 计算结果在 engine RPC 返回前完成设备同步，
+再交给 HTTP 线程 remotize，避免跨线程读取尚未完成的张量。
 
 缩容优先取消 pending，其次清退 dynamic READY；基础 cohort 不缩。
 DRAINING 即刻停止所有新 lease（包括 sticky），已有 lease 可续租。
