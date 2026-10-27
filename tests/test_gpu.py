@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -14,11 +15,33 @@ from test_vllm import replica_and_spec
 
 from elastic_rollout.api import ReplicaSpec
 from elastic_rollout.client import ControlError
+from elastic_rollout.collective_backend import CollectiveBackend
 from elastic_rollout.hccl_sender import HCCLSender
 from elastic_rollout.integrations.areal.weight_sync import NCCLWeightSyncConfig
 from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_mvp2b_verl_config
 from elastic_rollout.launcher.base import LaunchPlan
 from elastic_rollout.launcher.ray import RayProcessLauncher, _ProcessActor
+
+
+@pytest.mark.skipif(
+    os.environ.get("ELASTIC_ROLLOUT_REAL_GPU") != "1",
+    reason="requires explicitly reserved CUDA devices",
+)
+def test_cuda_bucket_fence_waits_for_auxiliary_stream():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    value = torch.zeros((), device="cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    try:
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(200_000_000)
+            value.fill_(42)
+        CollectiveBackend("nccl").synchronize()
+        assert stream.query() and value.item() == 42
+    finally:
+        torch.cuda.synchronize()
 
 
 def test_device_backend_pairs_are_explicit():
@@ -95,7 +118,11 @@ def test_gpu_core_real_http_policy_transaction(receivers):
 
 def test_cuda_sender_does_not_import_or_touch_npu(monkeypatch):
     sent, controls = [], []
-    stub_module(monkeypatch, "torch", cuda=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    stub_module(
+        monkeypatch,
+        "torch",
+        cuda=NS(current_stream=lambda: NS(synchronize=lambda: None), synchronize=lambda: None),
+    )
     for name in ("vllm", "vllm.distributed", "vllm.distributed.weight_transfer"):
         stub_module(monkeypatch, name)
     group = object()

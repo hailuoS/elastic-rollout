@@ -10,6 +10,38 @@ from elastic_rollout.hccl_sender import HCCLSender
 from elastic_rollout.runtime import PolicyConflict
 
 
+@pytest.mark.parametrize("backend,device", [("hccl", "npu"), ("nccl", "cuda")])
+def test_auxiliary_transfer_finishes_before_next_bucket(monkeypatch, backend, device):
+    from test_integrations import stub_module
+    from test_verl_hccl import Tensor
+
+    pending = []
+    sent = []
+    stub_module(
+        monkeypatch,
+        "torch",
+        **{
+            device: NS(
+                current_stream=lambda: NS(synchronize=lambda: None),
+                synchronize=pending.clear,
+            )
+        },
+    )
+
+    def send(weights, args):
+        assert not pending, "previous packed bucket still uses an auxiliary stream"
+        sent.extend(name for name, _ in weights)
+        pending.append("native auxiliary transfer")
+
+    monkeypatch.setattr(CollectiveBackend, "engine", lambda self: NS(trainer_send_weights=send))
+    sender = HCCLSender(8, True, endpoint="http://unused", deployment_id="test", backend=backend)
+    sender.group = object()
+    sender.session = dict(update_id="u", session_id="s", target_version=1)
+    sender.control.transfer_operation = lambda *args, **kwargs: {}
+    sender.send_weights_sync(iter((name, Tensor()) for name in ("a", "b", "c")), 1)
+    assert sent == ["a", "b", "c"] and not pending
+
+
 def test_receiver_failure_quarantines_the_slot_and_blocks_sender_ack(elastic):
     from test_mvp4 import grow, update
 

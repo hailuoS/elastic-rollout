@@ -93,7 +93,7 @@ def test_sender_receives_overlap_and_releases_buckets(adapters, monkeypatch):
         received.extend(kwargs["update_info"]["names"])
         barrier.wait(timeout=3)
 
-    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    stub_module(monkeypatch, "torch", npu=NS(synchronize=lambda: None))
     for path in (
         "vllm_ascend",
         "vllm_ascend.distributed",
@@ -523,7 +523,7 @@ def test_sender_persistent_identity_and_one_init_across_three_updates(adapters, 
             rendezvous.wait()
 
     stub_module(monkeypatch, "ray.util", get_node_ip_address=lambda: "127.0.0.1")
-    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    stub_module(monkeypatch, "torch", npu=NS(synchronize=lambda: None))
     for path in (
         "vllm_ascend",
         "vllm_ascend.distributed",
@@ -734,7 +734,7 @@ def test_sender_failure_does_not_hold_process_open(adapters, monkeypatch, reques
         assert entered.wait(timeout=3)
         raise RuntimeError("trainer send failed")
 
-    stub_module(monkeypatch, "torch", npu=NS(current_stream=lambda: NS(synchronize=lambda: None)))
+    stub_module(monkeypatch, "torch", npu=NS(synchronize=lambda: None))
     for path in (
         "vllm_ascend",
         "vllm_ascend.distributed",
@@ -796,7 +796,11 @@ def test_npu_entry_repeats_updates_with_one_init(adapters, receivers, monkeypatc
         monkeypatch,
         "torch",
         bfloat16="bf16",
-        npu=NS(set_device=lambda d: None, current_stream=lambda: NS(synchronize=lambda: None)),
+        npu=NS(
+            set_device=lambda d: None,
+            current_stream=lambda: NS(synchronize=lambda: None),
+            synchronize=lambda: None,
+        ),
     )
     stub_module(monkeypatch, "torch_npu")
     stub_module(monkeypatch, "ray.util", get_node_ip_address=lambda: "127.0.0.1")

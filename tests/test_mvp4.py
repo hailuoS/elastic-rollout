@@ -513,7 +513,7 @@ def test_shared_sender_transaction_over_real_core_http(elastic, monkeypatch):
     stub_module(
         monkeypatch,
         "torch",
-        npu=SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: None)),
+        npu=SimpleNamespace(synchronize=lambda: None),
     )
     for path in (
         "vllm_ascend",

@@ -64,7 +64,7 @@ def actor_adapter(monkeypatch):
         "torch",
         no_grad=lambda: lambda f: f,
         bfloat16="torch.bfloat16",
-        npu=NS(current_stream=lambda: NS(synchronize=lambda: None)),
+        npu=NS(synchronize=lambda: None),
     )
     dist = stub_module(
         monkeypatch,

@@ -20,7 +20,9 @@ class CollectiveBackend:
     def synchronize(self):
         import torch
 
-        getattr(torch, self.device).current_stream().synchronize()
+        # Native packed engines create their own streams. A current-stream
+        # fence cannot protect bucket lifetime or the next FSDP allocation.
+        getattr(torch, self.device).synchronize()
 
     def destroy(self, group):
         """Confirm native teardown on the actor's device thread before slot reuse."""
