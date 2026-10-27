@@ -56,6 +56,7 @@ class PolicyUpdateState(str, Enum):
 class PolicyPreparationKind(str, Enum):
     SNAPSHOT_RESTART = "SNAPSHOT_RESTART"
     EXTERNAL_HCCL = "EXTERNAL_HCCL"
+    EXTERNAL_NCCL = "EXTERNAL_NCCL"
 
 
 @dataclass(frozen=True)
@@ -95,10 +96,17 @@ class ReplicaSpec:
     python_executable: str = "python"
     vllm_args: tuple[str, ...] = ()
     weight_sync: str = "snapshot"
+    accelerator: str = "npu"
 
     def __post_init__(self) -> None:
-        if self.weight_sync not in ("snapshot", "hccl"):
-            raise ValueError("weight_sync must be snapshot or hccl")
+        if self.weight_sync not in ("snapshot", "hccl", "nccl"):
+            raise ValueError("weight_sync must be snapshot, hccl or nccl")
+        if self.accelerator not in ("npu", "gpu"):
+            raise ValueError("accelerator must be npu or gpu")
+        if (self.weight_sync == "hccl" and self.accelerator != "npu") or (
+            self.weight_sync == "nccl" and self.accelerator != "gpu"
+        ):
+            raise ValueError("hccl requires npu; nccl requires gpu")
         if not self.model or not self.served_model_name or not self.python_executable:
             raise ValueError("model, served_model_name and python_executable are required")
         if type(self.tensor_parallel_size) is not int or self.tensor_parallel_size <= 0:
@@ -129,9 +137,9 @@ class DeploymentSpec:
         if type(self.elastic_scaling) is not bool:
             raise ValueError("elastic_scaling must be boolean")
         if self.elastic_scaling and (
-            self.replica.weight_sync != "hccl" or self.desired_replicas < 1
+            self.replica.weight_sync not in ("hccl", "nccl") or self.desired_replicas < 1
         ):
-            raise ValueError("elastic scaling requires HCCL and a nonempty base cohort")
+            raise ValueError("elastic scaling requires HCCL/NCCL and a nonempty base cohort")
         positive_seconds(self.retirement_timeout_s, "retirement_timeout_s")
         if type(self.scale_retry_limit) is not int or self.scale_retry_limit < 1:
             raise ValueError("scale_retry_limit must be positive")

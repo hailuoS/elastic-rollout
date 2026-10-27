@@ -42,7 +42,8 @@ def test_surviving_group_never_acknowledges_cleanup(monkeypatch):
 
 
 @pytest.mark.parametrize("cleanup_failed", [False, True])
-def test_signal_during_spawn_requires_verified_cleanup(monkeypatch, cleanup_failed):
+@pytest.mark.parametrize("child_exit", [0, 1, -15])
+def test_signal_during_spawn_requires_verified_cleanup(monkeypatch, cleanup_failed, child_exit):
     handlers = {}
     monkeypatch.setattr(
         supervisor.signal, "signal", lambda sig, handler: handlers.update({sig: handler})
@@ -59,7 +60,7 @@ def test_signal_during_spawn_requires_verified_cleanup(monkeypatch, cleanup_fail
         ),
     )
     monkeypatch.setattr(supervisor.threading, "Thread", Mock())
-    process = Mock(returncode=0)
+    process = Mock(returncode=child_exit)
     process.poll.return_value = None
 
     def spawn(*args, **kwargs):

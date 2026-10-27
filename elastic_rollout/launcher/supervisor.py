@@ -82,7 +82,9 @@ def main() -> int:
                     os.write(int(acknowledgement_fd), b"CLEAN\n")
                 except BrokenPipeError:
                     pass  # Owner died; the process group has still been cleaned.
-    return process.returncode if process.returncode >= 0 else 0
+    # Child failure is observed through actor liveness/health. This process's
+    # exit status acknowledges physical cleanup, including a failed startup.
+    return 0
 
 
 if __name__ == "__main__":

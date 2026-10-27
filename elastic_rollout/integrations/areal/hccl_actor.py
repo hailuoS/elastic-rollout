@@ -69,8 +69,12 @@ class ElasticHCCLFSDPActor(FSDPPPOActor):
     def configure_elastic_hccl(self, options):
         if getattr(self, "_elastic_sender", None) is not None:
             raise RuntimeError("external HCCL sender is already configured")
-        if current_platform.device_type != "npu" or self.config.dtype != "bfloat16":
-            raise ValueError("MVP-3 requires NPU and bfloat16 compute dtype")
+        backend = options.get("backend", "hccl")
+        expected_device = "cuda" if backend == "nccl" else "npu"
+        if current_platform.device_type != expected_device or self.config.dtype != "bfloat16":
+            raise ValueError(
+                f"MVP-3 {backend} requires {expected_device} and bfloat16 compute dtype"
+            )
         expert_fields = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
         if (
             self.is_vision_model

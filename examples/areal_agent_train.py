@@ -14,18 +14,24 @@ def main(args):
     from areal.utils.hf_utils import load_hf_tokenizer
 
     from elastic_rollout.integrations.areal.trainer import ElasticPPOTrainer
-    from elastic_rollout.integrations.areal.weight_sync import HCCLWeightSyncConfig
+    from elastic_rollout.integrations.areal.weight_sync import (
+        HCCLWeightSyncConfig,
+        NCCLWeightSyncConfig,
+    )
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--agent", choices=AGENT_WORKFLOWS, default="math")
     parser.add_argument("--workflow-worker-count", type=int, default=2)
-    parser.add_argument("--weight-sync", choices=("snapshot", "hccl"), default="snapshot")
-    parser.add_argument("--hccl-master-address")
+    parser.add_argument("--weight-sync", choices=("snapshot", "hccl", "nccl"), default="snapshot")
+    parser.add_argument("--hccl-master-address", "--master-address", dest="hccl_master_address")
     parser.add_argument("--hccl-bucket-size-mb", type=int, default=1024)
     options, config_args = parser.parse_known_args(args)
     sync_config = None
-    if options.weight_sync == "hccl":
-        sync_config = HCCLWeightSyncConfig(
+    if options.weight_sync in ("hccl", "nccl"):
+        config_class = (
+            NCCLWeightSyncConfig if options.weight_sync == "nccl" else HCCLWeightSyncConfig
+        )
+        sync_config = config_class(
             master_address=options.hccl_master_address,
             bucket_size=options.hccl_bucket_size_mb * 1024 * 1024,
         )
@@ -43,7 +49,15 @@ def main(args):
         import ray
 
         if not ray.is_initialized():
-            ray.init(address="auto")
+            options_ray = {"address": os.environ.get("RAY_ADDRESS", "auto")}
+            if options.weight_sync == "nccl":
+                options_ray["runtime_env"] = {
+                    "py_executable": sys.executable,
+                    "env_vars": {
+                        key: os.environ[key] for key in ("VLLM_NCCL_SO_PATH",) if key in os.environ
+                    },
+                }
+            ray.init(**options_ray)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     train = get_custom_dataset("train", config.train_dataset, tokenizer)
     valid = get_custom_dataset("test", config.valid_dataset, tokenizer)

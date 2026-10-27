@@ -18,7 +18,8 @@ class ElasticPipelineReplayBuffer(ReplayBufferAsync):
         # Recover the exact native setting rather than silently disabling it.
         kwargs["filter_groups_metric"] = trainer._resolve_filter_groups_metric()
         super().__init__(**kwargs)
-        options = config.actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs["elastic_hccl"]
+        checkpoint = config.actor_rollout_ref.rollout.checkpoint_engine
+        options = checkpoint.engine_kwargs[checkpoint.backend]
         import os
 
         control = ControlClient(

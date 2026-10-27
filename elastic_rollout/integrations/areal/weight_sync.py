@@ -37,8 +37,11 @@ class HCCLWeightSyncConfig:
     packed_num_buffers: int = 2
     master_port: int | None = None
     weight_update_callback_timeout_s: float = 3660.0
+    backend: str = "hccl"
 
     def __post_init__(self) -> None:
+        if self.backend not in ("hccl", "nccl"):
+            raise ValueError("backend must be hccl or nccl")
         if not isinstance(self.master_address, str) or not self.master_address.strip():
             raise ValueError("master_address must name the trainer rank0 interface")
         if type(self.bucket_size) is not int or self.bucket_size <= 0:
@@ -54,3 +57,10 @@ class HCCLWeightSyncConfig:
         positive_seconds(self.weight_update_callback_timeout_s, "weight_update_callback_timeout_s")
         if not 60 <= self.weight_update_callback_timeout_s <= 7140:
             raise ValueError("weight_update_callback_timeout_s must be between 60 and 7140")
+
+
+@dataclass(frozen=True)
+class NCCLWeightSyncConfig(HCCLWeightSyncConfig):
+    """CUDA transport; retains the common full-model weight sync options."""
+
+    backend: str = "nccl"

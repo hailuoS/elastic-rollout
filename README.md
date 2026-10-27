@@ -23,7 +23,7 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **用户已在 NPU 环境验证** |
 | MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
 | MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
-| MVP-3 | AReaL FSDP2 Direct HCCL，与 verl 复用 sender 和策略事务 | 已实现；CPU contract 验证，NPU 验收待执行 |
+| MVP-3 | AReaL / verl FSDP2 共用策略事务，支持 HCCL / NCCL | GPU 功能已验证；NPU 验收待补充 |
 | MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 框架接入及 CPU 回归；NPU 验收待执行 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
@@ -31,6 +31,31 @@ MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL �
 verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定权重生成入口保留。
 
 ## MVP-3：AReaL Direct HCCL
+
+GPU 使用 CUDA/NCCL，NPU/HCCL 仍是默认配置。支持 dense BF16 FSDP2、
+训练与推理设备分离、固定 serving 成员；动态扩缩容不属于 MVP-3 Direct 更新路径。
+
+verl 复用 `examples/verl_v1_launch.json`：增加 `runtime.accelerator: "gpu"`，
+将 `trainer.device=npu` 改为 `trainer.device=cuda`。Launcher 会选择 Ray 原生 GPU
+资源、NCCL checkpoint engine 和对应 Core 配置，启动命令不变。
+
+AReaL 的 Core 配置设置 `replica.accelerator: "gpu"`、`replica.weight_sync: "nccl"`，
+训练入口使用 `--weight-sync nccl --master-address <训练 rank0 的可达 IP>`，或传入
+`NCCLWeightSyncConfig(master_address=...)`。`RAY_ADDRESS` 应指向同一专属集群。
+训练与 serving 使用不同 Python 环境时，设置 `VLLM_NCCL_SO_PATH` 为 serving 环境的
+NCCL 库路径，并传入训练 worker 的环境；权重通信两端必须使用兼容的 NCCL 库。
+
+RTX 5090 已验证 serving/verl 使用 vLLM 0.23.0、torch 2.11.0+cu130；AReaL trainer
+使用其 vLLM 依赖基线 0.19.1、torch 2.10.0+cu128。5090 的 vLLM 参数可选择
+`--attention-config '{"backend":"TRITON_ATTN"}' --enforce-eager`；消费卡验证配置使用
+`NCCL_P2P_DISABLE=1`、`VLLM_USE_FLASHINFER_SAMPLER=0`。
+这里的功能验证不代表大模型性能或长时间稳定性验证。
+AReaL 的 Agent/Proxy 依赖应按其 `uv.vllm.lock` 配套安装，避免混装不同版本的
+OpenAI SDK、Agents SDK 和 LiteLLM。
+
+Linux Launcher 的 Core/Trainer 子进程设置父进程死亡通知：Launcher 被 SIGKILL 后，
+子进程仍会收到 SIGTERM 并执行自己的清理。正常 SIGTERM 保持先停止 Trainer、再停止
+Core 的顺序；进程内存状态和训练恢复不在支持范围内。
 
 [MVP-3 中文真机操作手册](docs/mvp3-npu-validation-zh.md) 固定测试提交 `1aad77f`，
 包含独立测试目录、AReaL/verl 命令、故障清理检查和验收记录表。

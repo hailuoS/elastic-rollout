@@ -12,9 +12,10 @@ from elastic_rollout.weight_sync import ElasticWeightSync
 
 class ElasticCheckpointEngineManager(ElasticWeightSync):
     def __init__(self, config, actor_wg, replicas):
-        if config.backend != "elastic_hccl" or replicas:
+        if config.backend not in ("elastic_hccl", "elastic_nccl") or replicas:
             raise ValueError("elastic_hccl requires external service get_replicas() == []")
-        options = config.engine_kwargs["elastic_hccl"]
+        self.engine_backend = config.backend
+        options = config.engine_kwargs[config.backend]
         self.control = ControlClient(
             options["endpoint"], options["deployment_id"], os.getenv("ELASTIC_ROLLOUT_TOKEN")
         )
@@ -46,7 +47,11 @@ class ElasticCheckpointEngineManager(ElasticWeightSync):
         )
 
     def _send_weights(self, version):
-        return ray.get(self.actor_wg.update_weights(global_steps=version, mode="elastic_hccl"))
+        return ray.get(
+            self.actor_wg.update_weights(
+                global_steps=version, mode=getattr(self, "engine_backend", "elastic_hccl")
+            )
+        )
 
     @auto_await
     async def update_weights(self, global_steps=None):

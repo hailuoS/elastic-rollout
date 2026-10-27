@@ -214,7 +214,9 @@ class MultiTransferCoordinator:
                 # A successful join is required on every subsequent transaction.
                 child.optional = plan["optional"]
                 try:
-                    child.execute(update_id, action, {"backend": "hccl", **sources[key]})
+                    child.execute(
+                        update_id, action, {"backend": m.spec.replica.weight_sync, **sources[key]}
+                    )
                 except Exception as exc:
                     if not plan["optional"] or (child.session and child.session.physical_started):
                         m._fail_update(exc)

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -53,7 +54,9 @@ def elastic():
 
 
 def update(m, version, *, before_commit=None):
-    u = m.begin_policy_update(preparation_kind="EXTERNAL_HCCL", target_version=version)
+    u = m.begin_policy_update(
+        preparation_kind=f"EXTERNAL_{m.spec.replica.weight_sync.upper()}", target_version=version
+    )
     m.pause_generation()
     uid = u["update_id"]
     if not hasattr(m, "test_ports"):
@@ -280,17 +283,24 @@ def test_pipeline_deadband_and_invalid_phase_hold():
     assert p.decide(s, metric(222), signal, now=222)["action"] == "HOLD"
 
 
-def test_sender_fans_same_bucket_once_and_destroys_on_native_thread(monkeypatch):
+@pytest.mark.parametrize("backend,device", [("hccl", "npu"), ("nccl", "cuda")])
+def test_sender_fans_same_bucket_once_and_destroys_on_native_thread(monkeypatch, backend, device):
     import sys
     import threading
 
     from elastic_rollout.hccl_sender import HCCLSender
 
     sender = HCCLSender(
-        16, True, endpoint="http://core", deployment_id="m4", master_address="trainer"
+        16,
+        True,
+        endpoint="http://core",
+        deployment_id="m4",
+        master_address="trainer",
+        backend=backend,
     )
     sender.prepare(transport_plan=[{"transport_key": "base"}, {"transport_key": "extra"}])
     child = sender._children["extra"]
+    assert child.backend.name == backend
     calls = []
     sender._active_transports = [sender, child]
     sender.session = {"transports": [{"transport_key": "base", "session": {}}]}
@@ -305,23 +315,37 @@ def test_sender_fans_same_bucket_once_and_destroys_on_native_thread(monkeypatch)
         sys.modules,
         "torch",
         SimpleNamespace(
-            npu=SimpleNamespace(current_stream=lambda: SimpleNamespace(synchronize=lambda: None))
+            **{
+                device: SimpleNamespace(
+                    current_stream=lambda: SimpleNamespace(synchronize=lambda: None)
+                )
+            }
         ),
     )
     child.transport_id = "transport"
     child.group = SimpleNamespace(
         comm=123,
-        hccl=SimpleNamespace(
-            hcclCommDestroy=lambda comm: destroyed.append((comm, threading.get_ident()))
-        ),
+        **{
+            backend: SimpleNamespace(
+                **{
+                    f"{backend}CommDestroy": lambda comm: destroyed.append(
+                        (comm, threading.get_ident())
+                    )
+                }
+            )
+        },
     )
     request = {"retirement_id": "retire", "transport_key": "extra", "transport_id": "transport"}
     assert sender.retire_transports([request]) == sender.retire_transports([request])
     assert destroyed == [(123, thread)]
 
 
-def test_repeated_scale_cycles_keep_base_transport(elastic):
+@pytest.mark.parametrize("backend,accelerator", [("hccl", "npu"), ("nccl", "gpu")])
+def test_repeated_scale_cycles_keep_base_transport(elastic, backend, accelerator):
     c, m, _, _ = elastic
+    m.spec = replace(
+        m.spec, replica=replace(m.spec.replica, weight_sync=backend, accelerator=accelerator)
+    )
     update(m, 1)
     base = m.transfer.transport
     version = 1

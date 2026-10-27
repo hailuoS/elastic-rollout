@@ -129,7 +129,7 @@ class ReplicaManager:
         # Preserve MVP-0 desired-state changes during normal reconciliation.
         # Begin/commit also hold this lock, so the policy gate is atomic here.
         with self.traffic.lock:
-            if self.spec.replica.weight_sync == "hccl" and count != self.desired:
+            if self.spec.replica.weight_sync in ("hccl", "nccl") and count != self.desired:
                 raise PolicyConflict("Direct HCCL requires fixed topology; scaling is unsupported")
             if "generation" in self.traffic.route_pause_reasons:
                 raise PolicyConflict("generation paused; topology is locked")
@@ -252,7 +252,10 @@ class ReplicaManager:
             return status
 
     def _external_update(self) -> bool:
-        return bool(self.policy_update and self.policy_update.preparation_kind == K.EXTERNAL_HCCL)
+        return bool(
+            self.policy_update
+            and self.policy_update.preparation_kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL)
+        )
 
     def begin_policy_update(
         self,
@@ -261,22 +264,25 @@ class ReplicaManager:
         target_version: int | None = None,
     ) -> dict:
         kind = K(preparation_kind)
-        if kind == K.EXTERNAL_HCCL:
+        if kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL):
             nonnegative_int(target_version, "target_version")
-            if self.spec.replica.weight_sync != "hccl":
-                raise PolicyConflict("deployment is not HCCL capable")
+            if kind.value != "EXTERNAL_" + self.spec.replica.weight_sync.upper():
+                raise PolicyConflict("deployment transport does not match external backend")
             if snapshot_path is not None:
                 raise ValueError("EXTERNAL_HCCL has no snapshot_path")
         elif not isinstance(snapshot_path, str) or not snapshot_path.strip():
             raise ValueError("snapshot_path must be a non-empty string")
         with self._control_mutation():
             if (
-                kind == K.EXTERNAL_HCCL
+                kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL)
                 and self.transfer.transport
                 and self.transfer.transport.state == "POISONED"
             ):
                 raise PolicyConflict(RECOVERY_REQUIRED)
-            if kind == K.EXTERNAL_HCCL and target_version <= self.serving_policy_version:
+            if (
+                kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL)
+                and target_version <= self.serving_policy_version
+            ):
                 raise ValueError("target_version must exceed serving_policy_version")
             replicas = list(self.traffic.replicas.values())
             if self._update_blocks_topology():
@@ -306,7 +312,7 @@ class ReplicaManager:
                 target_version=target_version,
             )
             self.policy_update = update
-            if kind == K.EXTERNAL_HCCL:
+            if kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL):
                 self.transfer.session = None
             self.policy_updates[update.update_id] = update
             self.traffic.pause_routes("policy_update")
@@ -588,6 +594,12 @@ class ReplicaManager:
                     if replica.state == S.STOPPING:
                         self._cleanup(replica)
                         continue
+                    if self.closing and replica.state in STARTUP:
+                        # Startup replicas have never admitted generation. Waiting
+                        # for their health/warmup can outlive the shutdown deadline.
+                        self._transition(replica, S.STOPPING)
+                        self._cleanup(replica)
+                        continue
                     if not self.driver.alive(replica):
                         raise RuntimeError("replica process exited")
                     if replica.state in STARTUP:
@@ -667,7 +679,7 @@ class ReplicaManager:
                 "bootstrap_snapshot": asdict(self.bootstrap_snapshot),
                 "topology_limitation": (
                     "fixed topology; no stale bootstrap replacement or catch-up"
-                    if self.spec.replica.weight_sync == "hccl"
+                    if self.spec.replica.weight_sync in ("hccl", "nccl")
                     else None
                 ),
                 "transfer_session": self.transfer.status(),
@@ -675,7 +687,7 @@ class ReplicaManager:
                 "policy_update": asdict(self.policy_update) if self.policy_update else None,
                 "accepting_routes": self.traffic.accepting_routes,
                 "serving_ready_for_external_update": (
-                    self.spec.replica.weight_sync == "hccl"
+                    self.spec.replica.weight_sync in ("hccl", "nccl")
                     and not self.closing
                     and not self.generation_paused
                     and self.traffic.accepting_routes

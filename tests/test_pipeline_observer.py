@@ -151,7 +151,8 @@ def test_areal_native_dynamic_batch_counts_delivered_groups_and_excludes_none(mo
     assert metadata["oldest_buffer_policy_version"] == 1
 
 
-def test_verl_sampler_uses_native_wait_predicate_and_committed_version_floor(monkeypatch):
+@pytest.mark.parametrize("backend", ["elastic_hccl", "elastic_nccl"])
+def test_verl_sampler_uses_native_wait_predicate_and_committed_version_floor(monkeypatch, backend):
     from test_integrations import PACKAGE, ROOT, load_adapter, stub_module
 
     for name in ("verl", "verl.trainer", "verl.trainer.ppo", "verl.trainer.ppo.v1", "verl.utils"):
@@ -199,8 +200,9 @@ def test_verl_sampler_uses_native_wait_predicate_and_committed_version_floor(mon
                 hybrid_engine=False,
                 rollout=NS(
                     checkpoint_engine=NS(
+                            backend=backend,
                         engine_kwargs={
-                            "elastic_hccl": {"endpoint": "http://unused", "deployment_id": "test"}
+                                backend: {"endpoint": "http://unused", "deployment_id": "test"}
                         }
                     )
                 ),

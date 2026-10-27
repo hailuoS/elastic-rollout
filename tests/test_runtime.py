@@ -101,6 +101,22 @@ def test_only_ready_receives_routes(runtime):
     assert manager.traffic.acquire("a").serving_policy_version == 0
 
 
+@pytest.mark.parametrize("state", [S.STARTING, S.SYNCING, S.WARMING])
+def test_shutdown_stops_startup_without_waiting_for_readiness(runtime, state):
+    controller, manager, driver, _ = runtime
+    controller.reconcile()
+    for replica in manager.traffic.replicas.values():
+        replica.transition(state)
+
+    def forbidden(*args):
+        pytest.fail("shutdown must not probe or warm a startup replica")
+
+    driver.health = driver.warmup = forbidden
+    controller.close(timeout=0.1)
+    assert not driver.processes and manager.resources.allocated == 0
+    assert all(r.state == S.TERMINATED for r in manager.traffic.replicas.values())
+
+
 def test_sticky_least_inflight_duplicate_release_and_ttl(runtime):
     traffic = ready(runtime)
     a = traffic.acquire("a")

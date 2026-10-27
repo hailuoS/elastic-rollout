@@ -25,7 +25,7 @@ from elastic_rollout.client import ControlError
 from elastic_rollout.generation import Completion
 
 ROOT = Path(__file__).resolve().parents[2]
-PACKAGE = ROOT / "elastic-rollout" / "elastic_rollout"
+PACKAGE = Path(__file__).resolve().parents[1] / "elastic_rollout"
 
 
 def source_methods(path, cls_name, method_names, globals_dict):
@@ -508,7 +508,7 @@ def test_real_train_disk_method_orders_future_export_marker_and_wait(engine):
 
     rollout = NS(
         pause_generation=lambda: events.append("pause"),
-        update_weights_from_disk=lambda meta: (events.append("future") or future),
+        update_weights_from_disk=lambda meta: events.append("future") or future,
         continue_generation=lambda: events.append("continue"),
     )
 

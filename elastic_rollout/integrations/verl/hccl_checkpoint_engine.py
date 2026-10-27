@@ -8,7 +8,9 @@ from elastic_rollout.hccl_sender import HCCLSender, weight_groups  # noqa: F401
 @CheckpointEngineRegistry.register("elastic_hccl")
 class ElasticHCCLCheckpointEngine(HCCLSender, CheckpointEngine):
     def prepare(self, transport_plan=None):
-        if transport_plan is not None and not hasattr(self, "_elastic_cpu_group"):
+        if (transport_plan is not None or self.backend.name == "nccl") and not hasattr(
+            self, "_elastic_cpu_group"
+        ):
             from datetime import timedelta
 
             import torch.distributed as dist

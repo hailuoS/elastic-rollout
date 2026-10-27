@@ -157,12 +157,14 @@ class ControlClient:
     def get_policy_update(self, update_id: str) -> dict:
         return self._request(self.path + f"/policy-updates/{quote(update_id, safe='')}")
 
-    def begin_external_update(self, target_version: int) -> dict:
+    def begin_external_update(self, target_version: int, backend: str = "hccl") -> dict:
+        if backend not in ("hccl", "nccl"):
+            raise ValueError("external backend must be hccl or nccl")
         return self._request(
             self.path + "/policy-updates",
             "POST",
             {
-                "preparation_kind": "EXTERNAL_HCCL",
+                "preparation_kind": "EXTERNAL_" + backend.upper(),
                 "target_version": target_version,
             },
         )

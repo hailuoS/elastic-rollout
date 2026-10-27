@@ -85,7 +85,11 @@ class ElasticWeightSync:
         retries = 0
         while True:
             try:
-                update = self.control.begin_external_update(version)
+                update = (
+                    self.control.begin_external_update(version, backend="nccl")
+                    if getattr(self, "backend", "hccl") == "nccl"
+                    else self.control.begin_external_update(version)
+                )
                 if retries:
                     logger.info(
                         "external update began after lifecycle contention version=%s retries=%s",
@@ -111,6 +115,7 @@ class ElasticWeightSync:
     def _update(self, version):
         started = time.monotonic()
         status = self.control.status()
+        self.backend = status.get("spec", {}).get("replica", {}).get("weight_sync", "hccl")
         if version == 0 and status.get("spec", {}).get("elastic_scaling"):
             self.maintain_transports()
             # A prior drain may need time to finish or roll back. Maintenance
@@ -150,7 +155,7 @@ class ElasticWeightSync:
         def timed(name, function, *args, **kwargs):
             before = time.monotonic()
             result = function(*args, **kwargs)
-            metrics["elastic_hccl/" + name] = time.monotonic() - before
+            metrics[f"elastic_{self.backend}/" + name] = time.monotonic() - before
             return result
 
         try:
@@ -167,12 +172,14 @@ class ElasticWeightSync:
             if len([item for item in metadata if item]) != 1:
                 raise ValueError("exactly one trainer rank0 must provide rendezvous metadata")
             master = next(item for item in metadata if item)
-            session = self.control.transfer_operation(uid, "prepare", backend="hccl", **master)
+            session = self.control.transfer_operation(
+                uid, "prepare", backend=self.backend, **master
+            )
             if session["needs_initialize"]:
-                timed("hccl_init_s", self._actors, "configure_session", session=session)
+                timed(f"{self.backend}_init_s", self._actors, "configure_session", session=session)
             else:
                 self._actors("configure_session", session=session)
-                metrics["elastic_hccl/hccl_init_s"] = 0.0
+                metrics[f"elastic_{self.backend}/{self.backend}_init_s"] = 0.0
             sid = session["session_id"]
             started_session = timed(
                 "start_weight_update_s",
@@ -201,9 +208,13 @@ class ElasticWeightSync:
                 pass
             # No resume/rollback, including ambiguous sender/receiver failures.
             raise
-        metrics["elastic_hccl/weight_sync_total_s"] = time.monotonic() - started
-        metrics["elastic_hccl/logical_generation_pause_s"] = resumed_at - pause_started
+        metrics[f"elastic_{self.backend}/weight_sync_total_s"] = time.monotonic() - started
+        metrics[f"elastic_{self.backend}/logical_generation_pause_s"] = resumed_at - pause_started
         logger.info(
-            "HCCL update committed update_id=%s version=%s metrics=%s", uid, version, metrics
+            "%s update committed update_id=%s version=%s metrics=%s",
+            self.backend.upper(),
+            uid,
+            version,
+            metrics,
         )
         return metrics

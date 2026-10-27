@@ -19,9 +19,11 @@ class ElasticRolloutService:
         self.config = config
         custom = config.actor_rollout_ref.rollout.get("custom") or {}
         options = custom.get("elastic", {})
-        self.training = (
-            options.get("fixed_policy") is False and options.get("weight_sync") == "hccl"
+        self.training = options.get("fixed_policy") is False and options.get("weight_sync") in (
+            "hccl",
+            "nccl",
         )
+        self.backend = options.get("weight_sync", "hccl")
         if not self.training and (worker_group is not None or rollout_resource_pool is not None):
             raise ValueError("fixed-policy mode requires a standalone generation entrypoint")
         if not self.training and options.get("fixed_policy") is not True:
@@ -34,7 +36,7 @@ class ElasticRolloutService:
                     "elastic_rollout.integrations.verl.checkpoint_manager."
                     "ElasticCheckpointEngineManager"
                 )
-                or rollout.checkpoint_engine.backend != "elastic_hccl"
+                or rollout.checkpoint_engine.backend != f"elastic_{self.backend}"
             ):
                 raise ValueError(
                     "training requires ElasticCheckpointEngineManager and elastic_hccl"
@@ -56,7 +58,7 @@ class ElasticRolloutService:
                     )
             if rollout.get("free_cache_engine", False):
                 raise ValueError("external HCCL requires free_cache_engine=false; separate NPUs")
-            engine_options = rollout.checkpoint_engine.engine_kwargs["elastic_hccl"]
+            engine_options = rollout.checkpoint_engine.engine_kwargs[f"elastic_{self.backend}"]
             if (
                 engine_options["endpoint"] != options["endpoint"]
                 or engine_options["deployment_id"] != options["deployment_id"]
@@ -77,9 +79,9 @@ class ElasticRolloutService:
         service = cls(*args, **kwargs)
         status = await asyncio.to_thread(service.control.status)
         if service.training:
-            if status["spec"]["replica"]["weight_sync"] != "hccl" or status["bootstrap_snapshot"][
-                "model_path"
-            ] != config_path(service.config):
+            if status["spec"]["replica"]["weight_sync"] != service.backend or status[
+                "bootstrap_snapshot"
+            ]["model_path"] != config_path(service.config):
                 raise ValueError("Core must use HCCL and the same trainer bootstrap model")
         service.model = status["spec"]["replica"]["served_model_name"]
         return service

@@ -39,18 +39,16 @@ def make_server(
                 if token and not hmac.compare_digest(
                     self.headers.get("Authorization", ""), f"Bearer {token}"
                 ):
-                    # Closing with an unread POST body can reset TCP before the
-                    # client receives the 401 (notably on Windows). Drain only
-                    # bounded bodies with a finite read deadline; never parse
-                    # or execute an unauthenticated payload.
+                    # A close with an unread POST body can reset TCP before
+                    # clients receive 401. Bound both size and read time.
                     try:
-                        rejected_length = int(self.headers.get("Content-Length", "0"))
+                        length = int(self.headers.get("Content-Length", "0"))
                     except ValueError:
-                        rejected_length = 0
-                    if 0 < rejected_length <= 65536:
+                        length = 0
+                    if 0 < length <= 65536:
                         self.connection.settimeout(2)
                         try:
-                            self.rfile.read(rejected_length)
+                            self.rfile.read(length)
                         except OSError:
                             pass
                     self._reply(401, {"error": "unauthorized"})

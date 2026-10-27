@@ -78,8 +78,8 @@ class ElasticReplicaManager(ReplicaManager):
     def begin_policy_update(
         self, snapshot_path=None, preparation_kind=K.SNAPSHOT_RESTART, target_version=None
     ):
-        if preparation_kind != K.EXTERNAL_HCCL:
-            raise ValueError("elastic scaling requires EXTERNAL_HCCL updates")
+        if preparation_kind not in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL):
+            raise ValueError("elastic scaling requires external collective updates")
         # Super takes the lifecycle lock, so freeze construction is atomic with
         # reconcile and desired intents under the reentrant routing lock.
         with self.traffic.lock:

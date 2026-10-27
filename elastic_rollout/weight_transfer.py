@@ -231,8 +231,8 @@ class TransferCoordinator:
                 if action == "prepare":
                     if self.session and self.session.update_id == update_id:
                         raise PolicyConflict("transfer session already exists")
-                    if body.get("backend") != "hccl":
-                        raise ValueError("backend must be hccl")
+                    if body.get("backend") != m.spec.replica.weight_sync:
+                        raise ValueError("backend must match deployment weight_sync")
                     if (
                         not isinstance(body.get("master_address"), str)
                         or not body["master_address"]
