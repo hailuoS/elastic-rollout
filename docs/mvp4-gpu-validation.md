@@ -1,17 +1,24 @@
 # MVP-4 GPU 验收记录
 
-状态：单机 GPU、dense BF16 FSDP2 的核心弹性路径已通过真机验收，不代表 NPU 已通过。
+状态：单机和双机 GPU、dense BF16 FSDP2 的核心弹性及本文退出场景均已通过真机验收。
+NPU 专项仍待实际执行。
 早期 AReaL Agent/Proxy 用例的 SIGTERM 退出码为 -6，保留失败记录。
-2026-10-28 的退出补验已复现并修复普通 DP4 训练中的同类异常；双机完整弹性补验进行中。
+2026-10-28 已复现并修复普通 DP4 训练中的同类异常，跨机 DP8 SIGTERM 补验也已通过。
 代码在 `feat/mvp4-autoscaling`，未合入 main，未推送。
-本轮最终生产代码基线为 `0fd4e22`；各早期用例使用的修复阶段在下文单独注明。
+首轮生产代码基线为 `0fd4e22`；退出与双机补验基线为 `46b12de`。
+后续验收资料提交不改变生产代码；早期用例使用的修复阶段在下文单独注明。
 NPU 的操作步骤见 [补充验收手册](mvp4-npu-supplement-zh.md)。
 
 ## 环境与负载
 
-两台 RTX 5090 机器各自运行独立的单节点 Ray 集群。这里不是跨节点弹性验收。
+首轮两台 RTX 5090 机器各自运行独立的单节点 Ray 集群。
 verl 使用其中 6 张预留卡；另一用户的 GPU 保留不动。
 AReaL 使用另一台的 8 卡资源池。训练与 rollout 卡分离。
+2026-10-28 的补验改用两节点共用的原生 Ray 集群，训练每节点 4 rank，rollout
+两个基础副本和两个动态 slot 分布在两台机器，使用独立 GPU。
+资源池共 14 张 GPU（g02 六张、g12 八张），额外 checkpoint 参考也从此池分配。
+通信固定为 `NCCL_SOCKET_IFNAME=ens3`、`GLOO_SOCKET_IFNAME=ens3`、`NCCL_IB_DISABLE=1`，
+本次双机结果属于 TCP/NCCL，不包含 RDMA 性能验收。
 
 | 项目 | 配置 |
 | --- | --- |
@@ -112,7 +119,7 @@ CPU FP32 的误差保留为诊断，不能混为权重版本不一致。
 
 ## 回归与边界
 
-### 2026-10-28 退出补验
+### 2026-10-28 退出与双机补验
 
 使用同一真实 1.5B 模型、batch 16/n=2、严格 1024/2048 token 的普通 AReaL
 DP4 训练，在 v2 已提交且采样仍在运行时，直接向 Trainer 发送 SIGTERM。
@@ -132,7 +139,38 @@ DP4 训练，在 v2 已提交且采样仍在运行时，直接向 Trainer 发送
 `areal-multi/artifacts/preflight-gpus.json`。失败记录未改写为通过。
 本次 Windows 全量回归为 **580 passed / 23 skipped**（186.32 秒）；Linux 为
 **593 passed / 10 skipped**（144.25 秒），包含连接现有双机 Ray 的真实 SIGTERM 回归。
-双机完整训练/扩缩容结果待完成后补入；此处不提前标记通过。
+双机补验使用同一原生 Ray 集群，g02/g12 每节点 4 个训练 rank，共 FSDP2 DP8，
+rollout 的两个基础副本和两个动态 slot 分布在这两个节点。AReaL 普通 RLVR 完成
+40 步；手动 `2→3→2→3→2` 分别在 v5/v6/v9/v10 收敛，默认 AUTO 从 2 扩到 4。
+最终四个副本在两类输入上与独立冷加载 vLLM 的 token/logprob 完全一致，误差为 0；
+训练后维护 transport 清退回 2，两个剩余基础副本也完全一致，T0 `init_count=1`。
+参数最大变化 0.00048828125，workflow/eval version 均为 `[40,40]`。
+Trainer/Core 均为 `0`、全部服务端口关闭。原始证据在上述补验根目录的
+`areal-multi/artifacts/`；原生 8 rank 的 IP 分布另存于 `training-workers.json`。
+verl 原生 V1 separate_async 同样完成双机 8 rank、40 步；手动
+`2→3→2→3→2` 在 v5/v6/v9/v10 收敛，默认 AUTO 从 2 扩到 4。
+全部四个副本两类输入的 token/logprob 对独立冷加载参考完全一致，误差为 0，
+T0 `init_count=1`，参数最大变化 0.00041961669921875。
+Trainer/Core/Launcher 均为 `0`，`cleanup_success=true`、服务端口关闭。
+CPU FP32 诊断误差为 0.090669，未作为传输验收阈值；同后端冷加载比较仍为精确一致。
+
+| 退出补验 | 触发条件 | 结果 |
+| --- | --- | --- |
+| verl 双机 Launcher SIGTERM | 训练 v2，动态副本已分配且 STARTING | Launcher 143、Trainer 1、Core 0；123.87s 完成清理，14 GPU 全归还、两节点实际 GPU 进程为空 |
+| verl 双机 Launcher SIGKILL | 训练 v6，动态副本 READY 后再完成一次 required transport 复用；总计划 80 步 | Launcher -9；Core/Trainer 归属子树退出；126.96s 后端口关闭、14 GPU 全归还、实际 GPU 进程为空 |
+| AReaL 双机 Trainer SIGTERM | 严格 RLVR、DP8，g02/g12 各 4 rank，训练 v2 | Trainer 143（28.25s）；随后显式停止独立 Core，Core 0；最终两节点资源审计通过 |
+
+Trainer 1 是 Launcher 中断路径的退出结果，不记作正常训练完成。
+AReaL 表中时间仅为 Trainer 退出耗时，独立 Core 仍需随后排空并退出。
+SIGKILL 用例不依赖被杀 Launcher 写退出报告，使用外部记录的 PID/create_time 归属、
+实际端口、Ray 资源和两节点 `nvidia-smi` 检查清理。
+最终审计得到 14 GPU 空闲、Ray Actor 列表为空、任务端口及原生任务进程均为空。
+专用 Ray head/worker 保留供后续 Megatron 验证，未把这些基础服务计为任务进程泄漏。
+
+最终汇总为补验根目录的 `artifacts/followup-results.json`；
+`matrix-result.json` 和 `acceptance-tail-result.json` 均 `completed=true`。
+实际审计 1296 条 AReaL 完成响应，输入/输出长度组合仅有 1024/2048。
+补验结束再次核对 76 个受测代码/测试/入口文件，哈希与本地 `46b12de` 一致。
 
 `0fd4e22` 全量结果为 Windows **572 passed / 22 skipped**（178.66s）、
 Linux **583 passed / 11 skipped**（138.95s）。两个新增的 Linux TCP 用例在 Windows 跳过。
@@ -142,7 +180,9 @@ Ruff lint/format、`git diff --check` 另行检查；跳过不代表对应设备
 
 Core 的 TTL、试缩取消、手动覆盖、失败预算等负面分支由 CPU contract 覆盖。
 本次设备测试的重点是实际原生训练、真实扩缩容决策、通信组复用/销毁、数值和进程清理。
-多机动态压力、长时间稳定性、Megatron、平台资源申请/释放、Controller 恢复不在此结果内。
+双机补验覆盖上述有限轮次的真实训练、手动/AUTO 扩容、缩后更新、数值与退出。
+长时间稳定性、真实节点故障/网络分区、跨节点单个推理副本 TP/PP、Megatron、
+平台资源申请/释放及 Controller 恢复不在此结果内。
 NPU 仍须补验 HCCL 全 rank 销毁、缩后更新，以及 Ascend 进程和显存释放，不能直接写 CLOSED。
 
 ## 原始证据位置
@@ -160,3 +200,15 @@ NPU 仍须补验 HCCL 全 rank 销毁、缩后更新，以及 Ascend 进程和�
 | 训练中 SIGTERM / SIGKILL | `three-k/verl-term-pending-v2/artifacts/sigterm-pending.json`、`three-k/verl-kill-active-v3/artifacts/sigkill-active.json` |
 | TP2 协议与 owner 强杀清理 | `tp2-device-v4/artifacts/{protocol,owner-kill-cleanup}.json` |
 | 两个专用 Ray head 的最终清理 | `artifacts/{verl,areal}-final-resource-cleanup.json` |
+
+退出与双机补验另存于 `/mnt/sfs_turbo/shl/elastic-rollout-mvp4-followup-20261028`：
+
+| 证据 | 相对此补验根目录的路径 |
+| --- | --- |
+| 最终汇总、代码哈希 | `artifacts/followup-results.json`、`artifacts/followup-production-sources.json` |
+| AReaL 双机 40 步、数值、正常退出 | `areal-multi/artifacts/{areal-fixed.completed,areal-3k-exit,training-workers}.json` |
+| verl 双机 40 步、数值、正常退出 | `verl-multi/artifacts/{multi-result,numerical-proof,training-workers}.json` |
+| 两框架手动/AUTO 决策 | `{areal,verl}-multi/artifacts/{areal,verl}-3k-{manual,auto}-result.json` |
+| Launcher 双机 SIGTERM / SIGKILL | `verl-multi-{term,kill}/artifacts/signal-result.json` |
+| AReaL SIGTERM 原始失败与修复复测 | `areal-term-{baseline,fixed}/artifacts/signal-result.json` |
+| AReaL 双机 SIGTERM 与最终资源审计 | `areal-term-multi/artifacts/{signal-result,training-workers,resource-cleanup}.json` |

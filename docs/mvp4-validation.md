@@ -1,6 +1,6 @@
 # MVP-4：已有资源池内扩缩容
 
-状态：支持 NPU/HCCL 与 GPU/NCCL；单机 GPU FSDP2 核心路径已通过真机验收，NPU 专项尚未完成。
+状态：支持 NPU/HCCL 与 GPU/NCCL；单机及双机 GPU FSDP2 核心路径和所列退出场景已通过真机验收，NPU 专项尚未完成。
 默认配置继续使用固定拓扑；通过 `deployment.elastic_scaling=true`
 显式启用新路径。MVP-3 的 verl FSDP2 和 AReaL FSDP2 共用此实现。
 真实负载、设备结果和失败记录见 [GPU 验收记录](mvp4-gpu-validation.md)；

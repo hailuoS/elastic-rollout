@@ -24,7 +24,7 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
 | MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
 | MVP-3 | AReaL / verl FSDP2 共用策略事务，支持 HCCL / NCCL | GPU 功能已验证；NPU 验收待补充 |
-| MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 单机 GPU FSDP2 核心路径已验证；NPU 待补验 |
+| MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 单/双机 GPU FSDP2、数值与退出验证通过；NPU 待补验 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
