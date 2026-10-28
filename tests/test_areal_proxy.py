@@ -248,8 +248,9 @@ def test_proxy_observes_actual_http_commit_without_second_commit(
 
 @pytest.mark.parametrize("agent", ["math", "multi-turn", "tools"])
 @pytest.mark.parametrize("ray_address", [None, "10.0.0.8:6379"])
+@pytest.mark.parametrize("ray_initialized", [False, True])
 def test_agent_training_entry_uses_native_agents_and_existing_config(
-    monkeypatch, agent, ray_address
+    monkeypatch, agent, ray_address, ray_initialized
 ):
     from examples import areal_agent_train
 
@@ -281,14 +282,25 @@ def test_agent_training_entry_uses_native_agents_and_existing_config(
     stub_module(
         monkeypatch, "elastic_rollout.integrations.areal.trainer", ElasticPPOTrainer=trainer
     )
-    ray = stub_module(monkeypatch, "ray", is_initialized=lambda: False, init=MagicMock())
+    ray = stub_module(
+        monkeypatch,
+        "ray",
+        is_initialized=lambda: ray_initialized,
+        init=MagicMock(),
+        shutdown=MagicMock(),
+    )
     monkeypatch.setenv("AREAL_PROXY_ADMIN_KEY", "runtime-key")
     if ray_address is None:
         monkeypatch.delenv("RAY_ADDRESS", raising=False)
     else:
         monkeypatch.setenv("RAY_ADDRESS", ray_address)
     areal_agent_train.main(["--agent", agent, "--config", "existing.yaml"])
-    ray.init.assert_called_once_with(address=ray_address or "auto")
+    if ray_initialized:
+        ray.init.assert_not_called()
+        ray.shutdown.assert_not_called()
+    else:
+        ray.init.assert_called_once_with(address=ray_address or "auto")
+        ray.shutdown.assert_called_once_with()
     assert config.rollout.agent.admin_api_key == "runtime-key"
     assert config.rollout.agent.engine_max_tokens == 2048
     call = trainer.return_value.__enter__.return_value.train.call_args.kwargs

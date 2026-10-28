@@ -3,17 +3,16 @@
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 
 from examples.areal_agent import AGENT_WORKFLOWS
 
 
 def main(args):
     from areal.api.cli_args import GRPOConfig, load_expr_config
-    from areal.dataset import get_custom_dataset
     from areal.infra.utils.http import validate_admin_api_key
-    from areal.utils.hf_utils import load_hf_tokenizer
 
-    from elastic_rollout.integrations.areal.trainer import ElasticPPOTrainer
+    from elastic_rollout.integrations.areal.lifecycle import graceful_sigterm
     from elastic_rollout.integrations.areal.weight_sync import (
         HCCLWeightSyncConfig,
         NCCLWeightSyncConfig,
@@ -45,19 +44,34 @@ def main(args):
         config.rollout.agent.admin_api_key,
         config_field="rollout.agent.admin_api_key",
     )
-    if config.scheduler.type == "ray":
-        import ray
+    with ExitStack() as stack:
+        if config.scheduler.type == "ray":
+            import ray
 
-        if not ray.is_initialized():
-            options_ray = {"address": os.environ.get("RAY_ADDRESS", "auto")}
-            if options.weight_sync == "nccl":
-                options_ray["runtime_env"] = {
-                    "py_executable": sys.executable,
-                    "env_vars": {
-                        key: os.environ[key] for key in ("VLLM_NCCL_SO_PATH",) if key in os.environ
-                    },
-                }
-            ray.init(**options_ray)
+            if not ray.is_initialized():
+                options_ray = {"address": os.environ.get("RAY_ADDRESS", "auto")}
+                if options.weight_sync == "nccl":
+                    options_ray["runtime_env"] = {
+                        "py_executable": sys.executable,
+                        "env_vars": {
+                            key: os.environ[key]
+                            for key in ("VLLM_NCCL_SO_PATH",)
+                            if key in os.environ
+                        },
+                    }
+                ray.init(**options_ray)
+                stack.callback(ray.shutdown)
+        # Ray replaces SIGTERM during init; register only after that call.
+        stack.enter_context(graceful_sigterm())
+        _train(config, options, sync_config)
+
+
+def _train(config, options, sync_config):
+    from areal.dataset import get_custom_dataset
+    from areal.utils.hf_utils import load_hf_tokenizer
+
+    from elastic_rollout.integrations.areal.trainer import ElasticPPOTrainer
+
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     train = get_custom_dataset("train", config.train_dataset, tokenizer)
     valid = get_custom_dataset("test", config.valid_dataset, tokenizer)

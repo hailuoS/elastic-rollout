@@ -1,7 +1,8 @@
 # MVP-4 GPU 验收记录
 
 状态：单机 GPU、dense BF16 FSDP2 的核心弹性路径已通过真机验收，不代表 NPU 已通过。
-早期 AReaL Agent/Proxy 用例的 SIGTERM 退出码为 -6，未计为优雅退出通过。
+早期 AReaL Agent/Proxy 用例的 SIGTERM 退出码为 -6，保留失败记录。
+2026-10-28 的退出补验已复现并修复普通 DP4 训练中的同类异常；双机完整弹性补验进行中。
 代码在 `feat/mvp4-autoscaling`，未合入 main，未推送。
 本轮最终生产代码基线为 `0fd4e22`；各早期用例使用的修复阶段在下文单独注明。
 NPU 的操作步骤见 [补充验收手册](mvp4-npu-supplement-zh.md)。
@@ -110,6 +111,28 @@ CPU FP32 的误差保留为诊断，不能混为权重版本不一致。
 `RAY_TMPDIR` 作为 `VLLM_RPC_BASE_PATH`。它不改变训练副本的配置。
 
 ## 回归与边界
+
+### 2026-10-28 退出补验
+
+使用同一真实 1.5B 模型、batch 16/n=2、严格 1024/2048 token 的普通 AReaL
+DP4 训练，在 v2 已提交且采样仍在运行时，直接向 Trainer 发送 SIGTERM。
+原行为再次得到 Trainer `-6`、Core `0`。在 `ray.init()` 后安装应用的信号处理器，
+让异常展开完整覆盖 Trainer 构造/训练/关闭，并在原生清理后显式 `ray.shutdown()`，
+同条件复测得到 Trainer `143`，29.15 秒退出；随后显式停止独立 Core，Core `0`，
+服务端口全部关闭。下一轮双机任务前确认 Ray 的 14 张 GPU 全部归还，并在两个节点
+分别核对预留 GPU 的实际显存/利用率均为空闲。这不是进程退出后仅看 Ray 逻辑资源的检查。
+
+生产入口 `examples.areal_agent_train` 使用相同的 `graceful_sigterm()` 范围；它只关闭
+自己初始化的 Ray 连接，不关闭调用者已有的连接，也不自动终止独立启动的 Core。
+程序化使用时，必须在 `ray.init()` 后把 Trainer 的整个 `with` 块放入该信号范围。
+第二次 SIGTERM 不打断正在执行的清理；需要强制结束仍使用 SIGKILL。
+
+补验原始证据位于 `/mnt/sfs_turbo/shl/elastic-rollout-mvp4-followup-20261028`：
+`areal-term-{baseline,fixed}/artifacts/signal-result.json` 与
+`areal-multi/artifacts/preflight-gpus.json`。失败记录未改写为通过。
+本次 Windows 全量回归为 **580 passed / 23 skipped**（186.32 秒）；Linux 为
+**593 passed / 10 skipped**（144.25 秒），包含连接现有双机 Ray 的真实 SIGTERM 回归。
+双机完整训练/扩缩容结果待完成后补入；此处不提前标记通过。
 
 `0fd4e22` 全量结果为 Windows **572 passed / 22 skipped**（178.66s）、
 Linux **583 passed / 11 skipped**（138.95s）。两个新增的 Linux TCP 用例在 Windows 跳过。
