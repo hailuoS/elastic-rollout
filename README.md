@@ -25,6 +25,7 @@ AgentLoop 和生成语义。Core 不依赖这两个框架。
 | MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
 | MVP-3 | AReaL / verl FSDP2 共用策略事务，支持 HCCL / NCCL | GPU 功能已验证；NPU 验收待补充 |
 | MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 单/双机 GPU FSDP2、数值与退出验证通过；NPU 待补验 |
+| Megatron 接入 | AReaL / verl 原生 Bridge、dense BF16 TP/PP/DP | 双机 GPU 训练、扩缩、数值与退出验证通过；NPU/MindSpeed 路径保留，实机待补验 |
 
 本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
 MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
@@ -103,6 +104,7 @@ Serving 基线为 **vLLM / vLLM-Ascend 0.23.x**。最新暂停排空语义、180
 
 | 文档 | 何时阅读 |
 | --- | --- |
+| [Megatron 后端接入](docs/megatron-backends.md) | 原生 Bridge、源码补丁、GPU 验收进度与 NPU/MindSpeed 边界 |
 | [MVP-1.5B 实现与验收报告](docs/mvp15b-validation.md) | 当前入口：planned abort、跨版本续接、Rev2 核对 |
 | [MVP-1.5A 验证手册](docs/mvp15a-validation.md) | Agent/Proxy 基线回归 |
 | [MVP-1 验证手册](docs/mvp1-validation.md) | 已验收的权重同步基线与回归 |
@@ -136,6 +138,6 @@ ruff format --check .
 - 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
 - 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
 - 默认固定拓扑；显式 `elastic_scaling=true` 启用已有 slots 内的手动/自动扩缩。
-- AReaL/verl 当前支持 dense BF16 FSDP2；动态 transport 已在 GPU/NCCL 验证，NPU/HCCL 待补验。
+- AReaL/verl 支持 dense BF16 FSDP2 和 Megatron；动态 transport 已在 GPU/NCCL 验证，NPU/HCCL 待补验。
 - LoRA、多模态不在当前外部训练接入范围。
 - 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。

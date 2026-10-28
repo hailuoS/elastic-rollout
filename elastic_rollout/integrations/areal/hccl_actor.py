@@ -1,4 +1,4 @@
-"""AReaL FSDP producer: native export, shared external HCCL transaction.
+"""AReaL producers: native export, shared external HCCL transaction.
 
 No physical inference servers or native AReaL XCCL receiver groups are created.
 All methods run on AReaL's engine RPC thread with its selected accelerator.
@@ -10,6 +10,7 @@ from areal.engine.fsdp_engine import FSDPPPOActor
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.trainer.ppo.actor import PPOActorController
+from areal.utils.offload import torch_memory_saver
 
 from elastic_rollout.api import nonnegative_int
 from elastic_rollout.client import ControlClient
@@ -61,7 +62,7 @@ class ElasticHCCLActorController(PPOActorController):
             self._elastic_sync.meta = None
 
 
-class ElasticHCCLFSDPActor(FSDPPPOActor):
+class ElasticHCCLActorMixin:
     def compute_logp(self, data):
         result = super().compute_logp(data)
         # AReaL remotizes GPU results on the HTTP thread after this engine RPC
@@ -88,10 +89,11 @@ class ElasticHCCLFSDPActor(FSDPPPOActor):
                 f"MVP-3 {backend} requires {expected_device} and bfloat16 compute dtype"
             )
         expert_fields = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+        model_config = getattr(self, "model_config", None) or self.hf_config
         if (
             self.is_vision_model
-            or any(getattr(self.model_config, field, 0) for field in expert_fields)
-            or "moe" in getattr(self.model_config, "model_type", "").lower()
+            or any(getattr(model_config, field, 0) for field in expert_fields)
+            or "moe" in getattr(model_config, "model_type", "").lower()
         ):
             raise ValueError("MVP-3 supports dense text models only")
         options = dict(options)
@@ -113,7 +115,10 @@ class ElasticHCCLFSDPActor(FSDPPPOActor):
     def elastic_hccl_control(self, method, **kwargs):
         if method not in ("prepare", "configure_session", "retire_transports", "settle_optional"):
             raise ValueError("unsupported external HCCL producer operation")
-        return getattr(self._elastic_sender, method)(**kwargs)
+        # Persistent communicators must remain resident when TMS pauses model
+        # allocations. The native framework owns the memory-saver context.
+        with torch_memory_saver.disable():
+            return getattr(self._elastic_sender, method)(**kwargs)
 
     def _synchronize_bucket(self, error, manifest):
         values = [None] * dist.get_world_size(group=self.cpu_group)
@@ -124,33 +129,30 @@ class ElasticHCCLFSDPActor(FSDPPPOActor):
         if any(value["manifest"] != values[0]["manifest"] for value in values):
             raise RuntimeError("training ranks produced different HCCL weight manifests")
 
+    @torch.no_grad()
+    def elastic_hccl_send(self, meta):
+        validate_meta(meta)
+        self._check_rollout_engine_connected()
+        with self._offload_aware_context(), torch_memory_saver.disable():
+            return self._elastic_sender.send_weights_sync(
+                self._elastic_weights(meta),
+                meta.version,
+                synchronize_group=self._synchronize_bucket,
+            )
+
+
+class ElasticHCCLFSDPActor(ElasticHCCLActorMixin, FSDPPPOActor):
     def _elastic_weights(self, meta):
         parameters = list(self._get_model_name_parameters(meta))
-        # Compare metadata before any FSDP collective, without materializing a model.
         self._synchronize_bucket(
             None, [{"name": name, "shape": list(param.shape)} for name, param in parameters]
         )
         for name, param in parameters:
-            # full_tensor is collective; every rank also casts so bucket layouts
-            # match even with fp32 optimizer master storage.
             tensor = self._get_full_tensor(param)
             error = None
             try:
                 tensor = self._cast_to_compute_dtype(tensor)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-            # A rank-local cast/OOM must reach every rank before the next full_tensor,
-            # rather than letting one rank report an error while peers gather again.
             self._synchronize_bucket(error, None)
             yield name, tensor
-
-    @torch.no_grad()
-    def elastic_hccl_send(self, meta):
-        validate_meta(meta)
-        self._check_rollout_engine_connected()
-        with self._offload_aware_context():
-            return self._elastic_sender.send_weights_sync(
-                self._elastic_weights(meta),
-                meta.version,
-                synchronize_group=self._synchronize_bucket,
-            )

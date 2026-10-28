@@ -1,0 +1,21 @@
+--- a/areal/utils/offload.py
++++ b/areal/utils/offload.py
+@@ -51,14 +51,10 @@
+             "torch_memory_saver is required when train-engine offload is enabled."
+         ) from e
+ 
+-    # Locate the LD_PRELOAD shared library
+-    dynlib_path = os.path.join(
+-        os.path.dirname(os.path.dirname(tms_pkg.__file__)),
+-        "torch_memory_saver_hook_mode_preload.abi3.so",
+-    )
+-
+-    if not os.path.exists(dynlib_path):
+-        raise RuntimeError(f"LD_PRELOAD so file {dynlib_path} does not exist.")
++    # Let TMS select the binary matching the installed torch CUDA runtime.
++    # The unsuffixed compatibility library may target a different CUDA major.
++    with tms_pkg.configure_subprocess():
++        dynlib_path = os.environ["LD_PRELOAD"]
+ 
+     env_vars = {
+         "LD_PRELOAD": dynlib_path,

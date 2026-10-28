@@ -35,6 +35,7 @@ class ElasticPPOTrainer(PPOTrainer):
         if (
             config.actor.weight_update_mode != ("xccl" if self._hccl else "disk")
             or config.actor.use_lora
+            or getattr(config.actor, "use_merged_lora", False)
             or config.actor._version != "v1"
             or config.rollout._version != "v1"
             or self._is_actor_rollout_colocated(config)
@@ -43,9 +44,10 @@ class ElasticPPOTrainer(PPOTrainer):
                 "external training requires v1 engines, matching weight mode, no LoRA or colocation"
             )
         if self._hccl and (
-            not config.actor.backend.startswith("fsdp:") or config.actor.dtype != "bfloat16"
+            not config.actor.backend.startswith(("fsdp:", "megatron:"))
+            or config.actor.dtype != "bfloat16"
         ):
-            raise ValueError("MVP-3 supports FSDP with bfloat16 compute dtype only")
+            raise ValueError("Direct updates require FSDP or Megatron with bfloat16 compute dtype")
         if self._hccl and getattr(config.actor, "init_from_scratch", False):
             raise ValueError(
                 "MVP-3 bootstrap requires pretrained actor weights, not init_from_scratch"
@@ -97,9 +99,15 @@ class ElasticPPOTrainer(PPOTrainer):
     def _create_train_engine(self, actor_config, alloc):
         if not self._hccl or actor_config is not self.config.actor:
             return super()._create_train_engine(actor_config, alloc)
-        from .hccl_actor import ElasticHCCLFSDPActor
+        if actor_config.backend.startswith("megatron:"):
+            from .megatron_actor import ElasticHCCLMegatronActor
 
-        actor = ElasticHCCLFSDPActor.as_controller(actor_config, self.scheduler)
+            actor_cls = ElasticHCCLMegatronActor
+        else:
+            from .hccl_actor import ElasticHCCLFSDPActor
+
+            actor_cls = ElasticHCCLFSDPActor
+        actor = actor_cls.as_controller(actor_config, self.scheduler)
         actor.create_process_group(parallel_strategy=alloc.parallel)
         return actor
 

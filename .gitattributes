@@ -2,3 +2,6 @@
 
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Unified diffs require a prefix space on empty context lines.
+patches/megatron/*.patch whitespace=-blank-at-eol,-blank-at-eof

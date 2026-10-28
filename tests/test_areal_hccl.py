@@ -8,7 +8,7 @@ import copy
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
@@ -32,6 +32,9 @@ class Tensor:
 
     def is_floating_point(self):
         return True
+
+    def contiguous(self):
+        return self
 
     def to(self, dtype):
         result = copy.copy(self)
@@ -99,6 +102,8 @@ def actor_adapter(monkeypatch):
         "PPOActorController", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
     )
     stub_module(monkeypatch, "areal.trainer.ppo.actor", PPOActorController=controller)
+    stub_module(monkeypatch, "areal.utils")
+    stub_module(monkeypatch, "areal.utils.offload", torch_memory_saver=NS(disable=nullcontext))
     module = load_adapter(
         monkeypatch,
         "elastic_rollout.integrations.areal.hccl_actor",
@@ -134,6 +139,61 @@ def test_actor_sync_failure_does_not_publish_gpu_results(actor_adapter, monkeypa
     module.current_platform.synchronize.side_effect = RuntimeError("device work failed")
     with pytest.raises(RuntimeError, match="device work failed"):
         getattr(module.ElasticHCCLFSDPActor(), method)(object())
+
+
+@pytest.mark.parametrize("operation", ["configure_session", "retire_transports", "send"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_persistent_transport_allocations_stay_outside_tms(actor_adapter, operation, failure):
+    module, local, _ = actor_adapter
+    local.capturing = True
+    events = []
+
+    @contextmanager
+    def disable():
+        previous = local.capturing
+        local.capturing = False
+        try:
+            yield
+        finally:
+            local.capturing = previous
+
+    @contextmanager
+    def onload():
+        events.append("onload")
+        try:
+            yield
+        finally:
+            # Native offload must regain its capture state even on sender errors.
+            assert local.capturing
+            events.append("offload")
+
+    def native(*args, **kwargs):
+        assert not local.capturing, "communicator memory would be paused with model weights"
+        events.append("native")
+        if failure:
+            raise RuntimeError("native operation failed")
+        return {"ok": True}
+
+    module.torch_memory_saver = NS(disable=disable)
+    actor = module.ElasticHCCLFSDPActor()
+    method = operation if operation != "send" else "send_weights_sync"
+    actor._elastic_sender = NS(**{method: native})
+    actor._check_rollout_engine_connected = lambda: None
+    actor._offload_aware_context = onload
+    actor._elastic_weights = lambda meta: iter([])
+
+    def run():
+        if operation == "send":
+            return actor.elastic_hccl_send(Meta())
+        return actor.elastic_hccl_control(operation)
+
+    if failure:
+        with pytest.raises(RuntimeError, match="native operation failed"):
+            run()
+    else:
+        assert run() == {"ok": True}
+    assert local.capturing
+    assert events == (["onload", "native", "offload"] if operation == "send" else ["native"])
 
 
 @pytest.fixture
@@ -419,6 +479,14 @@ def test_trainer_selects_external_hccl_actor_only_and_validates_bootstrap(
     reference_config = object()
     assert trainer._create_train_engine(reference_config, alloc) == "native reference engine"
     assert parent_calls == [reference_config]
+    stub_module(
+        monkeypatch,
+        "elastic_rollout.integrations.areal.megatron_actor",
+        ElasticHCCLMegatronActor=factory,
+    )
+    config.actor.backend = "megatron:d2t2p2"
+    assert trainer._create_train_engine(config.actor, alloc) is actor
+    config.actor.backend = "fsdp:d2"
     trainer.actor = actor
     trainer._init_rollout(config.rollout)
     options, bootstrap = actor.configure_elastic_hccl.call_args.args
@@ -429,7 +497,7 @@ def test_trainer_selects_external_hccl_actor_only_and_validates_bootstrap(
     trainer._init_rollout(config.rollout, is_eval=True)
     actor.configure_elastic_hccl.assert_called_once()
     for key, bad, error in (
-        ("backend", "megatron:d2", "FSDP"),
+        ("backend", "unknown:d2", "FSDP"),
         ("dtype", "float32", "bfloat16"),
         ("weight_update_mode", "disk", "matching weight mode"),
     ):
@@ -445,3 +513,59 @@ def test_trainer_selects_external_hccl_actor_only_and_validates_bootstrap(
     config.actor.init_from_scratch = True
     with pytest.raises(ValueError, match="init_from_scratch"):
         module.ElasticPPOTrainer(config, weight_sync_config=HCCLWeightSyncConfig("trainer"))
+
+
+@pytest.mark.parametrize("failure", [None, "setup", "cast", "manifest", "end"])
+def test_megatron_bridge_all_rank_export_boundaries(actor_adapter, monkeypatch, failure):
+    module, local, _ = actor_adapter
+    monkeypatch.setitem(sys.modules, "elastic_rollout.integrations.areal.hccl_actor", module)
+    stub_module(
+        monkeypatch, "areal.engine.megatron_engine", MegatronPPOActor=type("Native", (), {})
+    )
+    megatron = load_adapter(
+        monkeypatch,
+        "elastic_rollout.integrations.areal.megatron_actor",
+        PACKAGE / "integrations/areal/megatron_actor.py",
+    )
+    consumed, closed = [[], []], []
+
+    def run(rank):
+        local.rank = rank
+        actor = megatron.ElasticHCCLMegatronActor()
+        actor.cpu_group = object()
+        actor.model = object()
+
+        def export(model, *, cpu, show_progress):
+            assert model is actor.model and not cpu and not show_progress
+            try:
+                for i in range(3):
+                    if failure == "end" and rank == 1 and i == 1:
+                        return
+                    tensor = Tensor()
+                    if failure == "cast" and rank == 1 and i == 1:
+                        tensor.to = Mock(side_effect=RuntimeError("cast failed"))
+                    name = f"layer.{i + (failure == 'manifest' and rank == 1)}"
+                    consumed[rank].append(name)
+                    yield name, tensor
+            finally:
+                closed.append(rank)
+
+        def bridge_export(*args, **kwargs):
+            if failure == "setup" and rank == 1:
+                raise RuntimeError("bridge setup failed")
+            return export(*args, **kwargs)
+
+        actor.bridge = NS(export_hf_weights=bridge_export)
+        return list(actor._elastic_weights(Meta()))
+
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(run, rank) for rank in range(2)]
+        if failure:
+            for future in futures:
+                with pytest.raises(RuntimeError, match="export failed|different .* manifests"):
+                    future.result(timeout=10)
+        else:
+            results = [f.result(timeout=10) for f in futures]
+            assert [[name for name, _ in result] for result in results] == consumed
+            assert all(t.dtype == "torch.bfloat16" for result in results for _, t in result)
+    assert sorted(closed) == ([0] if failure == "setup" else [0, 1])

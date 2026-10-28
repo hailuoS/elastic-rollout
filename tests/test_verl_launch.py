@@ -17,6 +17,49 @@ from elastic_rollout.integrations.verl import launcher, smoke
 from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_mvp2b_verl_config
 
 
+def test_megatron_launch_uses_native_config_and_rejects_fsdp_overlap(launch_file):
+    _edit_json(launch_file, lambda data: data["verl"].update(strategy="megatron"))
+    spec = LaunchSpec.from_file(launch_file)
+    with pytest.raises(ValueError, match="conflicts"):
+        spec.trainer_overrides("10.0.0.3:6379")
+    spec = replace(
+        spec,
+        user_overrides=tuple(v for v in spec.user_overrides if "actor.strategy=" not in v),
+    )
+    overrides = spec.trainer_overrides("10.0.0.3:6379")
+    assert "model_engine=megatron" in overrides
+    assert "actor_rollout_ref.actor.megatron.dtype=bfloat16" in overrides
+    assert "actor_rollout_ref.actor.megatron.vanilla_mbridge=false" in overrides
+    assert not any("fsdp_config" in value for value in overrides)
+
+
+@pytest.mark.parametrize(
+    "extra,error",
+    [
+        ([], None),
+        (["actor_rollout_ref.actor.megatron.expert_model_parallel_size=2"], "dense BF16"),
+        (["actor_rollout_ref.model.lora.rank=8"], "dense BF16"),
+    ],
+)
+def test_megatron_real_hydra_preflight(launch_file, monkeypatch, extra, error):
+    pytest.importorskip("hydra")
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "verl"))
+    spec = replace(LaunchSpec.from_file(launch_file), strategy="megatron")
+    (Path(spec.model_path) / "config.json").write_text('{"model_type":"qwen2"}')
+    spec = replace(
+        spec,
+        user_overrides=tuple(v for v in spec.user_overrides if "actor.strategy=" not in v)
+        + tuple(extra),
+    )
+    address = "10.0.0.3:6379"
+    args = (spec, address, spec.trainer_overrides(address), spec.core_config())
+    if error:
+        with pytest.raises(ValueError, match=error):
+            validate_mvp2b_verl_config(*args)
+    else:
+        validate_mvp2b_verl_config(*args)
+
+
 @pytest.fixture
 def launch_file(tmp_path):
     model = tmp_path / "model"

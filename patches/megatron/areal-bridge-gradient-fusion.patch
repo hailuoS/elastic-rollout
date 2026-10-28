@@ -1,0 +1,26 @@
+--- a/areal/api/cli_args.py
++++ b/areal/api/cli_args.py
+@@ -857,6 +857,9 @@
+     # Don't use MegatronOptimizerConfig here because OmegaConf
+     # does not recognize the annotation "torch.dtype"
+     overlap_param_gather_with_optimizer_step: bool = False
++
++    # Optional Bridge override; None preserves the provider default.
++    gradient_accumulation_fusion: bool | None = None
+ 
+     # Precision Configuration
+     use_precision_aware_optimizer: bool = field(
+--- a/areal/models/mcore/registry.py
++++ b/areal/models/mcore/registry.py
+@@ -459,8 +459,11 @@
+         # Disable fused weight-grad accumulation: LoRA params lack the main_grad
+         # buffers it needs; on NPU the fused wgrad op is a no-op stub that
+         # corrupts gradients (NaN).
++        if mcore_config.gradient_accumulation_fusion is not None:
++            provider.gradient_accumulation_fusion = mcore_config.gradient_accumulation_fusion
+         if use_lora or is_npu_available:
+             provider.gradient_accumulation_fusion = False
++        tf_config.gradient_accumulation_fusion = provider.gradient_accumulation_fusion
+ 
+         # Keep runtime-sensitive provider flags aligned with AReaL's config.
+         provider.variable_seq_lengths = True

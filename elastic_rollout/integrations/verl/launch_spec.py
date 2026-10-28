@@ -35,6 +35,7 @@ class LaunchSpec:
     shutdown_timeout_s: float
     trainer_shutdown_timeout_s: float
     accelerator: str = "npu"
+    strategy: str = "fsdp2"
 
     @classmethod
     def from_file(cls, path: Path) -> "LaunchSpec":
@@ -49,7 +50,7 @@ class LaunchSpec:
             "controller": "bind_host advertise_host port startup_timeout_s shutdown_timeout_s",
             "deployment": "id core_template",
             "model": "path initial_version",
-            "verl": "overrides shutdown_timeout_s",
+            "verl": "overrides shutdown_timeout_s strategy",
         }
         for section, names in fields.items():
             if unknown := set(data[section]) - set(names.split()):
@@ -85,7 +86,10 @@ class LaunchSpec:
             control.get("shutdown_timeout_s", 900),
             verl.get("shutdown_timeout_s", 120),
             runtime.get("accelerator", "npu"),
+            verl.get("strategy", "fsdp2"),
         )
+        if spec.strategy not in ("fsdp2", "megatron"):
+            raise ValueError("verl.strategy must be fsdp2 or megatron")
         if spec.accelerator not in ("npu", "gpu"):
             raise ValueError("runtime.accelerator must be npu or gpu")
         if any(
@@ -156,7 +160,6 @@ class LaunchSpec:
             "trainer.v1.trainer_mode": "separate_async",
             "actor_rollout_ref.hybrid_engine": "false",
             "actor_rollout_ref.model.path": self.model_path,
-            "actor_rollout_ref.actor.fsdp_config.model_dtype": "bfloat16",
             f"{ROLLOUT}.llm_server_manager_class": (
                 "elastic_rollout.integrations.verl.rollout_service.ElasticRolloutService"
             ),
@@ -176,6 +179,19 @@ class LaunchSpec:
             f"{ROLLOUT}.custom.elastic.fixed_policy": "false",
             f"{ROLLOUT}.custom.elastic.weight_sync": self.backend,
         }
+        if self.strategy == "megatron":
+            values.update(
+                {
+                    "model_engine": "megatron",
+                    "actor_rollout_ref.actor.strategy": "megatron",
+                    "actor_rollout_ref.actor.megatron.dtype": "bfloat16",
+                    "actor_rollout_ref.actor.megatron.use_mbridge": "true",
+                    "actor_rollout_ref.actor.megatron.vanilla_mbridge": "false",
+                    f"{ENGINE}.engine_kwargs.elastic_{self.backend}.synchronize_per_tensor": "true",
+                }
+            )
+        else:
+            values["actor_rollout_ref.actor.fsdp_config.model_dtype"] = "bfloat16"
         if self.core_config()["deployments"][0].get("elastic_scaling"):
             values.update(
                 {
@@ -238,7 +254,7 @@ def validate_mvp2b_verl_config(
     required = {
         "trainer.device": "cuda" if spec.accelerator == "gpu" else "npu",
         "trainer.resume_mode": "disable",
-        "actor_rollout_ref.actor.strategy": "fsdp2",
+        "actor_rollout_ref.actor.strategy": spec.strategy,
         f"{ROLLOUT}.name": "vllm",
         f"{ROLLOUT}.mode": "async",
         f"{ROLLOUT}.free_cache_engine": False,
@@ -247,6 +263,25 @@ def validate_mvp2b_verl_config(
     for key, value in required.items():
         if get(key) != value:
             raise ValueError(f"Verl {key} must be {value!r} for MVP-2B")
+    if spec.strategy == "megatron":
+        engine = "actor_rollout_ref.actor.megatron"
+        if (
+            get(f"{engine}.expert_model_parallel_size") != 1
+            or get(f"{engine}.context_parallel_size") != 1
+            or get(f"{engine}.qat.enable")
+            or get(f"{engine}.override_transformer_config.fp8")
+            or get("actor_rollout_ref.model.lora.rank")
+            or get("actor_rollout_ref.model.lora_rank")
+        ):
+            raise ValueError("external Megatron requires dense BF16 without EP/CP/FP8/QAT/LoRA")
+        model = json.loads((Path(spec.model_path) / "config.json").read_text(encoding="utf-8"))
+        if (
+            any(model.get(key) for key in ("num_experts", "num_local_experts", "n_routed_experts"))
+            or "moe" in model.get("model_type", "").lower()
+            or model.get("vision_config")
+            or model.get("quantization_config")
+        ):
+            raise ValueError("external Megatron requires a dense, unquantized text model")
     positive = (
         "trainer.nnodes trainer.n_gpus_per_node "
         "trainer.v1.separate_async.parameter_sync_step "

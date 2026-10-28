@@ -1,0 +1,20 @@
+--- a/areal/engine/megatron_engine.py
++++ b/areal/engine/megatron_engine.py
+@@ -1503,6 +1503,8 @@
+         """
+         if not is_tms_enabled():
+             return self.release_memory_occupation()
++        if self.is_offload:
++            return
+ 
+         self.get_device_stats().log("before offload model")
+ 
+@@ -1533,6 +1535,8 @@
+         """
+         if not is_tms_enabled():
+             return self.resume_memory_occupation()
++        if not self.is_offload:
++            return
+ 
+         torch_memory_saver.resume()
+ 

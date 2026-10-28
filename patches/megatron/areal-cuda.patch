@@ -1,0 +1,95 @@
+--- a/areal/engine/megatron_engine.py
++++ b/areal/engine/megatron_engine.py
+@@ -19,44 +19,51 @@
+ from datetime import datetime
+ from typing import TYPE_CHECKING, Any
+ 
+-import areal.engine.megatron_utils.ascend_log_patches  # noqa: F401 isort: skip  # before MindSpeed
+-import areal.utils.torch_npu_compat  # noqa: F401 isort: skip  # before MindSpeed
+-import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401 isort: skip  # before MindSpeed: fast GDN l2norm
+-import mindspeed.megatron_adaptor  # noqa: F401 isort: skip
+-
+-# Patch MindSpeed get_full_args to filter invalid field names.
+-# MindSpeed's argument parser strips "--" prefix from unknown CLI flags
+-# (args_utils.py:add_args does key[2:]). Short flags like pytest's "-v"
+-# become "" after stripping, causing make_dataclass to fail in
+-# transformer_config_init_wrapper with "Field names must be valid identifiers: ''".
+-import mindspeed.core.megatron_basic.arguments_basic as _ms_args_basic
+-
+-_ms_orig_get_full_args = _ms_args_basic.get_full_args
+-
+-
+-def _ms_sanitized_get_full_args():
+-    result = _ms_orig_get_full_args()
+-    d = vars(result)
+-    invalid_keys = [
+-        k for k in d if not isinstance(k, str) or not k or not k.isidentifier()
+-    ]
+-    for k in invalid_keys:
+-        del d[k]
+-    return result
+-
+-
+-_ms_args_basic.get_full_args = _ms_sanitized_get_full_args
+-
+-# Install mbridge compatibility shims (missing mcore APIs, transformer_engine
+-# stub) before the first ``import mbridge``. See areal/utils/mbridge_compat.py.
+-import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip
++from transformers.utils.import_utils import is_torch_npu_available
++
++if is_torch_npu_available():
++    import areal.engine.megatron_utils.ascend_log_patches  # noqa: F401 isort: skip  # before MindSpeed
++    import areal.utils.torch_npu_compat  # noqa: F401 isort: skip  # before MindSpeed
++    import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401 isort: skip  # before MindSpeed: fast GDN l2norm
++    import mindspeed.megatron_adaptor  # noqa: F401 isort: skip
++
++    # Patch MindSpeed get_full_args to filter invalid field names.
++    # MindSpeed's argument parser strips "--" prefix from unknown CLI flags
++    # (args_utils.py:add_args does key[2:]). Short flags like pytest's "-v"
++    # become "" after stripping, causing make_dataclass to fail in
++    # transformer_config_init_wrapper with "Field names must be valid identifiers: ''".
++    import mindspeed.core.megatron_basic.arguments_basic as _ms_args_basic
++
++    _ms_orig_get_full_args = _ms_args_basic.get_full_args
++
++
++    def _ms_sanitized_get_full_args():
++        result = _ms_orig_get_full_args()
++        d = vars(result)
++        invalid_keys = [
++            k for k in d if not isinstance(k, str) or not k or not k.isidentifier()
++        ]
++        for k in invalid_keys:
++            del d[k]
++        return result
++
++
++    _ms_args_basic.get_full_args = _ms_sanitized_get_full_args
++
++    # Install mbridge compatibility shims (missing mcore APIs, transformer_engine
++    # stub) before the first ``import mbridge``. See areal/utils/mbridge_compat.py.
++    import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip
++else:
++    # CUDA requires the real extension; do not install the NPU TE shim.
++    import transformer_engine.pytorch  # noqa: F401
+ 
+ import mbridge
+ 
+ # Re-wrap mbridge's @dataclass TransformerConfig subclasses (Qwen3VL etc.)
+ # so MindSpeed's CLI-args injection lands before the inherited __post_init__
+ # tries to validate ``moe_zero_memory_num_layers`` and friends. No-op on CUDA.
+-areal.utils.mbridge_compat.apply_post_mbridge()
++if is_torch_npu_available():
++    areal.utils.mbridge_compat.apply_post_mbridge()
+ import torch
+ import torch.distributed as dist
+ from megatron.core import parallel_state as mpu
+@@ -2808,6 +2815,8 @@
+         dist.barrier(group=self.cpu_group)
+ 
+     def _patch_mindspeed(self, parallel_strategy: ParallelStrategy):
++        if not is_npu_available:
++            return
+         from mindspeed.megatron_adaptor import repatch
+ 
+         config = self.mindspeed_config.as_dict()

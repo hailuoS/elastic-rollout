@@ -48,6 +48,65 @@ class Tensor:
         return 2
 
 
+@pytest.mark.parametrize("failure", [None, "manifest", "export", "end"])
+def test_megatron_global_stream_coordinates_every_rank(adapters, monkeypatch, failure):
+    from concurrent.futures import ThreadPoolExecutor
+
+    module, _ = adapters
+    local = threading.local()
+    barrier = threading.Barrier(8, timeout=5)
+    values = [None] * 8
+    consumed, closed = [[] for _ in range(8)], []
+
+    def gather(result, value, group):
+        values[local.rank] = value
+        barrier.wait()
+        result[:] = values
+        barrier.wait()
+
+    stub_module(monkeypatch, "torch")
+    stub_module(
+        monkeypatch,
+        "torch.distributed",
+        get_world_size=lambda group: 8,
+        all_gather_object=gather,
+    )
+
+    def run(rank):
+        local.rank = rank
+        engine = module.ElasticHCCLCheckpointEngine(
+            16, endpoint="http://control", deployment_id="test", synchronize_per_tensor=True
+        )
+        engine._elastic_cpu_group = object()
+
+        def export():
+            try:
+                for i in range(3):
+                    if rank == 4 and i == 1:
+                        if failure == "end":
+                            return
+                        if failure == "export":
+                            raise RuntimeError("native export failed")
+                    name = f"weight.{i + (failure == 'manifest' and rank == 4)}"
+                    consumed[rank].append(name)
+                    yield name, Tensor()
+            finally:
+                closed.append(rank)
+
+        return list(engine._coordinated_export(export()))
+
+    with ThreadPoolExecutor(8) as pool:
+        futures = [pool.submit(run, rank) for rank in range(8)]
+        if failure:
+            for future in futures:
+                with pytest.raises(RuntimeError, match="export failed|different .* manifests"):
+                    future.result(timeout=10)
+            assert max(map(len, consumed)) <= 2
+        else:
+            assert all(len(future.result(timeout=10)) == 3 for future in futures)
+    assert sorted(closed) == list(range(8))
+
+
 def test_bucket_data_metadata_order_and_oversized(adapters):
     module, _ = adapters
     weights = [(f"weight.{i}", Tensor()) for i in range(8)]
@@ -75,6 +134,21 @@ def test_nonmaster_exhausts_iterator_without_sender_import(adapters):
 
     assert asyncio.run(engine.send_weights(weights(), global_steps=1)) == {}
     assert consumed == list(range(9))
+
+
+def test_megatron_hccl_creates_coordination_group_without_elastic_plan(adapters, monkeypatch):
+    module, _ = adapters
+    group = object()
+    create = MagicMock(return_value=group)
+    stub_module(monkeypatch, "torch")
+    stub_module(monkeypatch, "torch.distributed", new_group=create)
+    engine = module.ElasticHCCLCheckpointEngine(
+        16, endpoint="http://control", deployment_id="test", synchronize_per_tensor=True
+    )
+    assert engine.prepare() == engine.prepare() == {}
+    assert engine._elastic_cpu_group is group
+    create.assert_called_once()
+    assert create.call_args.kwargs["backend"] == "gloo"
 
 
 def test_sender_receives_overlap_and_releases_buckets(adapters, monkeypatch):
@@ -591,6 +665,8 @@ def test_actual_verl_worker_uses_native_export(adapters):
     consumed = []
 
     class Export:
+        is_param_offload_enabled = False
+
         def get_per_tensor_param(self):
             consumed.append("native_export")
             return iter([("weight", Tensor())]), None
