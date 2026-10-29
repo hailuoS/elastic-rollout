@@ -25,6 +25,44 @@ def test_control_api_and_auth(http_runtime):
     assert error.value.status == 404
 
 
+@pytest.mark.parametrize(
+    "suffix,method,payload,field",
+    [
+        ("/desired", "PUT", {}, "desired_replicas"),
+        ("/routes", "POST", {}, "routing_key"),
+        ("", "PUT", {"deployment_id": "test"}, "replica"),
+        ("", "PUT", {"replica": {"model": "model"}}, "deployment_id"),
+        ("", "PUT", {"deployment_id": "test", "replica": {}}, "model"),
+    ],
+)
+def test_missing_request_fields_return_400(http_runtime, suffix, method, payload, field):
+    client, _ = http_runtime
+    before = client.status()
+    with pytest.raises(ControlError) as error:
+        request_json(client.endpoint + client.path + suffix, method, payload, token=client.token)
+    assert error.value.status == 400
+    assert field in str(error.value)
+    assert client.status() == before
+
+
+def test_missing_resources_and_expired_leases_still_return_404(http_runtime):
+    client, runtime = http_runtime
+    for path, method, payload in (
+        ("/v1/deployments/missing-deployment", "GET", None),
+        (client.path + "/leases/missing-lease", "PUT", {}),
+    ):
+        with pytest.raises(ControlError) as error:
+            request_json(client.endpoint + path, method, payload, token=client.token)
+        assert error.value.status == 404
+    lease = client.acquire("expires-before-renewal")
+    runtime[1].traffic.clock = lambda: lease.expires_at
+    with pytest.raises(ControlError) as error:
+        client.renew(lease.lease_id)
+    assert error.value.status == 404
+    assert not client.release(lease.lease_id)
+    assert client.status()["inflight"] == 0
+
+
 def test_replicas_api_retains_assignment_after_failure_and_slot_reuse(http_runtime):
     client, runtime = http_runtime
     controller, manager, driver, _ = runtime

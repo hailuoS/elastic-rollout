@@ -14,6 +14,12 @@ from .traffic import NoReadyReplica
 logger = logging.getLogger(__name__)
 
 
+def _require_fields(body: dict, *names: str) -> None:
+    missing = [name for name in names if name not in body]
+    if missing:
+        raise ValueError(f"missing required request fields: {', '.join(missing)}")
+
+
 class ControlHTTPServer(ThreadingHTTPServer):
     """Control server with capacity for concurrent route bursts."""
 
@@ -60,6 +66,7 @@ def make_server(
                 deployment_id = parts[2]
                 tail = parts[3:]
                 if not tail and self.command == "PUT":
+                    _require_fields(body, "deployment_id", "replica")
                     spec = DeploymentSpec.from_dict(body)
                     if spec.deployment_id != deployment_id:
                         raise ValueError("deployment ID in URL and body differ")
@@ -78,10 +85,12 @@ def make_server(
                                 ]
                             }
                     elif tail == ["desired"] and self.command == "PUT":
+                        _require_fields(body, "desired_replicas")
                         result = controller.set_desired_replicas(
                             deployment_id, body["desired_replicas"]
                         )
                     elif tail == ["routes"] and self.command == "POST":
+                        _require_fields(body, "routing_key")
                         result = asdict(manager.traffic.acquire(body["routing_key"]))
                     elif len(tail) == 2 and tail[0] == "leases" and self.command == "DELETE":
                         result = {"released": manager.traffic.release(tail[1])}
@@ -94,7 +103,7 @@ def make_server(
             except NoReadyReplica as exc:
                 self._reply(503, {"error": str(exc)})
             except KeyError as exc:
-                self._reply(404, {"error": f"unknown deployment, lease or missing field: {exc}"})
+                self._reply(404, {"error": f"unknown deployment or lease: {exc}"})
             except (ValueError, TypeError) as exc:
                 self._reply(400, {"error": str(exc)})
             except (BrokenPipeError, ConnectionResetError):
