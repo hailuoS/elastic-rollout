@@ -1,9 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest.mock import Mock
 
 import pytest
 
 from elastic_rollout.api import ReplicaSpec
 from elastic_rollout.api import ReplicaState as S
+from elastic_rollout.runtime import Reconciler
 from elastic_rollout.traffic import NoReadyReplica
 from tests.helpers import ready
 
@@ -172,3 +175,59 @@ def test_validation_and_capacity_exhaustion(runtime):
         runtime[0].reconcile()
     assert runtime[1].status()["ready_replicas"] == 4
     assert "no free" in runtime[1].last_error
+
+
+def test_startup_waits_for_warmup_before_routing(runtime, monkeypatch):
+    controller, manager, driver, _ = runtime
+    monkeypatch.setattr(driver, "warmup", lambda *args: False)
+    controller.reconcile()
+    controller.reconcile()
+    assert {r.state for r in manager.traffic.replicas.values()} == {S.WARMING}
+    with pytest.raises(NoReadyReplica):
+        manager.traffic.acquire("waiting-for-warmup")
+    monkeypatch.setattr(driver, "warmup", lambda *args: True)
+    controller.reconcile()
+    assert manager.status()["ready_replicas"] == 2
+
+
+def test_serving_health_recovers_and_replaces_after_three_consecutive_failures(runtime):
+    controller, manager, driver, _ = runtime
+    traffic = ready(runtime)
+    original = list(traffic.replicas.values())
+    driver.healthy = False
+    controller.reconcile()
+    controller.reconcile()
+    assert all(r.state == S.READY and r.health_failures == 2 for r in original)
+    driver.healthy = True
+    controller.reconcile()
+    assert all(r.health_failures == 0 for r in original)
+    driver.healthy = False
+    for _ in range(3):
+        controller.reconcile()
+    assert all(r.state == S.FAILED and r.resource is None for r in original)
+    driver.healthy = True
+    controller.reconcile()
+    assert manager.status()["ready_replicas"] == 2
+
+
+def test_reconciler_logs_exception_and_continues(caplog):
+    controller = Mock()
+    recovered = Event()
+    error = RuntimeError("transient reconcile failure")
+
+    def reconcile():
+        if controller.reconcile.call_count == 1:
+            raise error
+        recovered.set()
+
+    controller.reconcile.side_effect = reconcile
+    reconciler = Reconciler(controller, interval=0.001)
+    reconciler.start()
+    try:
+        assert recovered.wait(timeout=2)
+    finally:
+        reconciler.stop()
+    records = [r for r in caplog.records if r.name == "elastic_rollout.runtime"]
+    assert len(records) == 1
+    assert records[0].exc_info[1] is error
+    assert "reconcile failed" in records[0].getMessage()

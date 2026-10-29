@@ -105,65 +105,78 @@ class ReplicaManager:
             self.traffic.expire()
             for replica in list(self.traffic.replicas.values()):
                 try:
-                    if replica.state == S.FAILED:
-                        if replica.resource is not None:
-                            self._cleanup(replica)
-                        continue
-                    if replica.state == S.TERMINATED:
-                        continue
-                    if replica.state == S.STOPPING:
-                        self._cleanup(replica)
-                        continue
-                    if not self.driver.alive(replica):
-                        raise RuntimeError("replica process exited")
-                    if replica.state in STARTUP:
-                        if self.clock() - replica.started_at >= self.spec.replica.startup_timeout:
-                            raise TimeoutError("replica startup/health timeout")
-                        if not self.driver.health(replica):
-                            continue
-                        if replica.state == S.STARTING:
-                            # Fixed policy loaded by vLLM at startup; no weight transport.
-                            self._transition(replica, S.SYNCING)
-                            self._transition(replica, S.WARMING)
-                        if self.driver.warmup(replica, self.spec):
-                            self._transition(replica, S.READY)
-                    elif replica.state in (S.READY, S.DRAINING):
-                        replica.health_failures = (
-                            0 if self.driver.health(replica) else replica.health_failures + 1
-                        )
-                        if replica.health_failures >= 3:
-                            raise RuntimeError("replica failed three consecutive health probes")
-                    if replica.state == S.DRAINING and self.clock() >= replica.drain_deadline:
-                        self.traffic.forget_replica(replica.replica_id)
-                        with self.traffic.lock:
-                            no_leases = self.traffic.inflight.get(replica.replica_id, 0) == 0
-                        # TTL expiry alone is not proof that server generation finished.
-                        if no_leases and self.driver.idle(replica):
-                            self._transition(replica, S.QUIESCED)
-                            self._transition(replica, S.STOPPING)
-                            self._cleanup(replica)
+                    self._reconcile_replica(replica)
                 except Exception as exc:
                     self._fail(replica, exc)
+            self._adjust_capacity()
 
-            with self.traffic.lock:
-                live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
-                # Finish one scale direction before applying the newest desired count.
-                if any(r.state in STARTUP + DRAIN for r in live):
-                    return
-                desired = self.desired
-                ready = [r for r in live if r.state == S.READY]
-                excess = len(ready) - desired
-                if excess > 0:
-                    victims = sorted(
-                        ready, key=lambda r: self.traffic.inflight.get(r.replica_id, 0)
-                    )
-                    for replica in victims[:excess]:
-                        replica.drain_deadline = self.clock() + self.spec.drain_grace_period
-                        replica.transition(S.DRAINING)
-                    return
-            for _ in range(max(0, desired - len(ready))):
-                if not self._create():
-                    break
+    def _reconcile_replica(self, replica: ReplicaDescriptor) -> None:
+        """Advance one replica while the caller holds the lifecycle mutation lock."""
+        if replica.state == S.FAILED:
+            if replica.resource is not None:
+                self._cleanup(replica)
+            return
+        if replica.state == S.TERMINATED:
+            return
+        if replica.state == S.STOPPING:
+            self._cleanup(replica)
+            return
+        if not self.driver.alive(replica):
+            raise RuntimeError("replica process exited")
+        if replica.state in STARTUP:
+            self._advance_startup(replica)
+            return
+        if replica.state in (S.READY, S.DRAINING):
+            self._check_serving_health(replica)
+        self._drain_replica(replica)
+
+    def _advance_startup(self, replica: ReplicaDescriptor) -> None:
+        if self.clock() - replica.started_at >= self.spec.replica.startup_timeout:
+            raise TimeoutError("replica startup/health timeout")
+        if not self.driver.health(replica):
+            return
+        if replica.state == S.STARTING:
+            # Fixed policy loaded by vLLM at startup; no weight transport.
+            self._transition(replica, S.SYNCING)
+            self._transition(replica, S.WARMING)
+        if self.driver.warmup(replica, self.spec):
+            self._transition(replica, S.READY)
+
+    def _check_serving_health(self, replica: ReplicaDescriptor) -> None:
+        replica.health_failures = 0 if self.driver.health(replica) else replica.health_failures + 1
+        if replica.health_failures >= 3:
+            raise RuntimeError("replica failed three consecutive health probes")
+
+    def _drain_replica(self, replica: ReplicaDescriptor) -> None:
+        if replica.state != S.DRAINING or self.clock() < replica.drain_deadline:
+            return
+        self.traffic.forget_replica(replica.replica_id)
+        with self.traffic.lock:
+            no_leases = self.traffic.inflight.get(replica.replica_id, 0) == 0
+        # TTL expiry alone is not proof that server generation finished.
+        if no_leases and self.driver.idle(replica):
+            self._transition(replica, S.QUIESCED)
+            self._transition(replica, S.STOPPING)
+            self._cleanup(replica)
+
+    def _adjust_capacity(self) -> None:
+        with self.traffic.lock:
+            live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
+            # Finish one scale direction before applying the newest desired count.
+            if any(r.state in STARTUP + DRAIN for r in live):
+                return
+            desired = self.desired
+            ready = [r for r in live if r.state == S.READY]
+            excess = len(ready) - desired
+            if excess > 0:
+                victims = sorted(ready, key=lambda r: self.traffic.inflight.get(r.replica_id, 0))
+                for replica in victims[:excess]:
+                    replica.drain_deadline = self.clock() + self.spec.drain_grace_period
+                    replica.transition(S.DRAINING)
+                return
+        for _ in range(max(0, desired - len(ready))):
+            if not self._create():
+                break
 
     def status(self) -> dict:
         with self.traffic.lock:
