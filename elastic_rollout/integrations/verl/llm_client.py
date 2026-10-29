@@ -4,13 +4,13 @@ from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
 
 from elastic_rollout.client import ControlClient
-from elastic_rollout.generation import GenerationClient
+from elastic_rollout.integrations.http import AsyncGenerationClient
 
 
 class ElasticLLMClient(LLMServerClient):
     def __init__(self, config, control: ControlClient, model: str, request_timeout: float = 300):
         super().__init__(config=config, load_balancer_handle=None)
-        self.generator = GenerationClient(control, model, request_timeout)
+        self.generator = AsyncGenerationClient(control, model, request_timeout)
 
     async def generate(
         self,

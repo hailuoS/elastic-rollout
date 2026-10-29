@@ -252,7 +252,10 @@ def test_adapter_mid_request_pause_and_deployment_control(areal_adapter, monkeyp
             return completion([10])
         return completion([11], "stop")
 
-    monkeypatch.setattr("elastic_rollout.generation.request_json", generate)
+    async def async_generate(*args):
+        return await asyncio.to_thread(generate, *args)
+
+    monkeypatch.setattr(engine.generator, "request", async_generate)
     request = NS(
         rid="logical",
         input_ids=[1, 2],

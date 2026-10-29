@@ -21,7 +21,7 @@ from areal.utils import logging, stats_tracker
 
 from elastic_rollout.api import nonnegative_int
 from elastic_rollout.client import ControlClient, ControlError
-from elastic_rollout.generation import GenerationClient
+from elastic_rollout.integrations.http import AsyncGenerationClient
 
 from .weight_sync import WeightSyncConfig
 
@@ -93,7 +93,7 @@ class ElasticInferenceEngine(RemoteInfEngine):
         self._version = status.get("policy", {}).get(
             "version", status["spec"]["replica"]["policy_version"]
         )
-        self.generator = GenerationClient(
+        self.generator = AsyncGenerationClient(
             self.control,
             status["spec"]["replica"]["served_model_name"],
             request_timeout=self.config.request_timeout,

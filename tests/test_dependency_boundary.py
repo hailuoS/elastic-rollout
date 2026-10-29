@@ -30,7 +30,7 @@ def test_core_has_no_direct_framework_imports():
                     value = node.args[0]
                     if isinstance(value, ast.Constant) and isinstance(value.value, str):
                         names = [value.value]
-            if any(name.split(".")[0] in {"verl", "areal"} for name in names):
+            if any(name.split(".")[0] in {"verl", "areal", "aiohttp"} for name in names):
                 violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
     assert not violations, violations
 
@@ -51,7 +51,7 @@ from types import SimpleNamespace as NS
 attempts = []
 class DenyFrameworks(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'verl', 'areal'}:
+        if fullname.split('.')[0] in {'verl', 'areal', 'aiohttp'}:
             attempts.append(fullname)
             raise ImportError('framework dependency forbidden in core: ' + fullname)
 sys.meta_path.insert(0, DenyFrameworks())
@@ -75,7 +75,7 @@ for elastic in (False, True):
     status = controller.deployments['d'].status()
     assert status['ready_replicas'] == 1
 assert not attempts, attempts
-assert not any(name.split('.')[0] in {'verl', 'areal'} for name in sys.modules)
+assert not any(name.split('.')[0] in {'verl', 'areal', 'aiohttp'} for name in sys.modules)
 """
     result = subprocess.run(
         [sys.executable, "-c", "MODULES = " + json.dumps(modules) + "\n" + code],

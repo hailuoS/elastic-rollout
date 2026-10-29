@@ -11,7 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 ray = ["ray>=2.40,<3"]
-test = ["pytest>=8", "ruff>=0.9"]
+async-http = ["aiohttp>=3.11,<4"]
+test = ["pytest>=8", "ruff>=0.9", "aiohttp>=3.11,<4"]
 
 [project.scripts]
 elastic-rollout = "elastic_rollout.cli:main"

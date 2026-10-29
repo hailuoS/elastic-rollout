@@ -1,5 +1,7 @@
 # 框架接入
 
+在框架环境安装 `pip install -e '.[async-http]'`。AReaL 和 verl 默认使用共享异步 HTTP 传输，不再让长生成请求占用默认线程池。连接池在同一事件循环的并发生成间复用，最后一个逻辑请求结束后关闭；取消请求仍等待在途请求结束并释放租约。推理请求直连控制器返回的副本 endpoint，不继承环境 HTTP 代理、不跟随重定向，也不自动重试；单请求超时覆盖整个 HTTP 调用。
+
 ## verl
 
 填写 `examples/verl_launch.json`。`deployment.core_template` 相对于 LaunchSpec 文件解析；模型路径、数据、控制器地址、Ray GCS 地址及原生 Hydra overrides 需与实际部署匹配。

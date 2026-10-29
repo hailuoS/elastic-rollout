@@ -71,17 +71,27 @@ def request_json(
 async def complete_on_cancel(awaitable):
     """Finish a bounded I/O call before propagating cancellation.
 
-    A cancelled executor call keeps running. In particular, an acquire may have
+    Repeated cancellation must not cancel the protected operation. A cancelled
+    executor call keeps running. In particular, an acquire may have
     succeeded remotely even when the caller was cancelled before reading its ID.
     """
     task = asyncio.ensure_future(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError as cancelled:
+    cancelled = None
+    while True:
         try:
-            await task
-        finally:
-            raise cancelled
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise cancelled or exc
+            cancelled = cancelled or exc
+        except BaseException:
+            if cancelled is not None:
+                raise cancelled
+            raise
+        else:
+            if cancelled is not None:
+                raise cancelled
+            return result
 
 
 class ControlClient:

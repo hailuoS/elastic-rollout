@@ -12,7 +12,7 @@
 在对应框架及 vLLM 环境中安装本组件：
 
 ```bash
-pip install -e '.[ray]'
+pip install -e '.[ray,async-http]'
 ```
 
 填写 `examples/runtime.elastic.json` 的节点、地址、共享模型路径。默认配置是 NPU/HCCL；GPU 需设置 `replica.accelerator="gpu"`、`replica.weight_sync="nccl"`。
