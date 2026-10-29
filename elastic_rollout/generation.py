@@ -53,6 +53,7 @@ class GenerationClient:
         request_timeout: float = 300,
         max_stalled_aborts: int = 8,
         wait_for_resume: ResumeGate | None = None,
+        request: Callable[[str, str, dict, float], Awaitable[dict]] | None = None,
     ):
         self.control, self.model = control, model
         if type(max_stalled_aborts) is not int or max_stalled_aborts <= 0:
@@ -60,6 +61,11 @@ class GenerationClient:
         self.request_timeout = request_timeout
         self.max_stalled_aborts = max_stalled_aborts
         self.wait_for_resume = wait_for_resume
+        self.request = request if request is not None else self._blocking_request
+
+    @staticmethod
+    async def _blocking_request(*args):
+        return await asyncio.to_thread(request_json, *args)
 
     @asynccontextmanager
     async def _route(self, routing_key: str):
@@ -111,8 +117,7 @@ class GenerationClient:
             )
             async with self._route(routing_key) as lease:
                 response = await complete_on_cancel(
-                    asyncio.to_thread(
-                        request_json,
+                    self.request(
                         lease.endpoint + "/v1/completions",
                         "POST",
                         payload,

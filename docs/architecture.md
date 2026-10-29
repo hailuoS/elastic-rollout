@@ -4,6 +4,8 @@
 
 `runtime.ReplicaManager` 统一管理固定拓扑和弹性拓扑的启动、健康检查、预热、排空、故障处理及策略提交。`scaling.ScalingControl` 只管理弹性意图、指标和缩容试探，不运行另一套副本生命周期。
 
+`GenerationClient` 可通过 `request=` 注入框架侧的异步 JSON 请求函数，签名为 `(url, method, payload, timeout)`。调用方负责 HTTP session 的生命周期；公共层仍负责租约、版本及取消保护，默认传输保持标准库实现，不增加框架或 HTTP 库依赖。
+
 `TrafficManager` 管理路由租约、暂停原因和版本门禁。`GenerationClient` 处理生成与 partial continuation。慢速引擎操作不持有路由锁，生命周期变更和生成控制有独立的串行化边界。
 
 `TransferCoordinator` 管理单个训练到推理通信组。`MultiTransferCoordinator` 在弹性模式下组合基础组和新增副本的独立组，负责 required/optional 成员及退休确认。两者分别是单组原语和多组编排。
