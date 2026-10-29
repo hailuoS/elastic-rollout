@@ -43,7 +43,7 @@ def test_auxiliary_transfer_finishes_before_next_bucket(monkeypatch, backend, de
 
 
 def test_receiver_failure_quarantines_the_slot_and_blocks_sender_ack(elastic):
-    from test_mvp4 import grow, update
+    from helpers_elastic import grow, update
 
     c, m, driver, _ = elastic
     (candidate,) = grow(c, m, 3)

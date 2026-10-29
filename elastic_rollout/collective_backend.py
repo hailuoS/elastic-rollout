@@ -1,10 +1,11 @@
 """Only the device and native weight-transfer engine differ across transports."""
 
+from .transfer_config import validate_backend
+
 
 class CollectiveBackend:
     def __init__(self, name):
-        if name not in ("hccl", "nccl"):
-            raise ValueError("collective backend must be hccl or nccl")
+        validate_backend(name)
         self.name = name
         self.device = "npu" if name == "hccl" else "cuda"
 

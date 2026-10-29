@@ -5,7 +5,11 @@ import os
 import sys
 from contextlib import ExitStack
 
-from examples.areal_agent import AGENT_WORKFLOWS
+AGENT_WORKFLOWS = {
+    "math": "areal.workflow.openai.math_agent.MathAgent",
+    "multi-turn": "areal.workflow.openai.math_agent.MultiTurnMathAgent",
+    "tools": "areal.workflow.openai.math_agent.MathToolAgent",
+}
 
 
 def main(args):

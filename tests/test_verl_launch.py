@@ -13,8 +13,9 @@ from test_runtime import ready
 
 from elastic_rollout import cli
 from elastic_rollout.api import ReplicaState as S
-from elastic_rollout.integrations.verl import launcher, smoke
-from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_mvp2b_verl_config
+from elastic_rollout.integrations.verl import launcher
+from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_verl_config
+from elastic_rollout.launcher import network
 
 
 def test_megatron_launch_uses_native_config_and_rejects_fsdp_overlap(launch_file):
@@ -55,9 +56,9 @@ def test_megatron_real_hydra_preflight(launch_file, monkeypatch, extra, error):
     args = (spec, address, spec.trainer_overrides(address), spec.core_config())
     if error:
         with pytest.raises(ValueError, match=error):
-            validate_mvp2b_verl_config(*args)
+            validate_verl_config(*args)
     else:
-        validate_mvp2b_verl_config(*args)
+        validate_verl_config(*args)
 
 
 @pytest.fixture
@@ -151,7 +152,7 @@ def test_generated_overrides_compose_real_verl_base(launch_file, monkeypatch):
     monkeypatch.syspath_prepend(str(verl_checkout))
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
-    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
+    validate_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatch):
@@ -178,7 +179,7 @@ def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatc
     address = "10.0.0.3:6379"
     overrides = spec.trainer_overrides(address)
     assert any("ElasticPipelineReplayBuffer" in item for item in overrides)
-    validate_mvp2b_verl_config(spec, address, overrides, spec.core_config())
+    validate_verl_config(spec, address, overrides, spec.core_config())
 
 
 def test_model_path_with_spaces_is_quoted_for_real_hydra(launch_file, monkeypatch):
@@ -192,7 +193,7 @@ def test_model_path_with_spaces_is_quoted_for_real_hydra(launch_file, monkeypatc
     _edit_json(launch_file, lambda data: data["model"].update(path=str(renamed)))
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
-    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
+    validate_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 @pytest.mark.parametrize(
@@ -243,7 +244,7 @@ def test_trainer_resource_settings_remain_verl_owned(launch_file, monkeypatch):
     )
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
-    validate_mvp2b_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
+    validate_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 @pytest.mark.parametrize(
@@ -260,9 +261,7 @@ def test_verl_owned_training_values_still_validate(launch_file, monkeypatch, ove
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
     with pytest.raises(ValueError, match=error):
-        validate_mvp2b_verl_config(
-            spec, address, spec.trainer_overrides(address), spec.core_config()
-        )
+        validate_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
 def test_static_slot_and_unknown_endpoint_conflicts_fail(launch_file):
@@ -297,38 +296,13 @@ def test_fixed_verl_base_config_is_not_public(launch_file):
         LaunchSpec.from_file(launch_file)
 
 
-def test_smoke_requires_generation_from_committed_version(launch_file, monkeypatch):
-    spec = LaunchSpec.from_file(launch_file)
-    status = {
-        "serving_policy_version": 1,
-        "serving_ready_for_external_update": True,
-        "spec": {"replica": {"served_model_name": "policy"}},
-    }
-    client = SimpleNamespace(status=lambda: status)
-    core = SimpleNamespace(poll=lambda: None)
-
-    class FakeGenerationClient:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def generate(self, *_args, **_kwargs):
-            return SimpleNamespace(token_ids=[42], versions=[status["serving_policy_version"]])
-
-    monkeypatch.setattr(smoke, "GenerationClient", FakeGenerationClient)
-    report = smoke.probe_generation(client, spec, core, [0], [1, 2])
-    assert report["post_update_token_versions"] == [1]
-    status["serving_policy_version"] = 0
-    with pytest.raises(TimeoutError, match="newer than bootstrap"):
-        smoke.probe_generation(client, replace(spec, startup_timeout_s=0.01), core, [0], [1, 2])
-
-
-def test_smoke_detects_open_rollout_port():
+def test_cleanup_detects_open_rollout_port():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         slot = {"host": "127.0.0.1", "port": listener.getsockname()[1], "slot_id": "r0"}
-        assert not smoke.rollout_ports_closed([slot], timeout=0.01)
-    assert smoke.rollout_ports_closed([slot], timeout=0.01)
+        assert not network.rollout_ports_closed([slot], timeout=0.01)
+    assert network.rollout_ports_closed([slot], timeout=0.01)
 
 
 def test_ready_view_reuses_policy_topology_gate(runtime):
@@ -508,7 +482,7 @@ def test_launcher_supervises_both_children(
     trainer = Child(trainer_exit, 0)
     processes = iter((core, trainer))
     monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+    monkeypatch.setattr(launcher, "validate_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: next(processes))
     monkeypatch.setattr(
         launcher, "_wait_ready", lambda *a: {"serving_policy_version": 0, "ready_replicas": 1}
@@ -519,7 +493,7 @@ def test_launcher_supervises_both_children(
         lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None, setsockopt=lambda *_: None)),
     )
     monkeypatch.setattr(launcher.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
+    monkeypatch.setattr(network, "rollout_ports_closed", lambda *_: True)
     assert launcher.run_launch(launch_file) == expected
     if core_exit is None:
         assert core.terminated
@@ -534,10 +508,10 @@ def test_bootstrap_failure_never_starts_trainer(launch_file, monkeypatch):
     child.pid = 42
     starts = Mock(return_value=child)
     monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+    monkeypatch.setattr(launcher, "validate_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", starts)
     monkeypatch.setattr(launcher, "_wait_ready", Mock(side_effect=TimeoutError("not ready")))
-    monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
+    monkeypatch.setattr(network, "rollout_ports_closed", lambda *_: True)
     monkeypatch.setattr(
         launcher.socket,
         "socket",
@@ -571,7 +545,7 @@ def test_interrupted_launch_reports_cleanup_and_always_stops_core(
         return -15 if child is trainer else 0
 
     monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-    monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+    monkeypatch.setattr(launcher, "validate_verl_config", lambda *_: None)
     monkeypatch.setattr(launcher.subprocess, "Popen", spawn)
     monkeypatch.setattr(launcher, "_stop_child", stop)
     monkeypatch.setattr(
@@ -583,10 +557,10 @@ def test_interrupted_launch_reports_cleanup_and_always_stops_core(
         lambda *_: nullcontext(SimpleNamespace(bind=lambda *_: None, setsockopt=lambda *_: None)),
     )
     port_check = Mock(return_value=ports_closed)
-    monkeypatch.setattr(smoke, "rollout_ports_closed", port_check)
+    monkeypatch.setattr(network, "rollout_ports_closed", port_check)
     original = signal.getsignal(signal.SIGTERM)
     report_path = tmp_path / "run-b.json"
-    code = launcher.run_launch(launch_file, smoke_report=report_path, smoke_prompt_ids=[1, 2])
+    code = launcher.run_launch(launch_file, report_path=report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert events == [102, 101]
     assert code == (143 if ports_closed and not stop_error else 1)
@@ -625,12 +599,12 @@ def test_launch_port_reuses_closed_server_but_rejects_live_listener(launch_file,
         core.poll.return_value, trainer.poll.return_value = None, 0
         starts = Mock(side_effect=[core, trainer])
         monkeypatch.setattr(launcher, "resolve_ray_cluster", lambda *_: "10.0.0.3:6379")
-        monkeypatch.setattr(launcher, "validate_mvp2b_verl_config", lambda *_: None)
+        monkeypatch.setattr(launcher, "validate_verl_config", lambda *_: None)
         monkeypatch.setattr(launcher.subprocess, "Popen", starts)
         monkeypatch.setattr(launcher, "_stop_child", lambda *_: 0)
         monkeypatch.setattr(
             launcher, "_wait_ready", lambda *_: {"serving_policy_version": 0, "ready_replicas": 1}
         )
-        monkeypatch.setattr(smoke, "rollout_ports_closed", lambda *_: True)
+        monkeypatch.setattr(network, "rollout_ports_closed", lambda *_: True)
         assert launcher.run_launch(launch_file) == (1 if live else 0)
         assert starts.call_count == (0 if live else 2)

@@ -14,7 +14,7 @@ from pathlib import Path
 from elastic_rollout.client import ControlClient
 from elastic_rollout.launcher.owned_exec import owned_command
 
-from .launch_spec import LaunchSpec, validate_mvp2b_verl_config
+from .launch_spec import LaunchSpec, validate_verl_config
 
 logger = logging.getLogger(__name__)
 
@@ -135,18 +135,14 @@ def _wait_ready(
     raise TimeoutError(f"Core did not become serving_ready: {last_error}")
 
 
-def run_launch(
-    path: Path, *, smoke_report: Path | None = None, smoke_prompt_ids: list[int] | None = None
-) -> int:
+def run_launch(path: Path, *, report_path: Path | None = None) -> int:
     spec = LaunchSpec.from_file(path)
     core_config = spec.core_config()
     # Resolve and verify every input before spawning either child.
     ray_address = resolve_ray_cluster(spec, core_config)
     core_config = spec.core_config(resolved_ray_address=ray_address)
     trainer_overrides = spec.trainer_overrides(ray_address)
-    validate_mvp2b_verl_config(spec, ray_address, trainer_overrides, core_config)
-    if smoke_report is not None and not smoke_prompt_ids:
-        raise ValueError("--smoke-report requires --smoke-prompt-ids")
+    validate_verl_config(spec, ray_address, trainer_overrides, core_config)
     client = ControlClient(
         spec.endpoint, spec.deployment_id, token=os.environ.get("ELASTIC_ROLLOUT_TOKEN"), timeout=2
     )
@@ -161,7 +157,7 @@ def run_launch(
             "deployment_id": spec.deployment_id,
             "initial_version": spec.initial_version,
         }
-        if smoke_report is not None
+        if report_path is not None
         else None
     )
     interrupted = [0]
@@ -171,7 +167,7 @@ def run_launch(
     failed = False
     core_cleanup_ok = False
     try:
-        with tempfile.TemporaryDirectory(prefix="elastic-rollout-v1-") as temp:
+        with tempfile.TemporaryDirectory(prefix="elastic-rollout-") as temp:
             # An old control server on this endpoint must never satisfy our
             # readiness barrier before the new serve child has bound its port.
             family = socket.AF_INET6 if ":" in spec.bind_host else socket.AF_INET
@@ -242,13 +238,8 @@ def run_launch(
                         failed = True
                     break
                 time.sleep(0.2)
-            if not failed and smoke_report is not None:
-                from .smoke import probe_generation
-
-                report.update(probe_generation(client, spec, core, interrupted, smoke_prompt_ids))
-                report["initial_ready_replicas"] = ready_status["ready_replicas"]
     except (Exception, KeyboardInterrupt):
-        logger.exception("MVP-2B launch failed")
+        logger.exception("verl launch failed")
         failed = True
     finally:
         cleanup_ok = True
@@ -272,7 +263,7 @@ def run_launch(
                 cleanup_ok = False
                 logger.exception("Core termination failed")
             if core is not None:
-                from .smoke import rollout_ports_closed
+                from elastic_rollout.launcher.network import rollout_ports_closed
 
                 try:
                     ports_closed = rollout_ports_closed(core_config["slots"])
@@ -294,8 +285,8 @@ def run_launch(
                 interrupted_signal=interrupted[0],
                 cleanup_success=cleanup_ok,
             )
-    if smoke_report is not None and report is not None:
-        smoke_report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if report_path is not None and report is not None:
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if interrupted[0]:
         return 128 + interrupted[0] if cleanup_ok else 1
     return 1 if failed else 0

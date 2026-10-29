@@ -10,8 +10,8 @@
     "shutdown_timeout_s": 900
   },
   "deployment": {
-    "id": "verl-rollout",
-    "core_template": "verl_v1_core.template.json"
+    "id": "elastic-rollout",
+    "core_template": "runtime.elastic.json"
   },
   "model": {
     "path": "/shared/models/REPLACE_IMMUTABLE_MODEL",
@@ -22,22 +22,22 @@
     "overrides": [
       "data.train_files=/shared/data/REPLACE_TRAIN.parquet",
       "data.val_files=/shared/data/REPLACE_VALIDATION.parquet",
-      "data.train_batch_size=1",
+      "data.train_batch_size=16",
       "trainer.device=npu",
       "trainer.resume_mode=disable",
       "trainer.nnodes=1",
       "trainer.n_gpus_per_node=2",
       "trainer.v1.separate_async.parameter_sync_step=1",
-      "trainer.total_training_steps=3",
+      "trainer.total_training_steps=100",
       "trainer.test_freq=-1",
       "trainer.save_freq=-1",
       "trainer.val_before_train=false",
       "trainer.logger=[console]",
       "actor_rollout_ref.actor.strategy=fsdp2",
-      "actor_rollout_ref.actor.ppo_mini_batch_size=1",
+      "actor_rollout_ref.actor.ppo_mini_batch_size=16",
       "actor_rollout_ref.rollout.name=vllm",
       "actor_rollout_ref.rollout.mode=async",
-      "actor_rollout_ref.rollout.nnodes=1",
+      "actor_rollout_ref.rollout.nnodes=4",
       "actor_rollout_ref.rollout.n_gpus_per_node=2",
       "actor_rollout_ref.rollout.free_cache_engine=false",
       "actor_rollout_ref.rollout.multi_turn.enable=false",

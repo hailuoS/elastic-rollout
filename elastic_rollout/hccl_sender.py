@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from elastic_rollout.client import ControlClient
 from elastic_rollout.collective_backend import CollectiveBackend
+from elastic_rollout.transfer_config import TransferOptions
 from elastic_rollout.weight_transfer import (
     METADATA_LIMIT,
     RECOVERY_REQUIRED,
@@ -68,16 +69,15 @@ class HCCLSender:
         bootstrap_model_path=None,
         backend="hccl",
     ):
-        if type(bucket_size) is not int or bucket_size <= 0:
-            raise ValueError("bucket_size must be positive")
-        if not 256 <= metadata_group_limit_bytes <= METADATA_LIMIT:
-            raise ValueError("metadata_group_limit_bytes must be between 256 and 32768")
-        if (
-            type(packed) is not bool
-            or type(packed_num_buffers) is not int
-            or packed_num_buffers < 1
-        ):
-            raise ValueError("invalid packing options")
+        self.options = TransferOptions(
+            bucket_size,
+            packed,
+            packed_num_buffers,
+            master_address,
+            master_port,
+            backend,
+            metadata_group_limit_bytes,
+        )
         self.control = ControlClient(endpoint, deployment_id, os.getenv("ELASTIC_ROLLOUT_TOKEN"))
         self.backend = CollectiveBackend(backend)
         self.bucket_size, self.is_master = bucket_size, is_master

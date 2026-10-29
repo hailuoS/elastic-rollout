@@ -1,143 +1,65 @@
 # ElasticRollout
 
-## MVP-2B Verl V1 quick start
+独立管理 RL 训练所用的外部 vLLM 推理副本。AReaL、verl 保留原生训练、Agent 和参数导出，公共运行时负责副本生命周期、路由、策略版本事务和弹性扩缩。
 
-Fill in the model, data, Ray node and network values in [the single LaunchSpec](examples/verl_v1_launch.json) and [its Core slot template](examples/verl_v1_core.template.json), then run from the NPU environment:
+- 支持 AReaL / verl FSDP2 和原生 Megatron Bridge 的 dense BF16 权重更新。
+- GPU 使用 NCCL，NPU 使用 HCCL；保留 MindSpeed 路径。
+- 支持手动扩缩、流水线压力驱动的自动扩缩、跨版本 partial rollout。
+- 当前资源来自预先配置的静态 slot 池；平台资源申请和节点扩容尚需接入。
+
+## 安装与启动
+
+在对应框架及 vLLM 环境中安装本组件：
 
 ```bash
-elastic-rollout verl run -c examples/verl_v1_launch.json --smoke-report mvp2b-smoke.json --smoke-prompt-ids 1 2
+pip install -e '.[ray]'
 ```
 
-The launcher resolves one concrete Ray cluster address, validates Core and Verl settings, waits for the stable serving topology, supervises both processes and waits for Core cleanup. See [the integration guide](docs/verl_separate_async.md) and [the final smoke checklist](docs/validation/mvp2b_final_validation.md).
-
-独立的 RL 推理弹性组件：公共运行时管理外部 vLLM 副本，AReaL / verl 保留各自的 workflow、
-AgentLoop 和生成语义。Core 不依赖这两个框架。
-
-## 当前阶段
-
-| 阶段 | 内容 | 状态 |
-| --- | --- | --- |
-| MVP-0 | 固定权重生成、租约路由、手动扩缩容、故障补建、NPU 资源清理 | 已在你的目标环境验证 |
-| MVP-1 | 持久 HF 快照、重启加载、prepare/commit、更新后扩容和补副本追赶新权重 | 已在你的目标环境验证 |
-| **MVP-1.5A** | AReaL Agent Proxy、Proxy 跟随 committed policy、保守磁盘更新 | **当前需要做真机验证** |
-| **MVP-1.5B** | planned abort、跨版本 partial continuation、组合暂停原因 | **用户已在 NPU 环境验证** |
-| MVP-2A | verl 同步 Direct HCCL 权重传输 | 用户已在 NPU 环境验证 |
-| MVP-2B | verl Trainer V1 separate_async + Direct HCCL + partial rollout | 新单入口 Run A 已通过；Run B 关闭清理仍待验收 |
-| MVP-3 | AReaL / verl FSDP2 共用策略事务，支持 HCCL / NCCL | GPU 功能已验证；NPU 验收待补充 |
-| MVP-4 | 不变基础 cohort、动态独立 transport、原生流水线指标与自动扩缩 | 单/双机 GPU FSDP2、数值与退出验证通过；NPU 待补验 |
-| Megatron 接入 | AReaL / verl 原生 Bridge、dense BF16 TP/PP/DP | 双机 GPU 训练、扩缩、数值与退出验证通过；NPU/MindSpeed 路径保留，实机待补验 |
-
-本地 CPU/contract 回归测试不能替代 NPU Agent 和权重更新验收。
-MVP-1 使用共享文件系统和 vLLM 进程重启，不是热加载。AReaL 是首个完整训练接入目标；
-verl 新增 MVP-2A 同步 HCCL 接入，使用独立训练/推理卡；原固定权重生成入口保留。
-
-## MVP-3：AReaL Direct HCCL
-
-GPU 使用 CUDA/NCCL，NPU/HCCL 仍是默认配置。支持 dense BF16 FSDP2、
-训练与推理设备分离、固定 serving 成员；动态扩缩容不属于 MVP-3 Direct 更新路径。
-
-verl 复用 `examples/verl_v1_launch.json`：增加 `runtime.accelerator: "gpu"`，
-将 `trainer.device=npu` 改为 `trainer.device=cuda`。Launcher 会选择 Ray 原生 GPU
-资源、NCCL checkpoint engine 和对应 Core 配置，启动命令不变。
-
-AReaL 的 Core 配置设置 `replica.accelerator: "gpu"`、`replica.weight_sync: "nccl"`，
-训练入口使用 `--weight-sync nccl --master-address <训练 rank0 的可达 IP>`，或传入
-`NCCLWeightSyncConfig(master_address=...)`。`RAY_ADDRESS` 应指向同一专属集群。
-训练与 serving 使用不同 Python 环境时，设置 `VLLM_NCCL_SO_PATH` 为 serving 环境的
-NCCL 库路径，并传入训练 worker 的环境；权重通信两端必须使用兼容的 NCCL 库。
-
-RTX 5090 已验证 serving/verl 使用 vLLM 0.23.0、torch 2.11.0+cu130；AReaL trainer
-使用其 vLLM 依赖基线 0.19.1、torch 2.10.0+cu128。5090 的 vLLM 参数可选择
-`--attention-config '{"backend":"TRITON_ATTN"}' --enforce-eager`；消费卡验证配置使用
-`NCCL_P2P_DISABLE=1`、`VLLM_USE_FLASHINFER_SAMPLER=0`。
-这里的功能验证不代表大模型性能或长时间稳定性验证。
-AReaL 的 Agent/Proxy 依赖应按其 `uv.vllm.lock` 配套安装，避免混装不同版本的
-OpenAI SDK、Agents SDK 和 LiteLLM。
-
-Linux Launcher 的 Core/Trainer 子进程设置父进程死亡通知：Launcher 被 SIGKILL 后，
-子进程仍会收到 SIGTERM 并执行自己的清理。正常 SIGTERM 保持先停止 Trainer、再停止
-Core 的顺序；进程内存状态和训练恢复不在支持范围内。
-
-[MVP-3 中文真机操作手册](docs/mvp3-npu-validation-zh.md) 固定测试提交 `1aad77f`，
-包含独立测试目录、AReaL/verl 命令、故障清理检查和验收记录表。
-
-[MVP-4 配置与验收指南](docs/mvp4-validation.md) 说明 `elastic_scaling=true`、
-独立 autoscale 命令、通信组销毁确认、手动模式和当前未闭环的验收项。
-真实 5090、batch 16、输入 1K/输出 2K 的结果见
-[GPU 验收记录](docs/mvp4-gpu-validation.md)，Ascend 操作步骤见
-[NPU 补充验收手册](docs/mvp4-npu-supplement-zh.md)。
-
-[MVP-3 接入与验收指南](docs/mvp3-validation.md) 包含 Core 配置、AReaL 启动方式、
-支持边界和 NPU 验收清单。`ElasticPPOTrainer` 默认保留快照更新；传入
-`HCCLWeightSyncConfig(master_address=...)` 可启用共享 Direct HCCL 路径，
-并将 AReaL `actor.weight_update_mode` 配为 `xccl`。现有 Agent 训练示例新增
-`--weight-sync hccl --hccl-master-address ...`。
-
-## 验证 MVP-2A
-
-**[MVP-2A 验证指南](docs/mvp2a-validation.md)**：依次运行原生 HCCL、Core 手工 sender、
-verl FSDP2 单/双副本和同步多步训练。此入口不包含 MVP-2B async partial rollout。
-
-**[MVP-2B Trainer V1 验证指南](docs/mvp2b-v1-validation.md)**：既有运行时验证记录；新单入口的验收步骤见[最终清单](docs/validation/mvp2b_final_validation.md)。
-
-> 示例中的 `deployment_id: "mvp0"` 只是部署名称。使用该名称的现有部署也可以验证 MVP-1，
-> 不需要为了阶段名称改动已经跑通的配置。
-
-## 现在验证 MVP-1.5B，从这里开始
-
-**[打开 MVP-1.5B 实现与验收报告](docs/mvp15b-validation.md)**：先验证 stock vLLM abort/resume，
-再验证跨版本 continuation，最后运行真实 AReaL RLVR / Agent 训练。
-报告包含 Rev2 逐项核对、并发语义、自动化测试和待真机确认的边界。
-
-Serving 基线为 **vLLM / vLLM-Ascend 0.23.x**。最新暂停排空语义、180 秒控制 RPC、
-迟到请求与 AcquireRoute 竞态修复见 [1.5B Hardening 报告](docs/mvp15b-hardening.md)。
-
-### MVP-1.5A Agent 基线回归
-
-**[打开 MVP-1.5A 验证手册](docs/mvp15a-validation.md)**，按阶段进行：
-
-1. **固定权重 Agent**：验证单轮、多轮、工具调用、trajectory 导出及 2→4→2 扩缩容。
-2. **真实训练更新**：Agent v0 → 训练与持久快照 → drain/restart/commit → Proxy 跟随 v1。
-3. **故障补建回归**：确认最新策略副本恢复后 Agent 仍可工作。
-
-1.5A 手册保留原阶段基线；当前代码在训练更新时已经接入 1.5B planned abort，按新手册检查续接。
-
-| 文档 | 何时阅读 |
-| --- | --- |
-| [Megatron 后端接入](docs/megatron-backends.md) | 原生 Bridge、源码补丁、GPU 验收进度与 NPU/MindSpeed 边界 |
-| [MVP-1.5B 实现与验收报告](docs/mvp15b-validation.md) | 当前入口：planned abort、跨版本续接、Rev2 核对 |
-| [MVP-1.5A 验证手册](docs/mvp15a-validation.md) | Agent/Proxy 基线回归 |
-| [MVP-1 验证手册](docs/mvp1-validation.md) | 已验收的权重同步基线与回归 |
-| [MVP-1 行为与配置参考](docs/mvp1-reference.md) | 查询状态机、HTTP API、超时和 AReaL 磁盘契约 |
-| [MVP-0 已验证基线](docs/mvp0-baseline.md) | 重建基础环境、查询 Ray/NPU 配置或回归固定权重生成 |
-
-## 代码入口
-
-- [runtime.py](elastic_rollout/runtime.py)：副本生命周期、策略更新与故障处理。
-- [ElasticPPOTrainer](elastic_rollout/integrations/areal/trainer.py)：AReaL 完整训练接入。
-- [areal_agent.py](examples/areal_agent.py)：固定权重 Agent Proxy 真机验证。
-- [areal_agent_train.py](examples/areal_agent_train.py)：原生 Math Agent 的 Elastic 训练入口。
-- [policy_update_smoke.py](examples/policy_update_smoke.py)：MVP-1 Core 真机验证工具。
-- [partial_rollout_smoke.py](examples/partial_rollout_smoke.py)：中断、恢复和跨版本续接验收。
-- [单机 TP2 配置](examples/runtime.single-node-tp2.json)：单台 8-NPU、最多四个 TP2 副本。
-
-## 本地开发检查
+填写 `examples/runtime.elastic.json` 的节点、地址、共享模型路径。默认配置是 NPU/HCCL；GPU 需设置 `replica.accelerator="gpu"`、`replica.weight_sync="nccl"`。
 
 ```bash
-uv pip install -e '.[test]'
+elastic-rollout serve --config examples/runtime.elastic.json --host 0.0.0.0 --ray-address <GCS地址>
+elastic-rollout status --endpoint http://<控制器>:8080 --deployment elastic-rollout
+elastic-rollout scale --endpoint http://<控制器>:8080 --deployment elastic-rollout 3 --wait
+```
+
+verl 可使用一个入口启动并监督 Core 和 Trainer：
+
+```bash
+elastic-rollout verl run -c examples/verl_launch.json --report run.json
+```
+
+AReaL 的训练入口是 `examples/areal_agent_train.py`，详见[框架接入](docs/integrations.md)。
+
+## 自动扩缩
+
+```bash
+elastic-rollout autoscale --endpoint http://<控制器>:8080 --deployment elastic-rollout --config examples/autoscaling.json --once
+```
+
+默认仅给出建议。正式启用前，在配置中启用 `pipeline_enabled`，确保训练适配器持续发布有效流水线指标，再加 `--activate` 启动控制循环。手动设置 desired 会切回 MANUAL 模式。
+
+## 使用边界
+
+弹性模式保留初始基础副本组，新增副本使用独立持久通信组。新副本完成当前策略同步后才加入路由；缩容必须确认通信组退出后才释放资源。基础副本数是最小容量，无法通过弹性接口缩到更低。
+
+固定拓扑模式仍支持共享快照重启加载和 Direct 更新；弹性模式要求 Direct HCCL/NCCL。控制状态保存在单个控制器进程内，控制器故障恢复和训练断点恢复尚未实现。
+
+此前 GPU 基线已验证双机 Megatron TP2/PP2/DP2、40 次更新、手动/自动扩缩及同版本冷加载数值对齐。NPU/MindSpeed 路径保留，新增 Megatron 和弹性组合仍需 NPU 实机补验。该基线不代表本次重构已完成同规模 GPU 复验。
+
+## 代码与验证
+
+- `elastic_rollout/`：公共运行时、权重传输、框架适配器。
+- `patches/megatron/`：原生框架兼容补丁。
+- `examples/`：最小运行配置和 AReaL 训练入口。
+- `tests/`：生命周期、事务、传输、生成、框架契约回归。
+
+```bash
+pip install -e '.[test]'
 python -m pytest -q
-ruff check .
-ruff format --check .
+python -m ruff check elastic_rollout tests examples
 ```
 
-测试覆盖 Core、HTTP、资源管理及 AReaL/verl contract；框架 contract 测试使用相邻目标分支源码，
-以 stub 隔离 torch/Ray 等依赖。真实集群测试默认跳过。
+历史阶段报告和一次性验收程序不再随当前源码发布，可从 Git 历史恢复。
 
-## 当前边界
-
-- 单 Controller、内存状态；无 Controller 重启恢复、自动回滚或快照 GC。
-- 单个推理副本只跨一个节点，TP 固定、PP=1；训练与推理必须使用独占设备。
-- 默认固定拓扑；显式 `elastic_scaling=true` 启用已有 slots 内的手动/自动扩缩。
-- AReaL/verl 支持 dense BF16 FSDP2 和 Megatron；动态 transport 已在 GPU/NCCL 验证，NPU/HCCL 待补验。
-- LoRA、多模态不在当前外部训练接入范围。
-- 更新失败保持路由关闭，停止失败的资源保持隔离，需显式关闭和人工恢复。
+[架构与不变量](docs/architecture.md) · [配置与运行](docs/configuration.md) · [框架接入](docs/integrations.md)

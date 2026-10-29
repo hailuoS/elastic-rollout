@@ -1,14 +1,22 @@
-"""Planned-abort acceptance on a dedicated deployment, optionally across a policy update."""
+"""HTTP continuation scenario shared by core behavioral tests."""
 
-import argparse
 import asyncio
-import json
-import os
+import time
 from collections import Counter
 
-from elastic_rollout.client import ControlClient
+from elastic_rollout.client import ControlClient, ControlError
 from elastic_rollout.generation import GenerationClient
-from examples.policy_update_smoke import stable_call
+
+
+def stable_call(call, timeout=900):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return call()
+        except ControlError as exc:
+            if exc.status != 409 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
 
 
 async def run(
@@ -115,41 +123,3 @@ async def run(
         waiter.cancel()
         task.cancel()
         await asyncio.gather(task, waiter, return_exceptions=True)
-        # On failure leave admission gates intact for diagnosis; never auto-commit.
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--deployment", required=True)
-    parser.add_argument("--prompt-ids", required=True, help="JSON token ID array")
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--abort-after", type=float, default=1)
-    parser.add_argument("--snapshot")
-    parser.add_argument("--version", type=int)
-    args = parser.parse_args()
-    control = ControlClient(
-        args.endpoint,
-        args.deployment,
-        os.environ.get("ELASTIC_ROLLOUT_TOKEN"),
-        timeout=180,
-    )
-    print(
-        json.dumps(
-            asyncio.run(
-                run(
-                    control,
-                    json.loads(args.prompt_ids),
-                    max_tokens=args.max_tokens,
-                    abort_after=args.abort_after,
-                    snapshot=args.snapshot,
-                    version=args.version,
-                )
-            ),
-            indent=2,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

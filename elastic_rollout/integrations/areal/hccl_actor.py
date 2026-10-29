@@ -14,6 +14,7 @@ from areal.utils.offload import torch_memory_saver
 
 from elastic_rollout.api import nonnegative_int
 from elastic_rollout.client import ControlClient
+from elastic_rollout.export import synchronize_manifest
 from elastic_rollout.hccl_sender import HCCLSender
 from elastic_rollout.weight_sync import ElasticWeightSync
 
@@ -121,13 +122,7 @@ class ElasticHCCLActorMixin:
             return getattr(self._elastic_sender, method)(**kwargs)
 
     def _synchronize_bucket(self, error, manifest):
-        values = [None] * dist.get_world_size(group=self.cpu_group)
-        dist.all_gather_object(values, {"error": error, "manifest": manifest}, group=self.cpu_group)
-        errors = [value["error"] for value in values if value["error"]]
-        if errors:
-            raise RuntimeError(f"distributed HCCL export failed: {errors}")
-        if any(value["manifest"] != values[0]["manifest"] for value in values):
-            raise RuntimeError("training ranks produced different HCCL weight manifests")
+        synchronize_manifest(dist, self.cpu_group, error, manifest)
 
     @torch.no_grad()
     def elastic_hccl_send(self, meta):

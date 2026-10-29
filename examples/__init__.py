@@ -1,1 +1,1 @@
-"""Runnable smoke tests; framework selection belongs here, outside the runtime."""
+"""Minimal supported training example and configuration templates."""

@@ -4,7 +4,7 @@ from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
-from test_mvp4 import grow, update
+from helpers_elastic import grow, update
 from test_pipeline_scaling import publish
 
 from elastic_rollout.api import ReplicaState as S

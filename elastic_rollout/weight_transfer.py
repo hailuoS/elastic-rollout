@@ -12,9 +12,9 @@ from uuid import uuid4
 
 from .api import PolicyUpdateState as U
 from .api import ReplicaState as S
+from .transfer_config import METADATA_LIMIT, validate_rendezvous
 
 logger = logging.getLogger(__name__)
-METADATA_LIMIT = 32768
 RECOVERY_REQUIRED = (
     "persistent HCCL sender/topology changed or transport poisoned; "
     "restart the HCCL deployment/trainer from a clean bootstrap"
@@ -166,7 +166,7 @@ class TransferCoordinator:
             self.session.state, self.session.error = "FAILED", error
 
     def _check(self, update_id):
-        from .runtime import PolicyConflict
+        from .state import PolicyConflict
 
         m = self.manager
         u = m.policy_update
@@ -213,7 +213,7 @@ class TransferCoordinator:
                 future.cancel()  # Running daemon calls are abandoned, not joined.
 
     def execute(self, update_id, action, body):
-        from .runtime import PolicyConflict
+        from .state import PolicyConflict
 
         m = self.manager
         if action == "fail":
@@ -236,14 +236,8 @@ class TransferCoordinator:
                         raise PolicyConflict("transfer session already exists")
                     if body.get("backend") != m.spec.replica.weight_sync:
                         raise ValueError("backend must match deployment weight_sync")
-                    if (
-                        not isinstance(body.get("master_address"), str)
-                        or not body["master_address"]
-                    ):
-                        raise ValueError("master_address required")
                     port = body.get("master_port")
-                    if type(port) is not int or not 1 <= port <= 65535:
-                        raise ValueError("invalid master_port")
+                    validate_rendezvous(body.get("master_address"), port, required=True)
                     if (
                         not isinstance(body.get("sender_instance_id"), str)
                         or not body["sender_instance_id"]

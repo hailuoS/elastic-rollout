@@ -231,7 +231,7 @@ class LaunchSpec:
         return overrides
 
 
-def validate_mvp2b_verl_config(
+def validate_verl_config(
     spec: LaunchSpec, ray_address: str, overrides: list[str], core: dict
 ) -> None:
     """Compose stock Verl and check integration plus supported training invariants."""

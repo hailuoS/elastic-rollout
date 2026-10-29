@@ -15,7 +15,7 @@ from .server import make_server
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ElasticRollout MVP-0 control plane")
+    parser = argparse.ArgumentParser(description="ElasticRollout control plane")
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve")
     serve.add_argument("--config", type=Path, required=True)
@@ -24,18 +24,19 @@ def main() -> None:
     serve.add_argument("--ray-address", default="auto")
     serve.add_argument("--expected-gcs-address")
     serve.add_argument("--shutdown-timeout", type=float, default=900)
-    autoscale = sub.add_parser("autoscale", help="MVP-4 pressure controller (advisory by default)")
+    autoscale = sub.add_parser(
+        "autoscale", help="Pipeline pressure controller (advisory by default)"
+    )
     autoscale.add_argument("--endpoint", required=True)
     autoscale.add_argument("--deployment", required=True)
     autoscale.add_argument("--config", type=Path)
     autoscale.add_argument("--once", action="store_true")
     autoscale.add_argument("--activate", action="store_true")
-    verl = sub.add_parser("verl", help="MVP-2B V1 separate_async integration")
+    verl = sub.add_parser("verl", help="verl separate_async integration")
     verl_sub = verl.add_subparsers(dest="verl_command", required=True)
     run = verl_sub.add_parser("run")
     run.add_argument("-c", "--config", type=Path, required=True)
-    run.add_argument("--smoke-report", type=Path)
-    run.add_argument("--smoke-prompt-ids", type=int, nargs="+")
+    run.add_argument("--report", type=Path, help="Write process and cleanup results as JSON")
     for command in ("status", "scale"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--endpoint", required=True)
@@ -51,8 +52,7 @@ def main() -> None:
         raise SystemExit(
             run_launch(
                 args.config,
-                smoke_report=args.smoke_report,
-                smoke_prompt_ids=args.smoke_prompt_ids,
+                report_path=args.report,
             )
         )
     token = os.environ.get("ELASTIC_ROLLOUT_TOKEN")

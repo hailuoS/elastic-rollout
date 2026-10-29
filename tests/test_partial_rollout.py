@@ -313,7 +313,7 @@ def test_adapter_mid_request_pause_and_deployment_control(areal_adapter, monkeyp
 def test_smoke_uses_real_http_abort_resume_and_continuation(
     http_runtime, monkeypatch, update_policy
 ):
-    from examples.partial_rollout_smoke import run
+    from helpers_continuation import run
 
     client, runtime = http_runtime
     aborted = threading.Event()

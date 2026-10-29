@@ -14,34 +14,27 @@ from .api import (
     PolicyUpdateDescriptor,
     PolicyUpdateState,
     ReplicaDescriptor,
-    ReplicaState,
     nonnegative_int,
 )
 from .api import (
     PolicyPreparationKind as K,
 )
 from .resource import NoCapacity, StaticResourceProvider
+from .scaling import ScalingControl
+from .state import (
+    DRAIN,
+    STARTUP,
+    TERMINAL,
+    ElasticTopologyNotReady,
+    GenerationControlTimeout,
+    PolicyConflict,
+    S,
+    U,
+)
 from .traffic import TrafficManager
 from .weight_transfer import RECOVERY_REQUIRED, WeightTransferControl
 
 logger = logging.getLogger(__name__)
-S = ReplicaState
-STARTUP = (S.ALLOCATED, S.STARTING, S.SYNCING, S.WARMING)
-DRAIN = (S.DRAINING, S.QUIESCED, S.STOPPING)
-TERMINAL = (S.FAILED, S.TERMINATED)
-U = PolicyUpdateState
-
-
-class PolicyConflict(RuntimeError):
-    pass
-
-
-class ElasticTopologyNotReady(PolicyConflict):
-    code = "ELASTIC_TOPOLOGY_NOT_READY"
-
-
-class GenerationControlTimeout(TimeoutError):
-    pass
 
 
 class ServiceDriver(Protocol):
@@ -58,7 +51,7 @@ class ServiceDriver(Protocol):
     def resume_generation(self, replica: ReplicaDescriptor, *, timeout: float = 30) -> None: ...
 
 
-class ReplicaManager:
+class ReplicaManager(ScalingControl):
     def __init__(
         self,
         spec: DeploymentSpec,
@@ -85,12 +78,32 @@ class ReplicaManager:
         self.committed_policy = PolicySnapshot(spec.replica.policy_version, spec.replica.model)
         self.bootstrap_snapshot = self.committed_policy
         self.serving_policy_version = spec.replica.policy_version
+        from .multi_transfer import MultiTransferCoordinator
         from .weight_transfer import TransferCoordinator
 
-        self.transfer = TransferCoordinator(self)
+        self.transfer = (
+            MultiTransferCoordinator(self) if spec.elastic_scaling else TransferCoordinator(self)
+        )
         self.policy_update: PolicyUpdateDescriptor | None = None
         self.policy_updates: dict[str, PolicyUpdateDescriptor] = {}
         self.closing = False
+
+        self.base_count = spec.desired_replicas
+        self.base_ids = []
+        self.transaction_owned = False
+        self.scaling_mode = "MANUAL"
+        self.scaling_revision = 0
+        self.scale_failures = 0
+        self.scale_in_after = 0.0
+        self.policy_priority = False
+        self.workload_signal = None
+        self.pipeline_signal = None
+        self.pipeline_run = None
+        self.trial = None
+        self.last_trial = None
+        from .autoscaling import AutoscalingConfig
+
+        self.policy_config = AutoscalingConfig()
 
     @contextmanager
     def _control_mutation(self):
@@ -117,6 +130,16 @@ class ReplicaManager:
         Call with traffic.lock held. Begin additionally serializes mutations and
         checks the requested update kind and target version.
         """
+        if self.spec.elastic_scaling:
+            return (
+                not self._update_blocks_topology()
+                and not self.transfer.poisoned
+                and len(self.base_ids) == self.base_count
+                and all(self.traffic.replicas[rid].state == S.READY for rid in self.base_ids)
+                and not any(r.state in (S.DRAINING, S.RETIRE_PENDING, S.STOPPING) for r in replicas)
+                and not any(r.state == S.FAILED and r.resource for r in replicas)
+            )
+
         return (
             not self._update_blocks_topology()
             and self.desired > 0
@@ -125,8 +148,10 @@ class ReplicaManager:
             and sum(r.state == S.READY for r in replicas) == self.desired
         )
 
-    def set_desired(self, count: int) -> dict:
-        # Preserve MVP-0 desired-state changes during normal reconciliation.
+    def set_desired(self, count: int, *, automatic=False, revision=None) -> dict:
+        if self.spec.elastic_scaling:
+            return self._set_elastic_desired(count, automatic=automatic, revision=revision)
+        # Preserve fixed-topology desired-state changes during normal reconciliation.
         # Begin/commit also hold this lock, so the policy gate is atomic here.
         with self.traffic.lock:
             if self.spec.replica.weight_sync in ("hccl", "nccl") and count != self.desired:
@@ -264,6 +289,8 @@ class ReplicaManager:
         target_version: int | None = None,
     ) -> dict:
         kind = K(preparation_kind)
+        if self.spec.elastic_scaling and kind == K.SNAPSHOT_RESTART:
+            raise ValueError("elastic scaling requires external collective updates")
         if kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL):
             nonnegative_int(target_version, "target_version")
             if kind.value != "EXTERNAL_" + self.spec.replica.weight_sync.upper():
@@ -314,6 +341,25 @@ class ReplicaManager:
             self.policy_update = update
             if kind in (K.EXTERNAL_HCCL, K.EXTERNAL_NCCL):
                 self.transfer.session = None
+            if self.spec.elastic_scaling:
+                update.optional_replica_ids = tuple(
+                    r.replica_id
+                    for r in self.traffic.replicas.values()
+                    if r.state == S.JOIN_PENDING and not r.cancel_requested
+                )
+                update.transport_plan = [
+                    {"transport_key": "base", "replica_ids": list(self.base_ids), "optional": False}
+                ]
+                for rid in update.target_replica_ids + update.optional_replica_ids:
+                    if rid not in self.base_ids:
+                        update.transport_plan.append(
+                            {
+                                "transport_key": rid,
+                                "replica_ids": [rid],
+                                "optional": rid in update.optional_replica_ids,
+                            }
+                        )
+                self.transaction_owned = True
             self.policy_updates[update.update_id] = update
             self.traffic.pause_routes("policy_update")
             logger.info("policy update %s requested; routing paused", update.update_id)
@@ -339,7 +385,28 @@ class ReplicaManager:
             if self._external_update():
                 if policy_version != update.target_version:
                     raise ValueError("commit version must equal bound target_version")
-                if set(r.replica_id for r in live) != set(update.target_replica_ids) or any(
+                if self.spec.elastic_scaling:
+                    live = [self.traffic.replicas[rid] for rid in update.target_replica_ids]
+                    if any(
+                        key in self.transfer.children for key in self.transfer.optional_failures
+                    ):
+                        raise PolicyConflict(
+                            "failed optional sender must acknowledge isolation before commit"
+                        )
+                    if any(
+                        r.state != S.READY or r.loaded_policy_version != policy_version
+                        for r in live
+                    ):
+                        raise PolicyConflict("required target has not loaded policy")
+                    live += [
+                        r
+                        for rid in update.optional_replica_ids
+                        if (r := self.traffic.replicas[rid]).state == S.JOIN_PENDING
+                        and not r.cancel_requested
+                        and r.prepared_update_id == update_id
+                        and r.prepared_policy_version == policy_version
+                    ]
+                elif set(r.replica_id for r in live) != set(update.target_replica_ids) or any(
                     r.state != S.READY or r.loaded_policy_version != policy_version for r in live
                 ):
                     raise PolicyConflict("frozen targets must all have loaded target_version")
@@ -354,8 +421,11 @@ class ReplicaManager:
                 policy_version, self.bootstrap_snapshot.model_path
             )
             for replica in live:
+                if replica.state == S.JOIN_PENDING:
+                    self._transition(replica, S.READY)
                 replica.serving_policy_version = policy_version
                 replica.loaded_policy_version = policy_version
+            self.policy_priority = False
             self.traffic.sticky.clear()
             update.committed_version = policy_version
             self._update_transition(U.COMMITTED)
@@ -464,13 +534,53 @@ class ReplicaManager:
             except Exception as exc:
                 self._fail(replica, exc)
 
-    def _transition(self, replica: ReplicaDescriptor, state: ReplicaState) -> None:
+    def _transition(self, replica: ReplicaDescriptor, state: S) -> None:
         with self.traffic.lock:
             if state in (S.STARTING, S.READY):
                 self._generation_pause_verified = False
             replica.transition(state)
 
+    def reconcile(self):
+        with self.generation_lock, self.mutation_lock:
+            self.traffic.expire()
+            if self.spec.elastic_scaling:
+                with self.traffic.lock:
+                    if self.trial and (
+                        self.closing
+                        or self.clock() >= self.trial["deadline_at"]
+                        or not self.pipeline_signal
+                        or self.clock() - self.pipeline_signal["observed_at"]
+                        > self.policy_config.sample_ttl_s
+                    ):
+                        self._cancel_trial("trial deadline or reporter heartbeat lost")
+                self.transfer.maintenance()
+                if self._check_update_deadline() and not self.closing:
+                    return
+                if self.transaction_owned and not self.closing:
+                    return
+            elif self._update_blocks_topology() and not self.closing:
+                if self._check_update_deadline():
+                    return
+                if self.policy_update.state == U.REQUESTED and not self._external_update():
+                    self._update_transition(U.QUIESCING)
+            for replica in list(self.traffic.replicas.values()):
+                if not self.spec.elastic_scaling and self._check_update_deadline():
+                    return
+                try:
+                    self._reconcile_replica(replica)
+                except Exception as exc:
+                    self._fail(replica, exc)
+            if self.spec.elastic_scaling:
+                self._reconcile_elastic_capacity()
+            else:
+                self._reconcile_fixed_capacity()
+
     def _cleanup(self, replica: ReplicaDescriptor) -> None:
+        if self.spec.elastic_scaling and not replica.is_base and not self.closing:
+            if self.transaction_owned:
+                return
+            if replica.state != S.STOPPING and self.transfer.request_retirement(replica):
+                return
         # A failed stop quarantines its slot. Never reuse possibly occupied devices.
         try:
             self.driver.stop(replica)
@@ -485,6 +595,8 @@ class ReplicaManager:
             self._transition(replica, S.TERMINATED)
 
     def _fail(self, replica: ReplicaDescriptor, error: Exception) -> None:
+        if self.spec.elastic_scaling and not replica.is_base and replica.state not in TERMINAL:
+            self.scale_failures += 1
         update = self.policy_update
         if (
             self._external_update()
@@ -569,110 +681,16 @@ class ReplicaManager:
             self.driver.start(replica, self._effective_spec(model_path))
         except Exception as exc:
             self._fail(replica, exc)
+        if self.spec.elastic_scaling and len(self.base_ids) < self.base_count:
+            replica.is_base = True
+            self.base_ids.append(replica.replica_id)
         return True
-
-    def reconcile(self) -> None:
-        # A deployment has only one lifecycle mutation in progress. API handlers
-        # merely change desired state; they never create/destroy processes.
-        with self.generation_lock, self.mutation_lock:
-            self.traffic.expire()
-            if self._update_blocks_topology() and not self.closing:
-                if self._check_update_deadline():
-                    return
-                if self.policy_update.state == U.REQUESTED and not self._external_update():
-                    self._update_transition(U.QUIESCING)
-            for replica in list(self.traffic.replicas.values()):
-                if self._check_update_deadline():
-                    return
-                try:
-                    if replica.state == S.FAILED:
-                        if replica.resource is not None:
-                            self._cleanup(replica)
-                        continue
-                    if replica.state == S.TERMINATED:
-                        continue
-                    if replica.state == S.STOPPING:
-                        self._cleanup(replica)
-                        continue
-                    if self.closing and replica.state in STARTUP:
-                        # Startup replicas have never admitted generation. Waiting
-                        # for their health/warmup can outlive the shutdown deadline.
-                        self._transition(replica, S.STOPPING)
-                        self._cleanup(replica)
-                        continue
-                    if not self.driver.alive(replica):
-                        raise RuntimeError("replica process exited")
-                    if replica.state in STARTUP:
-                        if self.clock() - replica.started_at >= self.spec.replica.startup_timeout:
-                            raise TimeoutError("replica startup/health timeout")
-                        if not self.driver.health(replica):
-                            continue
-                        if replica.state == S.STARTING:
-                            # Model artifact is loaded by vLLM at process startup.
-                            self._transition(replica, S.SYNCING)
-                            self._transition(replica, S.WARMING)
-                        if self.driver.warmup(
-                            replica, self._effective_spec(replica.loaded_model_path)
-                        ):
-                            self._transition(replica, S.READY)
-                            logger.info(
-                                "%s replica %s READY from %s",
-                                "candidate" if self._update_blocks_topology() else "committed",
-                                replica.replica_id,
-                                replica.loaded_model_path,
-                            )
-                    elif replica.state in (S.READY, S.DRAINING):
-                        replica.health_failures = (
-                            0 if self.driver.health(replica) else replica.health_failures + 1
-                        )
-                        if replica.health_failures >= 3:
-                            raise RuntimeError("replica failed three consecutive health probes")
-                    if replica.state == S.DRAINING and self.clock() >= replica.drain_deadline:
-                        self.traffic.forget_replica(replica.replica_id)
-                        with self.traffic.lock:
-                            no_leases = self.traffic.inflight.get(replica.replica_id, 0) == 0
-                        # TTL expiry alone is not proof that server generation finished.
-                        if no_leases and self.driver.idle(replica):
-                            self._transition(replica, S.QUIESCED)
-                            self._transition(replica, S.STOPPING)
-                            self._cleanup(replica)
-                except Exception as exc:
-                    self._fail(replica, exc)
-
-            if self._update_blocks_topology() and not self.closing:
-                if self._check_update_deadline():
-                    return
-                try:
-                    self._reconcile_policy()
-                except Exception as exc:
-                    self._fail_update(exc)
-                return
-
-            with self.traffic.lock:
-                live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
-                # Finish one scale direction before applying the newest desired count.
-                if any(r.state in STARTUP + DRAIN for r in live):
-                    return
-                desired = self.desired
-                ready = [r for r in live if r.state == S.READY]
-                excess = len(ready) - desired
-                if excess > 0:
-                    victims = sorted(
-                        ready, key=lambda r: self.traffic.inflight.get(r.replica_id, 0)
-                    )
-                    for replica in victims[:excess]:
-                        replica.drain_deadline = self.clock() + self.spec.drain_grace_period
-                        replica.transition(S.DRAINING)
-                    return
-            for _ in range(max(0, desired - len(ready))):
-                if not self._create():
-                    break
 
     def status(self) -> dict:
         with self.traffic.lock:
             self.traffic.expire()
             replicas = list(self.traffic.replicas.values())
-            return {
+            result = {
                 "spec": asdict(self.spec),
                 "policy": asdict(self.committed_policy),
                 "serving_policy_version": self.serving_policy_version,
@@ -706,6 +724,135 @@ class ReplicaManager:
                 "last_error": self.last_error,
             }
 
+            return self._scaling_status(result) if self.spec.elastic_scaling else result
+
+    def _reconcile_replica(self, r):
+        elastic = self.spec.elastic_scaling
+        if r.state == S.TERMINATED:
+            return
+        if r.state in (S.FAILED, S.STOPPING):
+            if r.resource or r.state == S.STOPPING:
+                self._cleanup(r)
+            return
+        if r.state == S.RETIRE_PENDING:
+            if self.closing:
+                self._transition(r, S.STOPPING)
+                self._cleanup(r)
+            return
+        if self.closing and r.state in STARTUP and not elastic:
+            self._transition(r, S.STOPPING)
+            self._cleanup(r)
+            return
+        if not self.driver.alive(r):
+            raise RuntimeError(
+                "replica process exited; no stale replacement"
+                if elastic
+                else "replica process exited"
+            )
+        if elastic and (r.cancel_requested or self.closing):
+            self.traffic.forget_replica(r.replica_id)
+            if r.state in STARTUP or (
+                not self.traffic.inflight.get(r.replica_id, 0) and self.driver.idle(r)
+            ):
+                self._cleanup(r)
+            return
+        if r.state in STARTUP:
+            if self.clock() - r.started_at >= self.spec.replica.startup_timeout:
+                raise TimeoutError("replica startup/health timeout")
+            if not self.driver.health(r):
+                return
+            if not elastic and r.state == S.STARTING:
+                self._transition(r, S.SYNCING)
+                self._transition(r, S.WARMING)
+            if self.driver.warmup(r, self._effective_spec(r.loaded_model_path)):
+                if elastic and not r.is_base:
+                    self.driver.pause_generation(r, timeout=30)
+                    self._transition(r, S.JOIN_PENDING)
+                else:
+                    self._transition(r, S.READY)
+        elif r.state in (S.READY, S.JOIN_PENDING, S.DRAINING):
+            r.health_failures = 0 if self.driver.health(r) else r.health_failures + 1
+            if r.health_failures >= 3:
+                raise RuntimeError("replica failed three consecutive health probes")
+        if r.state != S.DRAINING:
+            return
+        if elastic:
+            if not self.traffic.inflight.get(r.replica_id, 0) and self.driver.idle(r):
+                self._cleanup(r)
+            elif self.clock() >= r.drain_deadline:
+                self._transition(r, S.READY)
+                r.error = "drain timeout; restored before retirement"
+                r.admission_disabled = False
+                self.scale_in_after = self.clock() + self.policy_config.scale_in_cooldown_s
+                self.policy_priority = True
+        elif self.clock() >= r.drain_deadline:
+            self.traffic.forget_replica(r.replica_id)
+            if not self.traffic.inflight.get(r.replica_id, 0) and self.driver.idle(r):
+                self._transition(r, S.QUIESCED)
+                self._transition(r, S.STOPPING)
+                self._cleanup(r)
+
+    def _reconcile_fixed_capacity(self):
+        if self._update_blocks_topology() and not self.closing:
+            if self._check_update_deadline():
+                return
+            try:
+                self._reconcile_policy()
+            except Exception as exc:
+                self._fail_update(exc)
+            return
+
+        with self.traffic.lock:
+            live = [r for r in self.traffic.replicas.values() if r.state not in TERMINAL]
+            # Finish one scale direction before applying the newest desired count.
+            if any(r.state in STARTUP + DRAIN for r in live):
+                return
+            desired = self.desired
+            ready = [r for r in live if r.state == S.READY]
+            excess = len(ready) - desired
+            if excess > 0:
+                victims = sorted(ready, key=lambda r: self.traffic.inflight.get(r.replica_id, 0))
+                for replica in victims[:excess]:
+                    replica.drain_deadline = self.clock() + self.spec.drain_grace_period
+                    replica.transition(S.DRAINING)
+                return
+        for _ in range(max(0, desired - len(ready))):
+            if not self._create():
+                break
+
+    def _reconcile_elastic_capacity(self):
+        if self.closing or self.transfer.poisoned:
+            return
+        # Never repair a lost member of the immutable base cohort.
+        if any(self.traffic.replicas[rid].state == S.FAILED for rid in self.base_ids):
+            self.traffic.pause_routes("base_failed")
+            return
+        live = [
+            r
+            for r in self.traffic.replicas.values()
+            if r.state not in TERMINAL and not r.cancel_requested
+        ]
+        if any(r.state in (S.DRAINING, S.RETIRE_PENDING, S.STOPPING) for r in live):
+            return
+        if (
+            len(live) > self.desired
+            and self.clock() >= self.scale_in_after
+            and not self.policy_priority
+        ):
+            victims = sorted(
+                [r for r in live if not r.is_base and r.state == S.READY],
+                key=lambda r: self.traffic.inflight.get(r.replica_id, 0),
+            )
+            for r in victims[: len(live) - self.desired]:
+                with self.traffic.lock:
+                    r.drain_deadline = self.clock() + self.spec.drain_grace_period
+                    self._transition(r, S.DRAINING)
+                    self.traffic.forget_replica(r.replica_id)
+        elif len(live) < self.desired and self.scale_failures < self.spec.scale_retry_limit:
+            for _ in range(self.desired - len(live)):
+                if not self._create():
+                    break
+
 
 class Controller:
     def __init__(
@@ -728,12 +875,7 @@ class Controller:
                 if replace(old, desired_replicas=spec.desired_replicas) != spec:
                     raise ValueError("deployment configuration is immutable in MVP-0")
             else:
-                manager_type = ReplicaManager
-                if spec.elastic_scaling:
-                    from .elastic_runtime import ElasticReplicaManager
-
-                    manager_type = ElasticReplicaManager
-                self.deployments[spec.deployment_id] = manager_type(
+                self.deployments[spec.deployment_id] = ReplicaManager(
                     spec, self.resources, self.driver, self.clock
                 )
             # Ensure is idempotent; it must not undo a separate SetDesiredReplicas.

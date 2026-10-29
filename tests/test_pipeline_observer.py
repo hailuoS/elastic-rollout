@@ -1,7 +1,7 @@
 from types import SimpleNamespace as NS
 
 import pytest
-from test_mvp4 import grow, update
+from helpers_elastic import grow, update
 
 from elastic_rollout.pipeline import snapshot_from_body
 from elastic_rollout.pipeline_observer import PipelineObserver

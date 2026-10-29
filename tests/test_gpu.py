@@ -18,7 +18,7 @@ from elastic_rollout.client import ControlError
 from elastic_rollout.collective_backend import CollectiveBackend
 from elastic_rollout.hccl_sender import HCCLSender
 from elastic_rollout.integrations.areal.weight_sync import NCCLWeightSyncConfig
-from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_mvp2b_verl_config
+from elastic_rollout.integrations.verl.launch_spec import LaunchSpec, validate_verl_config
 from elastic_rollout.launcher.base import LaunchPlan
 from elastic_rollout.launcher.ray import RayProcessLauncher, _ProcessActor
 
@@ -230,4 +230,4 @@ def test_gpu_launch_composes_actual_verl_config(launch_file, monkeypatch):
     spec = LaunchSpec.from_file(launch_file)
     overrides = spec.trainer_overrides("10.0.0.3:6379")
     assert "actor_rollout_ref.rollout.checkpoint_engine.backend=elastic_nccl" in overrides
-    validate_mvp2b_verl_config(spec, "10.0.0.3:6379", overrides, spec.core_config())
+    validate_verl_config(spec, "10.0.0.3:6379", overrides, spec.core_config())

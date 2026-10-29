@@ -59,14 +59,14 @@ def test_tp_slot_mismatch_fails_before_launch_and_releases_allocation():
     )
 
 
-def test_single_node_example_has_four_capacity_slots():
-    path = Path(__file__).resolve().parents[1] / "examples/runtime.single-node-tp2.json"
+def test_elastic_example_has_four_capacity_slots():
+    path = Path(__file__).resolve().parents[1] / "examples/runtime.elastic.json"
     config = json.loads(path.read_text(encoding="utf-8"))
     slots = [ResourceSlot(**slot) for slot in config["slots"]]
     spec = DeploymentSpec.from_dict(config["deployments"][0])
     provider = StaticResourceProvider(slots)
     leases = [provider.acquire(str(i)) for i in range(4)]
-    assert len({lease.slot.node_id for lease in leases}) == 1
+    assert len({lease.slot.node_id for lease in leases}) == 4
     assert [lease.slot.num_devices for lease in leases] == [2, 2, 2, 2]
-    assert len({lease.slot.port for lease in leases}) == 4
+    assert len({(lease.slot.host, lease.slot.port) for lease in leases}) == 4
     assert spec.replica.tensor_parallel_size == 2 and spec.desired_replicas == 2

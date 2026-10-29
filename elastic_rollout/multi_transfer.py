@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from .api import PolicyUpdateState as U
 from .api import ReplicaState as S
-from .runtime import PolicyConflict
+from .state import PolicyConflict
 from .weight_transfer import TransferCoordinator
 
 

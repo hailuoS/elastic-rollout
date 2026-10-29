@@ -1,7 +1,7 @@
 from dataclasses import asdict, replace
 
 import pytest
-from test_mvp4 import grow, state, update
+from helpers_elastic import grow, state, update
 
 from elastic_rollout.api import ReplicaState as S
 from elastic_rollout.autoscaling import TrainingPipelinePolicy
