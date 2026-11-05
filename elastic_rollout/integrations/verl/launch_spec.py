@@ -3,6 +3,7 @@
 import importlib.util
 import ipaddress
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,13 +30,14 @@ class LaunchSpec:
     deployment_id: str
     model_path: str
     initial_version: int
-    core_template: Path
+    core_template: Path | dict
     user_overrides: tuple[str, ...]
     startup_timeout_s: float
     shutdown_timeout_s: float
     trainer_shutdown_timeout_s: float
     accelerator: str = "npu"
     strategy: str = "fsdp2"
+    autoscaling: dict | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> "LaunchSpec":
@@ -50,7 +52,7 @@ class LaunchSpec:
             "controller": "bind_host advertise_host port startup_timeout_s shutdown_timeout_s",
             "deployment": "id core_template",
             "model": "path initial_version",
-            "verl": "overrides shutdown_timeout_s strategy",
+            "verl": "overrides shutdown_timeout_s strategy autoscaling",
         }
         for section, names in fields.items():
             if unknown := set(data[section]) - set(names.split()):
@@ -87,11 +89,16 @@ class LaunchSpec:
             verl.get("shutdown_timeout_s", 120),
             runtime.get("accelerator", "npu"),
             verl.get("strategy", "fsdp2"),
+            verl.get("autoscaling"),
         )
         if spec.strategy not in ("fsdp2", "megatron"):
             raise ValueError("verl.strategy must be fsdp2 or megatron")
         if spec.accelerator not in ("npu", "gpu"):
             raise ValueError("runtime.accelerator must be npu or gpu")
+        if spec.autoscaling is not None:
+            from elastic_rollout.autoscaling import AutoscalingConfig
+
+            AutoscalingConfig(**spec.autoscaling)
         if any(
             not isinstance(x, str) or not x
             for x in (spec.ray_address, spec.bind_host, spec.deployment_id)
@@ -117,7 +124,11 @@ class LaunchSpec:
         return f"http://{host}:{self.port}"
 
     def core_config(self, resolved_ray_address: str | None = None) -> dict:
-        config = json.loads(self.core_template.read_text(encoding="utf-8"))
+        config = (
+            deepcopy(self.core_template)
+            if isinstance(self.core_template, dict)
+            else json.loads(self.core_template.read_text(encoding="utf-8"))
+        )
         if unknown := set(config) - {"slots", "deployments", "endpoint", "ray_address"}:
             raise ValueError(f"unsupported Core template fields: {sorted(unknown)}")
         slots = [ResourceSlot(**slot) for slot in config["slots"]]
@@ -232,18 +243,19 @@ class LaunchSpec:
 
 
 def validate_verl_config(
-    spec: LaunchSpec, ray_address: str, overrides: list[str], core: dict
+    spec: LaunchSpec, ray_address: str, overrides: list[str], core: dict, *, config=None
 ) -> None:
     """Compose stock Verl and check integration plus supported training invariants."""
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    module = importlib.util.find_spec("verl")
-    if module is None or not module.submodule_search_locations:
-        raise RuntimeError("verl is unavailable in the launcher environment")
-    directory = Path(next(iter(module.submodule_search_locations))) / "trainer" / "config"
-    with initialize_config_dir(config_dir=str(directory), version_base=None):
-        config = compose(config_name=VERL_BASE_CONFIG, overrides=overrides)
+    if config is None:
+        module = importlib.util.find_spec("verl")
+        if module is None or not module.submodule_search_locations:
+            raise RuntimeError("verl is unavailable in the launcher environment")
+        directory = Path(next(iter(module.submodule_search_locations))) / "trainer" / "config"
+        with initialize_config_dir(config_dir=str(directory), version_base=None):
+            config = compose(config_name=VERL_BASE_CONFIG, overrides=overrides)
 
     def get(key):
         return OmegaConf.select(config, key)
@@ -300,7 +312,18 @@ def validate_verl_config(
     by_node: dict[str, int] = {}
     for slot in core["slots"]:
         by_node[slot["node_id"]] = by_node.get(slot["node_id"], 0) + slot["num_devices"]
-    if get(f"{ROLLOUT}.nnodes") != len(by_node) or set(by_node.values()) != {
-        get(f"{ROLLOUT}.n_gpus_per_node")
-    }:
+    placement = get("trainer.placement_group_node_ids.global_pool")
+    if placement is not None:
+        # Native shape is a capacity budget; an elastic cap may use fewer slots.
+        valid = (
+            len(placement) == get("trainer.nnodes") == get(f"{ROLLOUT}.nnodes")
+            and len(set(placement)) == len(placement)
+            and set(by_node) <= set(placement)
+            and all(devices <= get(f"{ROLLOUT}.n_gpus_per_node") for devices in by_node.values())
+        )
+    else:
+        valid = get(f"{ROLLOUT}.nnodes") == len(by_node) and set(by_node.values()) == {
+            get(f"{ROLLOUT}.n_gpus_per_node")
+        }
+    if not valid:
         raise ValueError("Verl rollout resource shape must match Core static slots")

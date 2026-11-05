@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from inspect import signature
 from pathlib import Path
 
 from elastic_rollout.client import ControlClient
@@ -19,22 +21,31 @@ from .launch_spec import LaunchSpec, validate_verl_config
 logger = logging.getLogger(__name__)
 
 
-def resolve_ray_cluster(spec: LaunchSpec, core_config: dict) -> str:
-    """Attach once, verify rollout slots, and return the concrete GCS address.
-
-    Ray Client addresses do not expose a direct GCS address for the child
-    drivers. The MVP-2B direct actor/HCCL path therefore requires native Ray.
-    """
-    if spec.ray_address.startswith("ray://") or spec.ray_address == "local":
+@contextmanager
+def ray_cluster(address):
+    """Inspect the existing cluster without retaining a driver or replacing signals."""
+    if address.startswith("ray://") or address == "local":
         raise ValueError("MVP-2B requires an existing native Ray cluster address")
     import ray
 
     if ray.is_initialized():
         raise RuntimeError("launcher must resolve Ray before another driver initializes it")
-    context = ray.init(address=spec.ray_address)
+    handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
-        info = getattr(context, "address_info", None)
-        address = info.get("gcs_address") if isinstance(info, dict) else None
+        context = ray.init(address=address)
+        yield context, ray
+    finally:
+        try:
+            ray.shutdown()
+        finally:
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+
+
+def resolve_ray_cluster(spec: LaunchSpec, core_config: dict) -> str:
+    """Verify rollout slots and resolve the GCS address before spawning children."""
+    with ray_cluster(spec.ray_address) as (context, ray):
+        address = context.address_info.get("gcs_address")
         if not address or address in ("auto", "local"):
             raise RuntimeError("Ray did not return a concrete GCS address")
         nodes = {node["NodeID"]: node for node in ray.nodes() if node.get("Alive")}
@@ -53,8 +64,6 @@ def resolve_ray_cluster(spec: LaunchSpec, core_config: dict) -> str:
                 )
         logger.info("resolved Ray cluster GCS %s with %d live nodes", address, len(nodes))
         return address
-    finally:
-        ray.shutdown()
 
 
 def validate_bootstrap(status: dict, spec: LaunchSpec, core_config: dict) -> None:
@@ -135,14 +144,34 @@ def _wait_ready(
     raise TimeoutError(f"Core did not become serving_ready: {last_error}")
 
 
-def run_launch(path: Path, *, report_path: Path | None = None) -> int:
-    spec = LaunchSpec.from_file(path)
+def run_launch(
+    path: Path | LaunchSpec,
+    *,
+    report_path: Path | None = None,
+    trainer_config=None,
+) -> int:
+    spec = path if isinstance(path, LaunchSpec) else LaunchSpec.from_file(path)
     core_config = spec.core_config()
     # Resolve and verify every input before spawning either child.
-    ray_address = resolve_ray_cluster(spec, core_config)
+    ray_address = (
+        resolve_ray_cluster(spec, core_config) if trainer_config is None else spec.ray_address
+    )
     core_config = spec.core_config(resolved_ray_address=ray_address)
     trainer_overrides = spec.trainer_overrides(ray_address)
-    validate_verl_config(spec, ray_address, trainer_overrides, core_config)
+    native_placement = trainer_config is not None or any(
+        "trainer.placement_group_node_ids." in value for value in trainer_overrides
+    )
+    if native_placement:
+        from verl.single_controller.ray.base import RayResourcePool
+
+        if "placement_group_node_ids" not in signature(RayResourcePool).parameters:
+            raise RuntimeError("install the paired verl resource-pool patch before elastic launch")
+    if trainer_config is None:
+        validate_verl_config(spec, ray_address, trainer_overrides, core_config)
+    else:
+        validate_verl_config(
+            spec, ray_address, trainer_overrides, core_config, config=trainer_config
+        )
     client = ControlClient(
         spec.endpoint, spec.deployment_id, token=os.environ.get("ELASTIC_ROLLOUT_TOKEN"), timeout=2
     )
@@ -151,6 +180,7 @@ def run_launch(path: Path, *, report_path: Path | None = None) -> int:
     env["ELASTIC_ROLLOUT_EXPECTED_GCS_ADDRESS"] = ray_address
     core = None
     trainer = None
+    scaler = None
     report = (
         {
             "ray_gcs_address": ray_address,
@@ -213,12 +243,21 @@ def run_launch(path: Path, *, report_path: Path | None = None) -> int:
             )
             if interrupted[0]:
                 raise InterruptedError("launch interrupted before trainer start")
+            trainer_args = trainer_overrides
+            if trainer_config is not None:
+                from omegaconf import OmegaConf
+
+                OmegaConf.save(trainer_config, Path(temp) / "trainer.yaml", resolve=True)
+                trainer_args = ["--config-path", temp, "--config-name", "trainer"]
             trainer = subprocess.Popen(
-                owned_command([sys.executable, "-m", "verl.trainer.main_ppo", *trainer_overrides]),
+                owned_command([sys.executable, "-m", "verl.trainer.main_ppo", *trainer_args]),
                 env=env,
                 start_new_session=os.name == "posix",
             )
             logger.info("started Verl trainer pid=%s on Ray GCS %s", trainer.pid, ray_address)
+            # Bound native PG/trainer initialization without dummy reservation actors.
+            starting = native_placement
+            startup_deadline = time.monotonic() + spec.startup_timeout_s
             while True:
                 if interrupted[0]:
                     logger.info(
@@ -237,6 +276,45 @@ def run_launch(path: Path, *, report_path: Path | None = None) -> int:
                         logger.error("trainer exited with status %s", trainer_code)
                         failed = True
                     break
+                if starting or (spec.autoscaling is not None and scaler is None):
+                    try:
+                        updated = client.status().get("serving_policy_version", 0)
+                    except (ConnectionError, TimeoutError, OSError):
+                        updated = spec.initial_version
+                    if updated > spec.initial_version:
+                        starting = False
+                    elif starting and time.monotonic() > startup_deadline:
+                        raise TimeoutError(
+                            "Trainer did not commit its first weights before startup timeout"
+                        )
+                    if (
+                        spec.autoscaling is not None
+                        and not starting
+                        and updated > spec.initial_version
+                    ):
+                        policy_path = Path(temp) / "autoscaling.json"
+                        policy_path.write_text(json.dumps(spec.autoscaling), encoding="utf-8")
+                        scaler = subprocess.Popen(
+                            owned_command(
+                                [
+                                    sys.executable,
+                                    "-m",
+                                    "elastic_rollout.cli",
+                                    "autoscale",
+                                    "--endpoint",
+                                    spec.endpoint,
+                                    "--deployment",
+                                    spec.deployment_id,
+                                    "--config",
+                                    str(policy_path),
+                                    "--activate",
+                                ]
+                            ),
+                            env=env,
+                            start_new_session=os.name == "posix",
+                        )
+                if scaler is not None and scaler.poll() is not None:
+                    raise RuntimeError("elastic autoscaler exited while training was running")
                 time.sleep(0.2)
     except (Exception, KeyboardInterrupt):
         logger.exception("verl launch failed")
@@ -246,6 +324,12 @@ def run_launch(path: Path, *, report_path: Path | None = None) -> int:
         ports_closed = None
         trainer_code = core_code = None
         try:
+            try:
+                if scaler is not None and _stop_child(scaler, 30) is None:
+                    cleanup_ok = False
+            except Exception:
+                cleanup_ok = False
+                logger.exception("autoscaler termination failed; still stopping Trainer/Core")
             try:
                 trainer_code = _stop_child(trainer, spec.trainer_shutdown_timeout_s)
                 if trainer is not None and trainer_code is None:

@@ -23,7 +23,9 @@ elastic-rollout status --endpoint http://<控制器>:8080 --deployment elastic-r
 elastic-rollout scale --endpoint http://<控制器>:8080 --deployment elastic-rollout 3 --wait
 ```
 
-verl 可使用一个入口启动并监督 Core 和 Trainer：
+verl 的 V1 separate_async 训练可保留原生命令，在原训练参数后追加 `+elastic.enabled=true` 及副本上下限；不需要维护额外 JSON，详见[原生入口指南](docs/verl-native.md)。需要配套的 verl 入口与资源池补丁；训练模式、dtype 和资源预算沿用原生配置，不自动切换。已在单机 5090 上验证 FSDP2 真实训练、手动扩缩及信号清理；自动弹性收益、双物理机和 NPU 仍待验收。
+
+显式管理配置的场景仍可使用原有统一 launcher：
 
 ```bash
 elastic-rollout verl run -c examples/verl_launch.json --report run.json
