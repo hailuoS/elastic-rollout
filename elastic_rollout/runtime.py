@@ -764,7 +764,15 @@ class ReplicaManager(ScalingControl):
             if not elastic and r.state == S.STARTING:
                 self._transition(r, S.SYNCING)
                 self._transition(r, S.WARMING)
-            if self.driver.warmup(r, self._effective_spec(r.loaded_model_path)):
+            try:
+                warmed = self.driver.warmup(r, self._effective_spec(r.loaded_model_path))
+            except (TimeoutError, OSError) as exc:
+                # First-token compilation may outlast one HTTP request. Keep the
+                # slot quarantined from traffic until warmup or startup deadline.
+                r.error = f"warmup pending: {exc}"
+                return
+            if warmed:
+                r.error = None
                 if elastic and not r.is_base:
                     self.driver.pause_generation(r, timeout=30)
                     self._transition(r, S.JOIN_PENDING)

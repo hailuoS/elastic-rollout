@@ -101,6 +101,57 @@ def test_only_ready_receives_routes(runtime):
     assert manager.traffic.acquire("a").serving_policy_version == 0
 
 
+def test_cold_warmup_timeout_retries_without_releasing_slot_or_routing(runtime):
+    controller, manager, driver, _ = runtime
+    controller.reconcile()
+    first = set()
+
+    def warmup(replica, spec):
+        if replica.replica_id not in first:
+            first.add(replica.replica_id)
+            raise TimeoutError("cold first-token compilation")
+        return True
+
+    driver.warmup = warmup
+    allocated = manager.resources.allocated
+    controller.reconcile()
+    assert manager.resources.allocated == allocated and not driver.stopped
+    assert all(r.state == S.WARMING for r in manager.traffic.replicas.values())
+    with pytest.raises(NoReadyReplica):
+        manager.traffic.acquire("during-compile")
+    controller.reconcile()
+    assert all(r.state == S.READY and r.error is None for r in manager.traffic.replicas.values())
+
+
+def test_warmup_retries_remain_bounded_by_startup_deadline(runtime):
+    controller, manager, driver, clock = runtime
+    controller.reconcile()
+    originals = list(manager.traffic.replicas.values())
+
+    def timeout(*_):
+        raise TimeoutError("still compiling")
+
+    driver.warmup = timeout
+    controller.reconcile()
+    clock.now += manager.spec.replica.startup_timeout + 1
+    controller.reconcile()
+    assert all(r.state == S.FAILED and r.resource is None for r in originals)
+    assert all(r.replica_id in driver.stopped for r in originals)
+
+
+def test_invalid_warmup_response_is_not_retried(runtime):
+    controller, manager, driver, _ = runtime
+    controller.reconcile()
+    originals = list(manager.traffic.replicas.values())
+
+    def invalid(*_):
+        raise ValueError("missing token logprobs")
+
+    driver.warmup = invalid
+    controller.reconcile()
+    assert all(r.state == S.FAILED and r.error == "missing token logprobs" for r in originals)
+
+
 @pytest.mark.parametrize("state", [S.STARTING, S.SYNCING, S.WARMING])
 def test_shutdown_stops_startup_without_waiting_for_readiness(runtime, state):
     controller, manager, driver, _ = runtime
