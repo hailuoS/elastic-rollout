@@ -8,6 +8,9 @@
   +elastic.max_replicas=4
 ```
 
+开关名是 `enabled`，不是 `enable`。配套 verl 入口会拒绝拼错或缺失的开关，
+避免 Hydra 接受新增字段后静默执行原生的固定副本路径。
+
 适用于当前配套的 verl 0.9.0 分支，需要其中的原生入口及可选 PG 放置补丁；使用支持 PG bundle label selector 的 Ray（配方版本 2.55.1）。仅安装组件而不更新该入口不会自动生效。不开启弹性时沿用原生路径，不导入 ElasticRollout。当前实现支持已有专用 Ray 集群，平台申请新 worker 尚未接入。
 
 ## 单机 8 卡

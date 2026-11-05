@@ -161,8 +161,19 @@ def test_documented_shell_example_composes_and_launches(tmp_path):
     assert child.trainer.v1.separate_async.parameter_sync_step == 1
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_native_main_hook_is_opt_in(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    "elastic,expected",
+    [
+        (None, "normal"),
+        ({"enabled": False}, "normal"),
+        ({"enabled": True}, "elastic"),
+        ({"enable": True}, "error"),
+        ({"enabled": False, "enable": True}, "error"),
+        ({"min_replicas": 1, "max_replicas": 4}, "error"),
+        ({"enabled": "true"}, "error"),
+    ],
+)
+def test_native_main_hook_is_opt_in(monkeypatch, elastic, expected):
     from omegaconf import OmegaConf
 
     source = Path(__file__).resolve().parents[2] / "verl/verl/trainer/main_ppo.py"
@@ -184,12 +195,19 @@ def test_native_main_hook_is_opt_in(monkeypatch, enabled):
         TaskRunnerV1=object(),
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
-    config = OmegaConf.create(dict(elastic=dict(enabled=enabled), trainer=dict(use_v1=True)))
-    if enabled:
+    config = OmegaConf.create(dict(trainer=dict(use_v1=True)))
+    if elastic is not None:
+        config.elastic = elastic
+    if expected == "elastic":
         with pytest.raises(SystemExit) as exit_info:
             namespace["main"](config)
         assert exit_info.value.code == 0
         run_native.assert_called_once_with(config)
+        normal.assert_not_called()
+    elif expected == "error":
+        with pytest.raises(ValueError, match=r"elastic\.enabled"):
+            namespace["main"](config)
+        run_native.assert_not_called()
         normal.assert_not_called()
     else:
         namespace["main"](config)
