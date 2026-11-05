@@ -290,6 +290,8 @@ class VLLMServiceDriver:
             "mp",
             "--scheduling-policy",
             "priority",
+            "--disable-access-log-for-endpoints",
+            "/health,/metrics",
             *(
                 ("--weight-transfer-config", '{"backend":"nccl"}')
                 if shape.weight_sync in ("hccl", "nccl")
