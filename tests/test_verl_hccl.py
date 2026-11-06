@@ -688,7 +688,8 @@ def test_actual_verl_worker_uses_native_export(adapters):
     assert result == {"step": 1}
 
 
-def test_training_service_keeps_external_ownership(adapters, monkeypatch):
+@pytest.mark.parametrize("request_timeout", [None, 1800])
+def test_training_service_keeps_external_ownership(adapters, monkeypatch, request_timeout):
     class Config(dict):
         __getattr__ = dict.__getitem__
 
@@ -710,11 +711,14 @@ def test_training_service_keeps_external_ownership(adapters, monkeypatch):
         free_cache_engine=False,
         multi_turn=Config(enable=False),
     )
+    if request_timeout is not None:
+        rollout.custom["elastic"]["request_timeout"] = request_timeout
     config = Config(
         actor_rollout_ref=Config(rollout=rollout, model=Config(path="model"), hybrid_engine=False),
         trainer=Config(use_v1=True, v1=Config(trainer_mode="separate_async")),
     )
     service = module.ElasticRolloutService(config, start_rank=0)
+    assert service.request_timeout == request_timeout
     service.control.status = lambda: {"ready_replicas": 2}
     assert service.get_replicas() == []
     assert service.get_active_server_count() == 2

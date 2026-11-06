@@ -290,6 +290,7 @@ def test_verl_client_external_route_output_and_service_guard(monkeypatch):
         actor_rollout_ref=NS(rollout=NS(response_length=4, ignore_eos=True, repetition_penalty=1.1))
     )
     client = client_module.ElasticLLMClient(config, MagicMock(), "policy")
+    assert client.generator.request_timeout is None
     client.generator = NS(generate=AsyncMock(return_value=Completion([9], [-0.3], [6], "length")))
     result = asyncio.run(
         client.generate(

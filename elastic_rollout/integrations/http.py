@@ -44,7 +44,7 @@ class AsyncGenerationClient(GenerationClient):
             method,
             url,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            timeout=aiohttp.ClientTimeout(total=timeout, connect=30),
             allow_redirects=False,
         ) as response:
             body = await response.read()

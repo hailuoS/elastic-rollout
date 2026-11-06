@@ -70,7 +70,7 @@ class ElasticRolloutService:
             options["deployment_id"],
             os.environ.get("ELASTIC_ROLLOUT_TOKEN"),
         )
-        self.request_timeout = options.get("request_timeout", 300)
+        self.request_timeout = options.get("request_timeout")
         self.model = None
 
     @classmethod

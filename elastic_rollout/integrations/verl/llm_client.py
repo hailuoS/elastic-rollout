@@ -8,7 +8,9 @@ from elastic_rollout.integrations.http import AsyncGenerationClient
 
 
 class ElasticLLMClient(LLMServerClient):
-    def __init__(self, config, control: ControlClient, model: str, request_timeout: float = 300):
+    def __init__(
+        self, config, control: ControlClient, model: str, request_timeout: float | None = None
+    ):
         super().__init__(config=config, load_balancer_handle=None)
         self.generator = AsyncGenerationClient(control, model, request_timeout)
 

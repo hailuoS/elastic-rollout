@@ -50,10 +50,10 @@ class GenerationClient:
         self,
         control: ControlClient,
         model: str,
-        request_timeout: float = 300,
+        request_timeout: float | None = 300,
         max_stalled_aborts: int = 8,
         wait_for_resume: ResumeGate | None = None,
-        request: Callable[[str, str, dict, float], Awaitable[dict]] | None = None,
+        request: Callable[[str, str, dict, float | None], Awaitable[dict]] | None = None,
     ):
         self.control, self.model = control, model
         if type(max_stalled_aborts) is not int or max_stalled_aborts <= 0:

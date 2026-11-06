@@ -71,6 +71,11 @@ python -m verl.trainer.main_ppo \
 
 当前路径用于 dense BF16、单轮 vLLM rollout；FSDP2 或原生 Megatron Bridge，NPU 下仍由 verl 选择 MindSpeed。使用 Megatron 时保留原生 `model_engine=megatron` 和并行配置，不能只把 FSDP2 配置中的 strategy 字符串改掉。继续遵守现有 LoRA、量化、多模态、EP/CP 和恢复训练的支持边界。
 
+verl 适配器默认不限制单次生成请求的总时长，允许长时间排队及生成；HTTP 连接建立仍有 30 秒超时，
+控制面请求继续使用各自的有限超时。如需显式限制生成请求，可设置
+`++actor_rollout_ref.rollout.custom.elastic.request_timeout=1800`（秒），`null` 表示不限制总时长。
+取消仍沿用在途请求结束后释放租约的语义；进程退出使用已有 launcher 清理路径。
+
 ## 进程与资源所有权
 
 `main_ppo` 的薄入口仅负责移交配置；框架 adapter 发现 Ray 资源、生成静态布局；现有 launcher 负责 Core、Trainer、自动策略子进程。Core 和通信层继续处理权重追赶、拓扑门禁、排空与通信组退出，没有新增副本状态机。公共运行时不导入 verl/AReaL。

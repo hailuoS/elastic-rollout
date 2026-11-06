@@ -190,12 +190,15 @@ def test_framework_default_sends_128_requests_without_generation_threads(
 
 
 @pytest.mark.parametrize("cancel_count", [1, 3])
-def test_cancellation_keeps_lease_and_pool_until_http_finishes(sessions, cancel_count):
+@pytest.mark.parametrize("request_timeout", [None, 2])
+def test_cancellation_keeps_lease_and_pool_until_http_finishes(
+    sessions, cancel_count, request_timeout
+):
     async def run():
         engine = Engine()
         async with engine_server(engine) as endpoint:
             routes = Routes(endpoint)
-            client = AsyncGenerationClient(routes, "policy", request_timeout=2)
+            client = AsyncGenerationClient(routes, "policy", request_timeout=request_timeout)
             task = asyncio.create_task(client.generate("cancel", [1], {"max_tokens": 1}))
             try:
                 await asyncio.wait_for(engine.ready.wait(), 2)
@@ -255,6 +258,29 @@ def test_timeout_closes_pool_and_releases_lease(sessions):
                     "r", [1], {"max_tokens": 1}
                 )
             assert routes.active == 0 and sessions[0].closed
+
+    asyncio.run(run())
+
+
+def test_no_total_timeout_keeps_slow_response_and_lease_alive(sessions):
+    async def run():
+        engine = Engine()
+        async with engine_server(engine) as endpoint:
+            routes = Routes(endpoint)
+            client = AsyncGenerationClient(routes, "policy", request_timeout=None)
+            task = asyncio.create_task(client.generate("slow", [1], {"max_tokens": 1}))
+            try:
+                await asyncio.wait_for(engine.ready.wait(), 2)
+                # Cross the short deadline used by the explicit-timeout regression.
+                await asyncio.sleep(0.1)
+                assert not task.done() and routes.active == 1 and not sessions[0].closed
+                engine.release.set()
+                result = await asyncio.wait_for(task, 2)
+                assert result.token_ids == [42]
+                assert routes.active == 0 and sessions[0].closed
+            finally:
+                engine.release.set()
+                await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
 
