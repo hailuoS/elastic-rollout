@@ -155,7 +155,10 @@ def test_generated_overrides_compose_real_verl_base(launch_file, monkeypatch):
     validate_verl_config(spec, address, spec.trainer_overrides(address), spec.core_config())
 
 
-def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatch):
+@pytest.mark.parametrize("policy_mode", ["service", "pipeline"])
+def test_elastic_launch_only_installs_observer_for_pipeline_mode(
+    launch_file, monkeypatch, policy_mode
+):
     pytest.importorskip("hydra")
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "verl"))
     template = launch_file.parent / "core.json"
@@ -167,6 +170,7 @@ def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatc
     _edit_json(template, edit_core)
 
     def edit_launch(data):
+        data["verl"]["autoscaling"] = {"policy_mode": policy_mode}
         data["verl"]["overrides"] = [
             "actor_rollout_ref.rollout.n_gpus_per_node=4"
             if item.startswith("actor_rollout_ref.rollout.n_gpus_per_node=")
@@ -178,7 +182,9 @@ def test_elastic_launch_composes_native_pipeline_sampler(launch_file, monkeypatc
     spec = LaunchSpec.from_file(launch_file)
     address = "10.0.0.3:6379"
     overrides = spec.trainer_overrides(address)
-    assert any("ElasticPipelineReplayBuffer" in item for item in overrides)
+    assert any("ElasticPipelineReplayBuffer" in item for item in overrides) == (
+        policy_mode == "pipeline"
+    )
     validate_verl_config(spec, address, overrides, spec.core_config())
 
 

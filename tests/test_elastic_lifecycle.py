@@ -123,7 +123,8 @@ def test_manual_mode_revision_and_retry_budget(elastic):
 def test_pressure_persistence_pending_and_cooldown():
     p, s = ServicePressurePolicy(AutoscalingConfig(sample_ttl_s=60)), state()
     assert p.decide(s, metric(100, 20), now=100)["action"] == "HOLD"
-    decision = p.decide(s, metric(131, 20), now=131)
+    for t in range(105, 136, 5):
+        decision = p.decide(s, metric(t, 20), now=t)
     assert decision["target"] == 4 and decision["action"] == "OUT"
     p.applied(decision, 131)
     assert p.decide(s, metric(160, 20), now=160)["action"] == "HOLD"
@@ -131,7 +132,7 @@ def test_pressure_persistence_pending_and_cooldown():
     assert p.decide(s, metric(200, 20), now=200)["action"] == "HOLD"
 
 
-@pytest.mark.parametrize("missing", ["kv_usage", "wait_p95_s", "queue_per_replica"])
+@pytest.mark.parametrize("missing", ["kv_usage", "generation_tps", "queue_per_replica", "coverage"])
 def test_missing_sample_prevents_shrink_and_resets_persistence(missing):
     p, s = ServicePressurePolicy(), state()
     p.decide(s, metric(100), now=100)
@@ -143,12 +144,14 @@ def test_missing_sample_prevents_shrink_and_resets_persistence(missing):
 
 def test_all_low_shrinks_and_projected_kv_gate():
     p, s = ServicePressurePolicy(AutoscalingConfig(sample_ttl_s=300)), state()
-    p.decide(s, metric(100), now=100)
-    assert p.decide(s, metric(221), now=221)["action"] == "IN"
+    for t in range(100, 241, 10):
+        decision = p.decide(s, metric(t), now=t)
+    assert decision["action"] == "IN"
     config = AutoscalingConfig(kv_low=0.5, projected_kv_limit=0.6, sample_ttl_s=300)
     p = ServicePressurePolicy(config)
-    p.decide(s, metric(100, kv=0.45), now=100)
-    assert p.decide(s, metric(221, kv=0.45), now=221)["action"] == "HOLD"
+    for t in range(100, 241, 10):
+        decision = p.decide(s, metric(t, kv=0.45), now=t)
+    assert decision["action"] == "HOLD"
 
 
 def test_pipeline_deadband_and_invalid_phase_hold():
@@ -295,14 +298,14 @@ def test_gap_invalidates_low_pressure_window():
     p, s = ServicePressurePolicy(), state()
     p.decide(s, metric(100), now=100)
     assert p.decide(s, metric(221), now=221)["action"] == "HOLD"
-    assert p.low_since == 221
+    assert p.low_since is None  # A gap requires throughput history to warm up again.
 
 
-def test_missing_or_stale_pipeline_signal_vetoes_scale_in():
-    p, s = ServicePressurePolicy(AutoscalingConfig(pipeline_enabled=True)), state()
+def test_service_policy_does_not_need_training_pipeline_reports():
+    p, s = ServicePressurePolicy(), state()
     for t in range(100, 250, 10):
-        assert p.decide(s, metric(t), now=t)["action"] == "HOLD"
-    assert p.low_since is None
+        decision = p.decide(s, metric(t), now=t)
+    assert decision["action"] == "IN"
 
 
 def test_histogram_pressure_uses_window_deltas(monkeypatch):

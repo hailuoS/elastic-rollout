@@ -24,6 +24,7 @@ class VLLMControlPlane(WeightTransferControl, Protocol):
 class StandardVLLMControl:
     def __init__(self):
         self._histograms = {}
+        self._generation = {}
         self._metrics_lock = threading.Lock()
 
     def pressure(self, endpoint):
@@ -45,46 +46,63 @@ class StandardVLLMControl:
             result["queue_per_replica"] = sum(waiting)
         if kv:
             result["kv_usage"] = max(kv)
-        # Quantile absent in pinned builds is unknown, never synthetic zero.
-        quantiles = re.findall(
-            r'^vllm:request_queue_time_seconds\{[^\n]*quantile="0\.95"[^\n]*\}\s+(\S+)',
-            text,
-            re.MULTILINE,
-        )
-        if quantiles:
-            result["wait_p95_s"] = max(float(v) for v in quantiles)
-        else:
-            buckets = {}
-            for labels, raw in re.findall(
-                r"^vllm:request_queue_time_seconds_bucket\{([^\n]*)\}\s+(\S+)",
+
+        def latency(metric, field, overflow):
+            quantiles = re.findall(
+                rf'^vllm:{metric}\{{[^\n]*quantile="0\.95"[^\n]*\}}\s+(\S+)',
                 text,
                 re.MULTILINE,
-            ):
-                match = re.search(r'\ble="([^"]+)"', labels)
-                if match:
-                    bound, count = float(match[1]), float(raw)
-                    if math.isnan(bound) or not math.isfinite(count) or count < 0:
-                        buckets = {}
-                        break
-                    buckets[bound] = buckets.get(bound, 0) + count
-            with self._metrics_lock:
-                previous = self._histograms.get(endpoint)
-                self._histograms[endpoint] = buckets
-            if previous and buckets.keys() == previous.keys() and math.inf in buckets:
-                delta = {bound: count - previous[bound] for bound, count in buckets.items()}
-                ordered = sorted(delta)
-                if all(delta[b] >= 0 for b in ordered) and all(
-                    delta[a] <= delta[b] for a, b in zip(ordered, ordered[1:])
+            )
+            if quantiles:
+                result[field] = max(float(v) for v in quantiles)
+            else:
+                buckets = {}
+                for labels, raw in re.findall(
+                    rf"^vllm:{metric}_bucket\{{([^\n]*)\}}\s+(\S+)",
+                    text,
+                    re.MULTILINE,
                 ):
-                    total = delta[math.inf]
-                    if total == 0 and result.get("queue_per_replica") == 0:
-                        result["wait_p95_s"] = 0.0
-                    elif total > 0:
-                        # Conservative upper bucket bound, never pretend the +Inf
-                        # tail has finite latency. Missing remains a scale-in veto.
-                        bound = next(b for b in ordered if delta[b] >= 0.95 * total)
-                        if math.isfinite(bound):
-                            result["wait_p95_s"] = bound
+                    match = re.search(r'\ble="([^"]+)"', labels)
+                    if match:
+                        bound, count = float(match[1]), float(raw)
+                        if math.isnan(bound) or not math.isfinite(count) or count < 0:
+                            buckets = {}
+                            break
+                        buckets[bound] = buckets.get(bound, 0) + count
+                with self._metrics_lock:
+                    previous = self._histograms.get((endpoint, metric))
+                    self._histograms[(endpoint, metric)] = buckets
+                if previous and buckets.keys() == previous.keys() and math.inf in buckets:
+                    delta = {bound: count - previous[bound] for bound, count in buckets.items()}
+                    ordered = sorted(delta)
+                    if all(delta[b] >= 0 for b in ordered) and all(
+                        delta[a] <= delta[b] for a, b in zip(ordered, ordered[1:])
+                    ):
+                        total = delta[math.inf]
+                        if total == 0 and result.get("queue_per_replica") == 0:
+                            result[field] = 0.0
+                        elif total > 0:
+                            # Conservative upper bucket bound, never pretend the +Inf
+                            # tail has finite latency. Missing remains a scale-in veto.
+                            bound = next(b for b in ordered if delta[b] >= 0.95 * total)
+                            if math.isfinite(bound):
+                                result[field] = bound
+                            else:
+                                result[overflow] = True
+
+        latency("request_queue_time_seconds", "wait_p95_s", "queue_p95_overflow")
+        latency("time_to_first_token_seconds", "ttft_p95_s", "ttft_p95_overflow")
+        tokens = samples("generation_tokens_total")
+        now = time.monotonic()
+        with self._metrics_lock:
+            previous = self._generation.get(endpoint)
+            if tokens and all(math.isfinite(v) and v >= 0 for v in tokens):
+                count = sum(tokens)
+                self._generation[endpoint] = (now, count)
+                if previous and now > previous[0] and count >= previous[1]:
+                    result["generation_tps"] = (count - previous[1]) / (now - previous[0])
+            else:
+                self._generation.pop(endpoint, None)
         return result
 
     def get_world_size(self, endpoint, *, timeout=30):

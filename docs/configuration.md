@@ -25,13 +25,13 @@ GPU 应同时设置 `accelerator=gpu` 与 `weight_sync=nccl`，NPU 使用 `npu/h
 
 CLI 的 `status` 返回副本状态、serving 版本、通信状态及扩缩信息；`scale <count> --wait` 提交手动容量意图并等待 ready。扩容 ready 依赖下一次训练权重同步，暂停训练时等待可能无法完成。
 
-`examples/autoscaling.json` 默认 `pipeline_enabled=false`，适合先观察建议。启用流水线指标并设置该字段为 true 后，再执行：
+`examples/autoscaling.json` 默认使用 Relax 风格服务负载策略，独立 CLI 可先不加 `--activate` 观察建议；执行扩缩时运行：
 
 ```bash
 elastic-rollout autoscale --endpoint http://<控制器>:8080 --deployment elastic-rollout --config examples/autoscaling.json --activate
 ```
 
-该命令持续运行控制循环。指标失效、试探失败或拓扑不安全时应检查 status 的错误及 trial 信息，不能直接强制释放仍有通信组的资源。
+该命令持续运行控制循环。默认策略不需要训练侧 trial；指标缺失或拓扑不安全时暂停决策。规则见[自动扩缩说明](autoscaling.md)，不能强制释放仍有通信组的资源。
 
 ## Python 接口
 

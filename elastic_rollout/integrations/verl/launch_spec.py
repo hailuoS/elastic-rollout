@@ -203,7 +203,10 @@ class LaunchSpec:
             )
         else:
             values["actor_rollout_ref.actor.fsdp_config.model_dtype"] = "bfloat16"
-        if self.core_config()["deployments"][0].get("elastic_scaling"):
+        if (
+            self.core_config()["deployments"][0].get("elastic_scaling")
+            and (self.autoscaling or {}).get("policy_mode", "service") == "pipeline"
+        ):
             values.update(
                 {
                     "trainer.v1.sampler.custom_sampler.path": "pkg://elastic_rollout.integrations.verl.pipeline_sampler",

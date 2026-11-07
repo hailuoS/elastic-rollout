@@ -21,7 +21,23 @@ class ScalingControl:
                 if self.scale_failures >= self.spec.scale_retry_limit:
                     raise PolicyConflict("scale retry budget exhausted; manual recovery required")
                 if count < self.desired:
-                    raise PolicyConflict("automatic scale-in requires a successful shrink trial")
+                    if self.policy_config.policy_mode != "service":
+                        raise PolicyConflict(
+                            "automatic scale-in requires a successful shrink trial"
+                        )
+                    live = list(self.traffic.replicas.values())
+                    if (
+                        count != self.desired - 1
+                        or self.trial
+                        or self.generation_paused
+                        or not self.traffic.accepting_routes
+                        or not self._stable_for_policy_update(live)
+                        or any(r.state in STARTUP for r in live)
+                        or sum(r.state == S.READY for r in live) != self.desired
+                    ):
+                        raise PolicyConflict(
+                            "service scale-in requires one stable replica at a time"
+                        )
             else:
                 self._cancel_trial("manual desired override")
                 self.scaling_mode = "MANUAL"
@@ -107,13 +123,6 @@ class ScalingControl:
                 if "trial_action" in body:
                     self._trial_action(body)
                 if "desired_replicas" in body:
-                    if (
-                        type(body["desired_replicas"]) is not int
-                        or body["desired_replicas"] < self.desired
-                    ):
-                        raise PolicyConflict(
-                            "automatic scale-in requires a successful shrink trial"
-                        )
                     if self.scaling_mode != "AUTO" or body.get("revision") != self.scaling_revision:
                         raise PolicyConflict("automatic scaling revision/mode changed")
                     if self.trial:
@@ -135,7 +144,7 @@ class ScalingControl:
                 samples.append(self.driver.pressure(replica))
             except Exception:
                 samples.append({})
-        metrics = {"observed_at": self.clock()}
+        metrics = {"observed_at": self.clock(), "coverage": 0.0}
         with self.traffic.lock:
             current = [r.replica_id for r in self.traffic.replicas.values() if r.state == S.READY]
             if (
@@ -146,12 +155,32 @@ class ScalingControl:
                 and self.traffic.accepting_routes
                 and not self.generation_paused
             ):
-                for key in ("queue_per_replica", "wait_p95_s", "kv_usage"):
-                    if all(key in sample for sample in samples):
-                        values = [sample[key] for sample in samples]
+                valid = [
+                    sample
+                    for sample in samples
+                    if "queue_per_replica" in sample
+                    and "kv_usage" in sample
+                    and "generation_tps" in sample
+                ]
+                metrics["coverage"] = len(valid) / len(targets)
+                for key in (
+                    "queue_per_replica",
+                    "wait_p95_s",
+                    "kv_usage",
+                    "ttft_p95_s",
+                    "generation_tps",
+                ):
+                    values = [sample[key] for sample in samples if key in sample]
+                    if values:
                         metrics[key] = (
-                            sum(values) / len(values) if key == "queue_per_replica" else max(values)
+                            sum(values)
+                            if key == "generation_tps"
+                            else sum(values) / len(values)
+                            if key in ("queue_per_replica", "kv_usage")
+                            else max(values)
                         )
+                for key in ("queue_p95_overflow", "ttft_p95_overflow"):
+                    metrics[key] = any(sample.get(key) is True for sample in samples)
         return {"status": status, "metrics": metrics, "workload": workload}
 
     def publish_pipeline(self, body):

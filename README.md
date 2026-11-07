@@ -39,7 +39,7 @@ AReaL 的训练入口是 `examples/areal_agent_train.py`，详见[框架接入](
 elastic-rollout autoscale --endpoint http://<控制器>:8080 --deployment elastic-rollout --config examples/autoscaling.json --once
 ```
 
-默认仅给出建议。正式启用前，在配置中启用 `pipeline_enabled`，确保训练适配器持续发布有效流水线指标，再加 `--activate` 启动控制循环。手动设置 desired 会切回 MANUAL 模式。
+独立 CLI 默认仅给出建议，加 `--activate` 执行扩缩；原生 verl 入口默认自动启动策略。默认采用 Relax 风格的推理负载策略（`policy_mode=service`），不再要求库存换代 trial。手动设置 desired 会切回 MANUAL 模式。规则、来源和边界见[自动扩缩说明](docs/autoscaling.md)。
 
 ## 使用边界
 

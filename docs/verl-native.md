@@ -65,7 +65,7 @@ python -m verl.trainer.main_ppo \
 | `+elastic.controller_port`、`+elastic.vllm_port` | 控制器端口和每机推理端口起点，默认 18080/18100 |
 | `+elastic.policy.<字段>` | 可选策略调参，沿用 AutoscalingConfig |
 
-启用后只安装外部推理服务、权重同步适配器和流水线观察 sampler，以及外部实例所需的 `free_cache_engine=false`。`parameter_sync_step` 与 batch 关系沿用原生配置并校验；FSDP2/Megatron 的训练 dtype 和 Bridge 设置也必须由原生配置明确指定，不自动切换。
+默认启用后安装外部推理服务、权重同步适配器，以及外部实例所需的 `free_cache_engine=false`。默认使用 Relax 风格服务负载策略，不安装额外的流水线观察 sampler；显式选择 `+elastic.policy.policy_mode=pipeline` 时保留旧 observer/trial 路径。`parameter_sync_step` 与 batch 关系沿用原生配置并校验；FSDP2/Megatron 的训练 dtype 和 Bridge 设置也必须由原生配置明确指定，不自动切换。
 
 所有模型、训练、数据及自定义配置字段经 Hydra 合成后传给训练子进程；集成拥有的字段除外。子进程不再携带 `elastic` 根配置，避免递归启动。自定义 sampler/manager 冲突会报错；当前入口还不映射额外的 `rollout.engine_kwargs.vllm`，有设置时显式拒绝。
 

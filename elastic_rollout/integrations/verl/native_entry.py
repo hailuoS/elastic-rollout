@@ -34,7 +34,7 @@ class NativeOptions:
                 raise ValueError(f"elastic.{key} must be a positive integer")
         if max(self.controller_port, self.vllm_port) > 65535:
             raise ValueError("elastic ports must be <= 65535")
-        AutoscalingConfig(**{"pipeline_enabled": True, **self.policy})
+        AutoscalingConfig(**self.policy)
 
 
 def build_launch(config, nodes, address, host, options):
@@ -177,7 +177,7 @@ def build_launch(config, nodes, address, host, options):
         trainer_shutdown_timeout_s=180,
         accelerator=accelerator,
         strategy=strategy,
-        autoscaling={"pipeline_enabled": True, **options.policy} if options.autoscale else None,
+        autoscaling=dict(options.policy) if options.autoscale else None,
     )
     owned = {
         **spec.integration_values(address),

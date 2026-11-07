@@ -10,18 +10,21 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class AutoscalingConfig:
-    policy_mode: str = "pipeline"
-    queue_high: float = 8.0
+    policy_mode: str = "service"
+    queue_high: float = 10.0
     wait_high_s: float = 5.0
     kv_high: float = 0.85
     kv_low: float = 0.30
-    projected_kv_limit: float = 0.60
+    projected_kv_limit: float = 0.50
     scale_out_persistence_s: float = 30.0
     scale_in_persistence_s: float = 120.0
     scale_out_cooldown_s: float = 60.0
     scale_in_cooldown_s: float = 300.0
     sample_ttl_s: float = 30.0
-    window_s: float = 30.0
+    window_s: float = 60.0
+    ttft_high_s: float = 10.0
+    max_scale_out_delta: int = 4
+    throughput_variance_limit: float = 0.1
     pipeline_enabled: bool = False
     wait_high: float = 0.10
     wait_low: float = 0.05
@@ -50,6 +53,8 @@ class AutoscalingConfig:
             for key in ("trial_min_cycles", "trial_policy_advances")
         ):
             raise ValueError("trial cycle/version counts must be integers")
+        if type(self.max_scale_out_delta) is not int:
+            raise ValueError("max_scale_out_delta must be an integer")
 
 
 @dataclass(frozen=True)
@@ -84,17 +89,26 @@ class WorkloadSignal:
 
 
 class ServicePressurePolicy:
-    def __init__(self, config=None):
+    """Relax-style engine pressure rules; no training inventory shrink trial.
+
+    Reference: redai-studio/Relax 6a2ad57, scaling_decision.py.
+    Adapted to vLLM metrics and ElasticRollout's lifecycle/coverage contract.
+    """
+
+    def __init__(self, config=None, *, interval=5.0):
         self.config = config or AutoscalingConfig()
+        self.interval = interval
         self.high_since = self.low_since = None
         self.last_out = self.last_in = -math.inf
         self.samples = []
         self.last_observation = None
+        self.identity = None
+        self.streaks = {}
 
     def decide(self, status, metrics, workload=None, *, now=None):
         now = time.time() if now is None else now
         c, s = self.config, status["scaling"]
-        ready, pending = status["ready_replicas"], s["pending_replicas"]
+        ready = status["ready_replicas"]
 
         def hold(reason):
             return {"action": "HOLD", "target": status["desired_replicas"], "reason": reason}
@@ -104,126 +118,120 @@ class ServicePressurePolicy:
             or not status["accepting_routes"]
             or s["transaction_owned"]
             or s["retirements"]
+            or s["pending_replicas"]
             or s["failures"] >= s["retry_limit"]
             or ready < s["minimum"]
+            or ready != status["desired_replicas"]
         ):
-            self.high_since = self.low_since = None
+            self.streaks.clear()
             self.samples.clear()
+            self.high_since = self.low_since = None
             return hold("lifecycle or retry gate")
+        identity = (s.get("revision"), ready)
+        timestamp = metrics.get("observed_at")
+        if (
+            identity != self.identity
+            or self.last_observation is not None
+            and now - self.last_observation > min(c.sample_ttl_s, 2 * self.interval)
+        ):
+            self.streaks.clear()
+            self.samples.clear()
+        self.identity = identity
 
         def number(value):
-            return (
-                not isinstance(value, bool)
-                and isinstance(value, (int, float))
-                and math.isfinite(value)
-                and value >= 0
-            )
+            return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
-        timestamp = metrics.get("observed_at")
-        valid = number(timestamp) and 0 <= now - timestamp <= c.sample_ttl_s
-        if self.last_observation is not None and now - self.last_observation > c.sample_ttl_s:
-            self.high_since = self.low_since = None
+        if not number(timestamp) or not 0 <= now - timestamp <= c.sample_ttl_s:
+            self.streaks.clear()
             self.samples.clear()
-        self.last_observation = now
-        values = {k: metrics.get(k) for k in ("queue_per_replica", "wait_p95_s", "kv_usage")}
+            self.high_since = self.low_since = None
+            return hold("stale or missing engine metrics")
+        if self.last_observation is not None and timestamp <= self.last_observation:
+            return hold("waiting for a new engine observation")
+        self.last_observation = timestamp
         values = {
-            k: v for k, v in values.items() if valid and number(v) and (k != "kv_usage" or v <= 1)
+            k: metrics[k]
+            for k in ("queue_per_replica", "kv_usage", "wait_p95_s", "ttft_p95_s", "generation_tps")
+            if number(metrics.get(k))
         }
-        if valid:
-            if not self.samples or self.samples[-1][0] != timestamp:
-                self.samples.append((timestamp, values))
-        self.samples = [(t, v) for t, v in self.samples if 0 <= now - t <= c.window_s]
-        # Current observation is mandatory; old low values cannot mask a gap.
-        averaged = {
-            k: sum(v[k] for _, v in self.samples if k in v) / sum(k in v for _, v in self.samples)
-            for k in values
-        }
-        queue, wait, kv = (averaged.get(k) for k in ("queue_per_replica", "wait_p95_s", "kv_usage"))
-        high = (
-            (queue is not None and queue > c.queue_high)
-            or (wait is not None and wait > c.wait_high_s)
-            or (kv is not None and kv > c.kv_high)
-        )
-        low = (
-            queue is not None
-            and wait is not None
-            and kv is not None
+        if values.get("kv_usage", 0) > 1:
+            values.pop("kv_usage")
+        self.samples.append((timestamp, values))
+        self.samples = [(t, v) for t, v in self.samples if timestamp - t <= c.window_s][-10:]
+        throughputs = [v["generation_tps"] for _, v in self.samples if "generation_tps" in v]
+        mean = sum(throughputs) / len(throughputs) if throughputs else 0
+        variance = max((abs(v - mean) for v in throughputs), default=0) / mean if mean else 0
+        queue, kv = values.get("queue_per_replica"), values.get("kv_usage")
+        coverage = metrics.get("coverage", 0)
+        conditions = {
+            "kv_high": kv is not None and kv > c.kv_high,
+            "queue_high": queue is not None and queue > c.queue_high,
+            "latency_high": values.get("wait_p95_s", 0) > c.wait_high_s
+            or metrics.get("queue_p95_overflow") is True,
+            "ttft_high": values.get("ttft_p95_s", 0) > c.ttft_high_s
+            or metrics.get("ttft_p95_overflow") is True,
+            "low": coverage == 1
             and queue == 0
-            and wait < 1
+            and kv is not None
             and kv < c.kv_low
-            and values.get("queue_per_replica") == 0
-            and values.get("wait_p95_s", math.inf) < 1
-            and values.get("kv_usage", math.inf) < c.kv_low
-        )
-        pipeline = None
-        if c.pipeline_enabled:
-            try:
-                pipeline = WorkloadSignal(**workload) if workload else None
-            except (TypeError, ValueError):
-                pipeline = None
-            if pipeline is None or not pipeline.valid(now, c.sample_ttl_s):
-                low = False
+            and len(throughputs) >= 3
+            and len(throughputs) == len(self.samples)
+            and variance < c.throughput_variance_limit,
+        }
+        for key, active in conditions.items():
+            if not active or not number(coverage) or coverage < (1 if key == "low" else 0.5):
+                self.streaks.pop(key, None)
             else:
-                high |= pipeline.trainer_wait_fraction > 0.10
-                low &= (
-                    pipeline.trainer_wait_fraction < 0.05 and pipeline.produced >= pipeline.consumed
-                )
-        if not valid or not values:
-            low = False
-        self.high_since = (now if self.high_since is None else self.high_since) if high else None
-        self.low_since = (now if self.low_since is None else self.low_since) if low else None
-        if (
-            high
-            and now - self.high_since >= c.scale_out_persistence_s
-            and now - self.last_out >= c.scale_out_cooldown_s
+                self.streaks.setdefault(key, timestamp)
+        self.high_since = min((v for k, v in self.streaks.items() if k != "low"), default=None)
+        self.low_since = self.streaks.get("low")
+        # Relax applies a cooldown based on the previous scale direction.
+        last = max(self.last_out, self.last_in)
+        cooldown = (
+            c.scale_out_cooldown_s if self.last_out >= self.last_in else c.scale_in_cooldown_s
+        )
+        if now - last < cooldown:
+            return hold("scale operation cooldown")
+        if any(
+            timestamp - start >= c.scale_out_persistence_s
+            for key, start in self.streaks.items()
+            if key != "low"
         ):
-            severe = (queue is not None and queue > 2 * c.queue_high) or (
-                kv is not None and kv > 0.95 and queue is not None and queue > 0
+            usage_delta = int((kv - 0.7) / 0.1) if kv is not None and kv > 0.9 else 1
+            queue_delta = (
+                max(1, int((queue * ready - ready * c.queue_high) // (c.queue_high * 2)))
+                if queue is not None
+                else 1
             )
-            target = min(s["maximum"], ready + (2 if severe else 1))
-            if (
-                pipeline
-                and pipeline.valid(now, c.sample_ttl_s)
-                and pipeline.trainer_wait_fraction > 0.10
-            ):
-                target = min(
-                    s["maximum"],
-                    max(target, PipelineBalancePolicy.scale_out_target(ready, pipeline)),
-                )
-            if target > max(status["desired_replicas"], ready + pending):
+            target = min(
+                s["maximum"], ready + min(c.max_scale_out_delta, max(usage_delta, queue_delta, 1))
+            )
+            if target > ready:
                 return {
                     "action": "OUT",
                     "target": target,
-                    "reason": "persistent service/pipeline pressure",
+                    "reason": "Relax sustained engine pressure",
                 }
         if (
-            low
-            and now - self.low_since >= c.scale_in_persistence_s
-            and now - self.last_in >= c.scale_in_cooldown_s
+            self.low_since is not None
+            and timestamp - self.low_since >= c.scale_in_persistence_s
+            and ready > s["minimum"]
+            and kv * ready / (ready - 1) <= c.projected_kv_limit
         ):
-            if (
-                not pending
-                and ready > s["minimum"]
-                and max(kv, values["kv_usage"]) * ready / (ready - 1) < c.projected_kv_limit
-            ):
-                target = ready - 1
-                if pipeline and pipeline.produced > 0:
-                    target = max(
-                        target, math.ceil(ready * pipeline.consumed / pipeline.produced * 1.1)
-                    )
-                if target < status["desired_replicas"]:
-                    return {
-                        "action": "IN",
-                        "target": max(s["minimum"], target),
-                        "reason": "all demand signals persistently low",
-                    }
-        return hold("persistence, cooldown, capacity or incomplete low-demand evidence")
+            return {
+                "action": "IN",
+                "target": ready - 1,
+                "reason": "Relax sustained low usage, empty queue and stable throughput",
+            }
+        return hold("engine pressure persistence, bounds or incomplete shrink evidence")
 
     def applied(self, decision, now):
         if decision["action"] == "OUT":
             self.last_out = now
         elif decision["action"] == "IN":
             self.last_in = now
+        self.streaks.clear()
+        self.samples.clear()
         self.high_since = self.low_since = None
 
 
@@ -425,7 +433,7 @@ def run_autoscaler(client, config, *, once=False, activate=False, interval=5.0):
     policy = (
         TrainingPipelinePolicy(config)
         if config.policy_mode == "pipeline"
-        else ServicePressurePolicy(config)
+        else ServicePressurePolicy(config, interval=interval)
     )
     if activate:
         from dataclasses import asdict
@@ -440,7 +448,6 @@ def run_autoscaler(client, config, *, once=False, activate=False, interval=5.0):
         if (
             activate
             and decision["action"] != "HOLD"
-            and decision["action"] != "IN"
             and snapshot["status"]["scaling"]["mode"] == "AUTO"
         ):
             body = {
@@ -464,7 +471,7 @@ def run_autoscaler(client, config, *, once=False, activate=False, interval=5.0):
                 policy = (
                     TrainingPipelinePolicy(config)
                     if config.policy_mode == "pipeline"
-                    else ServicePressurePolicy(config)
+                    else ServicePressurePolicy(config, interval=interval)
                 )
             else:
                 policy.applied(decision, now)

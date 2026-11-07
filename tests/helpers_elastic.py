@@ -104,7 +104,14 @@ def grow(c, m, count):
 
 
 def metric(t, queue=0, kv=0.1):
-    return {"observed_at": t, "queue_per_replica": queue, "wait_p95_s": 0, "kv_usage": kv}
+    return {
+        "observed_at": t,
+        "queue_per_replica": queue,
+        "wait_p95_s": 0,
+        "kv_usage": kv,
+        "generation_tps": 100,
+        "coverage": 1.0,
+    }
 
 
 def state():
