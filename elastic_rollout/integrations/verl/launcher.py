@@ -121,6 +121,10 @@ def _wait_ready(
             raise RuntimeError(f"Core exited before serving readiness (exit {core.returncode})")
         try:
             status = client.status()
+            if "base_failed" in status.get("route_pause_reasons", ()):
+                raise RuntimeError(
+                    f"Core base replica failed before trainer start: {status.get('last_error')}"
+                )
             if not validated:
                 validate_bootstrap(status, spec, core_config)
                 validated = True

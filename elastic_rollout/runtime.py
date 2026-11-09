@@ -618,10 +618,12 @@ class ReplicaManager(ScalingControl):
         with self.traffic.lock:
             self._transition(replica, S.FAILED)
             invalidated = self.traffic.invalidate_replica(replica.replica_id)
-        logger.info(
-            "replica failed replica_id=%s invalidated_leases=%s",
+        logger.error(
+            "replica failed replica_id=%s invalidated_leases=%s error=%s: %s",
             replica.replica_id,
             invalidated,
+            type(error).__name__,
+            error,
         )
         self._cleanup(replica)
         if candidate_failure:

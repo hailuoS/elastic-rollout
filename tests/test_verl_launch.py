@@ -351,6 +351,23 @@ def test_launcher_validates_bootstrap_once_and_uses_core_readiness(launch_file):
         launcher.validate_bootstrap(status, spec, spec.core_config())
 
 
+def test_failed_base_reports_cause_without_waiting_for_startup_deadline(launch_file, monkeypatch):
+    spec = LaunchSpec.from_file(launch_file)
+    core = Mock()
+    core.poll.return_value = None
+    client = Mock()
+    client.status.return_value = {
+        "route_pause_reasons": ["base_failed"],
+        "last_error": "replica startup/health timeout",
+    }
+    sleep = Mock(side_effect=AssertionError("must not keep waiting after terminal base failure"))
+    monkeypatch.setattr(launcher.time, "sleep", sleep)
+    with pytest.raises(RuntimeError, match="base replica failed.*startup/health timeout"):
+        launcher._wait_ready(client, spec, spec.core_config(), core, [0])
+    assert client.status.call_count == 1
+    sleep.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "field,value,error",
     [
