@@ -11,8 +11,26 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _group_has_live_members(pgid: int, proc_root=Path("/proc")) -> bool:
+    """Zombies retain their process group but no longer own device resources."""
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            except FileNotFoundError:
+                continue  # A process exited during the scan.
+            if int(fields[2]) == pgid and fields[0] not in ("Z", "X"):
+                return True
+    except (OSError, ValueError, IndexError):
+        return True  # Incomplete visibility must never release a physical slot.
+    return False
 
 
 def _wait_group_exit(process, timeout: float) -> bool:
@@ -22,6 +40,8 @@ def _wait_group_exit(process, timeout: float) -> bool:
         try:
             os.killpg(process.pid, 0)
         except ProcessLookupError:
+            return True
+        if not _group_has_live_members(process.pid):
             return True
         if time.monotonic() >= deadline:
             return False

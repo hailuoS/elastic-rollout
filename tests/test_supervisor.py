@@ -11,6 +11,19 @@ import pytest
 from elastic_rollout.launcher import supervisor
 
 
+@pytest.mark.parametrize("state,expected", [("Z", False), ("X", False), ("S", True), ("D", True)])
+def test_group_members_distinguish_zombies_from_live_processes(tmp_path, state, expected):
+    member = tmp_path / "42"
+    member.mkdir()
+    (member / "stat").write_text(f"42 (worker name (npu)) {state} 1 123 123 0")
+    assert supervisor._group_has_live_members(123, tmp_path) is expected
+    assert supervisor._group_has_live_members(456, tmp_path) is False
+
+
+def test_unreadable_process_table_does_not_confirm_cleanup(tmp_path):
+    assert supervisor._group_has_live_members(123, tmp_path / "missing") is True
+
+
 @pytest.fixture(autouse=True)
 def posix_signals(monkeypatch):
     monkeypatch.setattr(

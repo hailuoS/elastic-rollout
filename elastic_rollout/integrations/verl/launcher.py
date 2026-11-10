@@ -176,10 +176,47 @@ def run_launch(
         validate_verl_config(
             spec, ray_address, trainer_overrides, core_config, config=trainer_config
         )
+
+    def trainer_command(temp):
+        trainer_args = trainer_overrides
+        if trainer_config is not None:
+            from omegaconf import OmegaConf
+
+            OmegaConf.save(trainer_config, Path(temp) / "trainer.yaml", resolve=True)
+            trainer_args = ["--config-path", temp, "--config-name", "trainer"]
+        return [sys.executable, "-m", "verl.trainer.main_ppo", *trainer_args]
+
+    return run_owned_children(
+        spec,
+        core_config,
+        ray_address,
+        trainer_command,
+        report_path=report_path,
+        wait_first_weights=native_placement,
+    )
+
+
+def run_owned_children(
+    spec,
+    core_config,
+    ray_address,
+    trainer_command,
+    *,
+    report_path=None,
+    wait_first_weights=True,
+    extra_env=None,
+):
+    """Own Core, original training command and scaler with common cleanup guarantees."""
     client = ControlClient(
-        spec.endpoint, spec.deployment_id, token=os.environ.get("ELASTIC_ROLLOUT_TOKEN"), timeout=2
+        spec.endpoint,
+        spec.deployment_id,
+        token=(extra_env or {}).get(
+            "ELASTIC_ROLLOUT_TOKEN", os.environ.get("ELASTIC_ROLLOUT_TOKEN")
+        ),
+        timeout=2,
     )
     env = os.environ.copy()
+    env.update(extra_env or {})
     env["RAY_ADDRESS"] = ray_address
     env["ELASTIC_ROLLOUT_EXPECTED_GCS_ADDRESS"] = ray_address
     core = None
@@ -247,20 +284,14 @@ def run_launch(
             )
             if interrupted[0]:
                 raise InterruptedError("launch interrupted before trainer start")
-            trainer_args = trainer_overrides
-            if trainer_config is not None:
-                from omegaconf import OmegaConf
-
-                OmegaConf.save(trainer_config, Path(temp) / "trainer.yaml", resolve=True)
-                trainer_args = ["--config-path", temp, "--config-name", "trainer"]
             trainer = subprocess.Popen(
-                owned_command([sys.executable, "-m", "verl.trainer.main_ppo", *trainer_args]),
+                owned_command(trainer_command(temp)),
                 env=env,
                 start_new_session=os.name == "posix",
             )
-            logger.info("started Verl trainer pid=%s on Ray GCS %s", trainer.pid, ray_address)
+            logger.info("started trainer pid=%s on Ray GCS %s", trainer.pid, ray_address)
             # Bound native PG/trainer initialization without dummy reservation actors.
-            starting = native_placement
+            starting = wait_first_weights
             startup_deadline = time.monotonic() + spec.startup_timeout_s
             while True:
                 if interrupted[0]:
@@ -321,7 +352,7 @@ def run_launch(
                     raise RuntimeError("elastic autoscaler exited while training was running")
                 time.sleep(0.2)
     except (Exception, KeyboardInterrupt):
-        logger.exception("verl launch failed")
+        logger.exception("owned training launch failed")
         failed = True
     finally:
         cleanup_ok = True

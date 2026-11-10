@@ -16,6 +16,48 @@ Megatron 设置 `verl.strategy="megatron"`，移除示例中显式的 `actor_rol
 
 ## AReaL
 
+### 原始脚本入口（NPU，当前验收候选）
+
+工作区中的 AReaL 已接入可选 `elastic` 配置。保持原始 Python 训练脚本、
+workflow 和奖励代码，在原生配置后追加参数：
+
+```bash
+export RAY_AUTH_MODE=token
+export RAY_AUTH_TOKEN_PATH=/path/to/private/ray/auth_token
+export RAY_ADDRESS=<专用Ray集群GCS地址>
+python examples/math/gsm8k_rl.py --config <原生训练配置.yaml> \
+  scheduler.type=ray actor.weight_update_mode=xccl \
+  +elastic.enabled=true +elastic.min_replicas=1 +elastic.max_replicas=4 \
+  +elastic.ray_address="${RAY_ADDRESS}"
+```
+
+原生 YAML 没有 `elastic` 节点时使用 Hydra 的 `+` 语法；已有该字段时直接
+覆盖。关闭功能只需将 `enabled` 改为 `false`，仍使用原生 `PPOTrainer`。
+此入口需要安装本仓与包含对应接入修改的 AReaL，不能用于未修改的上游版本。
+
+启动前准备一个空闲、启用 token 认证的专用 Ray NPU 集群；其节点数及每节点
+`NPU` 资源必须与原生 `cluster` 配置一致。actor 与 rollout 使用独立的设备预算，
+例如 8 卡节点分配 4 卡训练和 4 卡推理预算；每个 actor worker 的 scheduling spec
+声明 1 张卡。FSDP 与 Megatron 均从原生 backend/并行配置推导布局，无需另写 Core JSON。
+推理 TP 组必须在单节点内放下，最大副本数不能超过推理预算。
+
+当前入口要求 v1、dense BF16、预训练本地/共享模型、`recover.mode=disabled`、
+vLLM rollout。Megatron 使用 Megatron Bridge 和 Bridge 权重更新；EP/CP 为 1，
+不启用 LoRA/FP8。启用 KL reference 时，reference 必须与 actor 采用相同后端和
+并行布局，并通过非 fork 的 colocation 复用 actor workers。critic/teacher 尚未接入
+该入口的资源规划，会在启动前拒绝。
+
+父进程先启动 Core bootstrap 副本，再重新执行同一个 Python 脚本或模块；训练子进程
+绑定同一 Ray 集群，由 `ElasticPPOTrainer` 执行权重更新和 rollout。默认开启自动策略；
+独立手动功能验收可追加 `+elastic.autoscale=false`。控制器默认端口 28080、
+推理端口起点 28100，可通过对应 elastic 参数覆盖。退出报告写入原生 stats logger
+目录下的 `elastic/native-entry.json` 和 `elastic/cleanup.json`，不记录认证密钥值。
+
+该入口的配置、原始命令重执行和 CPU 契约测试已通过；AReaL 两后端的完整 NPU
+训练及扩缩验收仍在进行，不能将这些测试视为实机扩缩已通过。
+
+### 显式外部 Core 入口
+
 先启动 Core，设置训练进程环境：
 
 ```bash

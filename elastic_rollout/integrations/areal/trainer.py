@@ -28,6 +28,18 @@ class ElasticPPOTrainer(PPOTrainer):
         workflow_worker_count=2,
         weight_sync_config: WeightSyncConfig | HCCLWeightSyncConfig | None = None,
     ):
+        elastic = getattr(config, "elastic", None)
+        if (
+            weight_sync_config is None
+            and elastic is not None
+            and elastic.enabled
+            and os.environ.get("ELASTIC_ROLLOUT_AREAL_CHILD") == "1"
+        ):
+            weight_sync_config = HCCLWeightSyncConfig(
+                master_address=os.environ.get("ELASTIC_ROLLOUT_MASTER_ADDRESS"),
+                bucket_size=elastic.weight_sync_bucket_size_mb * 1024 * 1024,
+            )
+            workflow_worker_count = elastic.workflow_worker_count
         self._weight_sync_config = weight_sync_config or WeightSyncConfig()
         self._hccl = isinstance(self._weight_sync_config, HCCLWeightSyncConfig)
         if not is_single_controller():
