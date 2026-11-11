@@ -107,6 +107,13 @@ class _ProcessActor:
             os.close(writer)
         return self.actual_device_ids
 
+    def location(self, port):
+        import ray
+
+        host = ray.util.get_node_ip_address()
+        host = f"[{host}]" if ":" in host else host
+        return f"http://{host}:{port}"
+
     def alive(self) -> bool:
         return self.process is not None and self.process.poll() is None
 

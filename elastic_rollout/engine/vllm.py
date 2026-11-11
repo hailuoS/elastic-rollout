@@ -339,7 +339,11 @@ class VLLMServiceDriver:
         return self.launcher.alive(replica.replica_id)
 
     def health(self, replica: ReplicaDescriptor) -> bool:
-        return self.launcher.started(replica.replica_id) and self.control.health(replica.endpoint)
+        if not self.launcher.started(replica.replica_id):
+            return False
+        if replica.allocation.endpoint:
+            replica.endpoint = replica.allocation.endpoint
+        return self.control.health(replica.endpoint)
 
     def warmup(self, replica: ReplicaDescriptor, spec: DeploymentSpec) -> bool:
         ready = self.control.warmup(replica.endpoint, spec.replica.served_model_name)

@@ -78,10 +78,19 @@ def main() -> None:
     config = json.loads(args.config.read_text(encoding="utf-8"))
     slots = [ResourceSlot(**slot) for slot in config["slots"]]
     resources = StaticResourceProvider(slots)
+    launcher_class = RayProcessLauncher
+    launcher_options = {}
+    if config.get("resource_backend") == "ray_pg":
+        from .launcher.ray_pg import RayPGProcessLauncher
+
+        launcher_class = RayPGProcessLauncher
+        launcher_options["resource_label"] = config["pg_resource_label"]
     controller = Controller(
         resources,
         VLLMServiceDriver(
-            RayProcessLauncher(args.ray_address, expected_gcs=args.expected_gcs_address)
+            launcher_class(
+                args.ray_address, expected_gcs=args.expected_gcs_address, **launcher_options
+            )
         ),
     )
     # Ray.init replaces the driver's SIGTERM handler. Install ours afterwards.

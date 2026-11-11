@@ -177,9 +177,10 @@ class ResourceSlot:
     num_devices: int
     port: int = 8000
     num_cpus: float = 8.0
+    placement_group: bool = False
 
     def __post_init__(self) -> None:
-        if not self.slot_id or not self.node_id or not self.host:
+        if not self.slot_id or (not self.placement_group and (not self.node_id or not self.host)):
             raise ValueError("slot_id, Ray node_id and host are required")
         if type(self.num_devices) is not int or self.num_devices <= 0:
             raise ValueError("num_devices must be a positive integer")
@@ -189,6 +190,8 @@ class ResourceSlot:
 
     @property
     def endpoint(self) -> str:
+        if self.placement_group:
+            return ""  # Published by the actor only after Ray chooses its node.
         host = f"[{self.host}]" if ":" in self.host else self.host
         return f"http://{host}:{self.port}"
 
@@ -200,6 +203,7 @@ class ResourceAllocation:
     slot_id: str
     num_devices: int
     actual_device_ids: tuple[str, ...] = ()
+    endpoint: str = ""
 
 
 @dataclass(frozen=True)

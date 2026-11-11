@@ -129,7 +129,14 @@ class LaunchSpec:
             if isinstance(self.core_template, dict)
             else json.loads(self.core_template.read_text(encoding="utf-8"))
         )
-        if unknown := set(config) - {"slots", "deployments", "endpoint", "ray_address"}:
+        if unknown := set(config) - {
+            "slots",
+            "deployments",
+            "endpoint",
+            "ray_address",
+            "resource_backend",
+            "pg_resource_label",
+        }:
             raise ValueError(f"unsupported Core template fields: {sorted(unknown)}")
         slots = [ResourceSlot(**slot) for slot in config["slots"]]
         StaticResourceProvider(slots)
@@ -160,7 +167,14 @@ class LaunchSpec:
         if "ray_address" in config and (resolved_ray_address or self.ray_address != "auto"):
             if config["ray_address"] != (resolved_ray_address or self.ray_address):
                 raise ValueError("Core template ray_address conflicts with resolved Ray cluster")
-        return {"slots": config["slots"], "deployments": [deployment]}
+        result = {"slots": config["slots"], "deployments": [deployment]}
+        if config.get("resource_backend") == "ray_pg":
+            if not all(slot.placement_group for slot in slots):
+                raise ValueError("PG mode requires logical PG slots")
+            result.update(resource_backend="ray_pg", pg_resource_label=config["pg_resource_label"])
+        elif any(slot.placement_group for slot in slots):
+            raise ValueError("logical PG slots require ray_pg backend")
+        return result
 
     def integration_values(self, ray_address: str) -> dict[str, str]:
         if ray_address in ("", "auto", "local"):
@@ -312,6 +326,11 @@ def validate_verl_config(
         raise ValueError(
             "Verl train_batch_size must equal parameter_sync_step * ppo_mini_batch_size"
         )
+    if core.get("resource_backend") == "ray_pg":
+        placement = get("trainer.placement_group_node_ids.global_pool")
+        if not placement or len(set(placement)) != get("trainer.nnodes"):
+            raise ValueError("PG rollout requires explicit distinct training node placement")
+        return
     by_node: dict[str, int] = {}
     for slot in core["slots"]:
         by_node[slot["node_id"]] = by_node.get(slot["node_id"], 0) + slot["num_devices"]

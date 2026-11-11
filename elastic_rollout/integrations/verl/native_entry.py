@@ -22,6 +22,8 @@ class NativeOptions:
     controller_port: int = 18080
     vllm_port: int = 18100
     policy: dict = field(default_factory=dict)
+    resource_backend: str = "static"
+    pg_resource_label: str = ""
 
     def __post_init__(self):
         if type(self.enabled) is not bool or type(self.autoscale) is not bool:
@@ -34,6 +36,18 @@ class NativeOptions:
                 raise ValueError(f"elastic.{key} must be a positive integer")
         if max(self.controller_port, self.vllm_port) > 65535:
             raise ValueError("elastic ports must be <= 65535")
+        if self.resource_backend not in ("static", "ray_pg"):
+            raise ValueError("resource_backend must be static or ray_pg")
+        if self.resource_backend == "ray_pg":
+            if not self.pg_resource_label or self.pg_resource_label in (
+                "CPU",
+                "GPU",
+                "NPU",
+                "memory",
+            ):
+                raise ValueError("ray_pg requires a dedicated pg_resource_label")
+            if self.max_replicas is None:
+                raise ValueError("ray_pg requires explicit max_replicas")
         AutoscalingConfig(**self.policy)
 
 
@@ -74,6 +88,9 @@ def build_launch(config, nodes, address, host, options):
     )
     if any(type(v) is not int or v <= 0 for v in (train, count, tp)):
         raise ValueError("trainer node/device counts and rollout TP must be positive integers")
+    pg_mode = options.resource_backend == "ray_pg"
+    if pg_mode:
+        nodes = [n for n in nodes if not n["Resources"].get(options.pg_resource_label, 0)]
     nodes = sorted(nodes, key=lambda n: n["NodeManagerAddress"])
     if len(nodes) != count:
         raise ValueError("use a dedicated Ray accelerator cluster matching trainer.nnodes")
@@ -81,19 +98,19 @@ def build_launch(config, nodes, address, host, options):
     if len(capacities) != 1:
         raise ValueError("native elastic entry currently requires uniform node capacities")
     capacity = capacities.pop()
-    if capacity != int(capacity) or capacity <= train:
+    if capacity != int(capacity) or (capacity < train if pg_mode else capacity <= train):
         raise ValueError("each node needs accelerator capacity beyond its training reservation")
     available = int(capacity) - train
     rollout_nodes, rollout_devices = get(f"{ROLLOUT}.nnodes"), get(f"{ROLLOUT}.n_gpus_per_node")
     if rollout_nodes != count or type(rollout_devices) is not int or rollout_devices <= 0:
         raise ValueError("native rollout resource shape must span the selected trainer nodes")
-    if rollout_devices > available or rollout_devices % tp:
+    if (not pg_mode and rollout_devices > available) or rollout_devices % tp:
         raise ValueError("native rollout devices must fit beside training and be divisible by TP")
     maximum = options.max_replicas or count * rollout_devices // tp
     minimum = options.min_replicas or min(count, maximum)
-    if maximum < minimum or maximum * tp > count * rollout_devices:
+    if maximum < minimum or (not pg_mode and maximum * tp > count * rollout_devices):
         raise ValueError("elastic min/max must fit the native rollout resource budget")
-    ports_per_node = (maximum + count - 1) // count
+    ports_per_node = maximum if pg_mode else (maximum + count - 1) // count
     if options.vllm_port + ports_per_node - 1 > 65535:
         raise ValueError("elastic vLLM port range exceeds 65535")
     if options.vllm_port <= options.controller_port < options.vllm_port + ports_per_node:
@@ -122,6 +139,19 @@ def build_launch(config, nodes, address, host, options):
         for i in range(rollout_devices // tp)
         for n, node in enumerate(nodes)
     ][:maximum]
+    if pg_mode:
+        slots = [
+            dict(
+                slot_id=f"pg-{i}",
+                node_id="",
+                host="",
+                num_devices=tp,
+                num_cpus=1,
+                port=options.vllm_port + i,
+                placement_group=True,
+            )
+            for i in range(maximum)
+        ]
     replica = dict(
         python_executable=sys.executable,
         tensor_parallel_size=tp,
@@ -162,6 +192,8 @@ def build_launch(config, nodes, address, host, options):
             )
         ],
     )
+    if pg_mode:
+        core.update(resource_backend="ray_pg", pg_resource_label=options.pg_resource_label)
     spec = LaunchSpec(
         ray_address=address,
         bind_host="0.0.0.0",
@@ -214,6 +246,8 @@ def run_native(config):
         host = context.address_info["node_ip_address"]
         resource = "NPU" if config.trainer.device == "npu" else "GPU"
         nodes = [n for n in ray.nodes() if n["Alive"] and n["Resources"].get(resource, 0) > 0]
+        if options.resource_backend == "ray_pg":
+            nodes = [n for n in nodes if not n["Resources"].get(options.pg_resource_label, 0)]
         free = ray._private.state.available_resources_per_node()
         if any(
             free.get(n["NodeID"], {}).get(resource, 0) != n["Resources"][resource] for n in nodes

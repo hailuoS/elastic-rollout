@@ -49,6 +49,8 @@ def resolve_ray_cluster(spec: LaunchSpec, core_config: dict) -> str:
         if not address or address in ("auto", "local"):
             raise RuntimeError("Ray did not return a concrete GCS address")
         nodes = {node["NodeID"]: node for node in ray.nodes() if node.get("Alive")}
+        if core_config.get("resource_backend") == "ray_pg":
+            return address  # Capacity may arrive after platform provisioning.
         slots_by_node: dict[str, int] = {}
         for slot in core_config["slots"]:
             node_id = slot["node_id"]
@@ -385,8 +387,11 @@ def run_owned_children(
                 from elastic_rollout.launcher.network import rollout_ports_closed
 
                 try:
-                    ports_closed = rollout_ports_closed(core_config["slots"])
-                    if not ports_closed:
+                    ports_closed = (
+                        None if core_config.get("resource_backend") == "ray_pg"
+                        else rollout_ports_closed(core_config["slots"])
+                    )
+                    if ports_closed is False:
                         cleanup_ok = False
                 except Exception:
                     cleanup_ok = False
