@@ -26,14 +26,13 @@ class CollectiveBackend:
         getattr(torch, self.device).synchronize()
 
     def initialize(self, session):
-        if self.name == "nccl":
-            import torch
+        import torch
 
-            # NCCL allocates outside PyTorch's caching allocator. Training can
-            # retain almost all free VRAM in that cache before a dynamic join.
-            # Reclaim unused blocks once per new group, never on group reuse.
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        # Collective libraries allocate outside PyTorch's caching allocator.
+        # Release unused training blocks before a new NCCL or HCCL group.
+        device = getattr(torch, self.device)
+        device.synchronize()
+        device.empty_cache()
         return self.engine().trainer_init(session)
 
     def destroy(self, group):
