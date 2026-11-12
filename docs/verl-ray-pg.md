@@ -40,3 +40,14 @@ Core 退出成功依赖实例 supervisor 清理和 PG 删除确认，不伪称�
 
 本版提供模拟 Ray 的生命周期和真实 Hydra 配置测试；平台新增节点、真实 Ray 调度、
 NPU 训练和扩缩容端到端尚需联调验证。
+
+## 资源配置与统计
+
+PG 模式下 `trainer.nnodes/n_gpus_per_node` 固定训练侧资源池；推理规模由
+`elastic.min_replicas/max_replicas` 和 rollout TP 决定。原生 rollout 的
+`nnodes/n_gpus_per_node` 不参与该模式的资源申请，可保留默认值，不随扩缩修改。
+静态模式仍校验原生 rollout 预算。
+
+每卡吞吐使用训练资源池卡数加 Core 已确认分配、尚未释放的推理设备数。
+排空或清理失败但仍持有资源的实例计入；pending 且尚未确认设备分配的不计入。
+这是采样时的已确认分配量，存在启动状态上报延迟，不是平台计费卡时或步内占用积分。

@@ -102,11 +102,16 @@ def build_launch(config, nodes, address, host, options):
         raise ValueError("each node needs accelerator capacity beyond its training reservation")
     available = int(capacity) - train
     rollout_nodes, rollout_devices = get(f"{ROLLOUT}.nnodes"), get(f"{ROLLOUT}.n_gpus_per_node")
-    if rollout_nodes != count or type(rollout_devices) is not int or rollout_devices <= 0:
-        raise ValueError("native rollout resource shape must span the selected trainer nodes")
-    if (not pg_mode and rollout_devices > available) or rollout_devices % tp:
-        raise ValueError("native rollout devices must fit beside training and be divisible by TP")
-    maximum = options.max_replicas or count * rollout_devices // tp
+    if not pg_mode:
+        if rollout_nodes != count or type(rollout_devices) is not int or rollout_devices <= 0:
+            raise ValueError("native rollout resource shape must span the selected trainer nodes")
+        if rollout_devices > available or rollout_devices % tp:
+            raise ValueError(
+                "native rollout devices must fit beside training and be divisible by TP"
+            )
+    maximum = (
+        options.max_replicas if pg_mode else (options.max_replicas or count * rollout_devices // tp)
+    )
     minimum = options.min_replicas or min(count, maximum)
     if maximum < minimum or (not pg_mode and maximum * tp > count * rollout_devices):
         raise ValueError("elastic min/max must fit the native rollout resource budget")
@@ -136,7 +141,7 @@ def build_launch(config, nodes, address, host, options):
             num_cpus=1,
             port=options.vllm_port + i,
         )
-        for i in range(rollout_devices // tp)
+        for i in range(0 if pg_mode else rollout_devices // tp)
         for n, node in enumerate(nodes)
     ][:maximum]
     if pg_mode:

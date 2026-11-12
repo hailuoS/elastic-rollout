@@ -103,6 +103,14 @@ class ElasticRolloutService:
     def get_active_server_count(self):
         return self.control.status()["ready_replicas"]
 
+    def get_n_gpus(self):
+        # Retain draining/failed assignments until their resource lease is released.
+        return sum(
+            len(r["allocation"]["actual_device_ids"])
+            for r in self.control.replicas()
+            if r["resource"] is not None and r["allocation"] is not None
+        )
+
     def destroy(self):
         """The runtime outlives framework clients and owns replica cleanup."""
 

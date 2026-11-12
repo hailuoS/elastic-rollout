@@ -86,3 +86,81 @@ def test_pg_entry_accepts_future_capacity_and_pins_training(tmp_path, strategy):
     assert all(s["placement_group"] and not s["node_id"] for s in core["slots"])
     assert child.trainer.placement_group_node_ids.global_pool == ["n0"]
     validate_verl_config(spec, spec.ray_address, [], core, config=child)
+
+
+@pytest.mark.parametrize("shape", [(-1, -1), (3, 7)])
+def test_pg_ignores_static_rollout_shape_through_native_constructor(tmp_path, shape):
+    from types import SimpleNamespace as NS
+
+    from test_integrations import ROOT, source_methods
+
+    config, nodes = native_config(tmp_path)
+    config.actor_rollout_ref.rollout.nnodes, config.actor_rollout_ref.rollout.n_gpus_per_node = (
+        shape
+    )
+    spec, child = build_launch(
+        config,
+        nodes,
+        "head:6379",
+        "head",
+        NativeOptions(
+            resource_backend="ray_pg",
+            pg_resource_label="rollout",
+            max_replicas=4,
+        ),
+    )
+    assert len(spec.core_config()["slots"]) == 4
+    assert child.trainer.n_gpus_per_node == 4 and child.trainer.nnodes == 1
+    init = source_methods(
+        ROOT / "verl/verl/trainer/ppo/v1/trainer_separate_async.py",
+        "PPOTrainerSeparateAsync",
+        ["__init__"],
+        {
+            "super": lambda: NS(__init__=lambda config: None),
+            "need_reward_model": lambda config: False,
+        },
+    )["__init__"]
+    init(NS(), child)
+    child.actor_rollout_ref.rollout.llm_server_manager_class = None
+    if shape[0] < 0:
+        with pytest.raises(AssertionError):
+            init(NS(), child)
+
+
+def test_throughput_tracks_confirmed_assignments_and_preserves_native_fallback():
+    from types import SimpleNamespace as NS
+
+    from test_integrations import PACKAGE, ROOT, source_methods
+
+    count = source_methods(
+        PACKAGE / "integrations/verl/rollout_service.py",
+        "ElasticRolloutService",
+        ["get_n_gpus"],
+        {},
+    )["get_n_gpus"]
+    throughput = source_methods(
+        ROOT / "verl/verl/trainer/ppo/v1/trainer_separate_async.py",
+        "PPOTrainerSeparateAsync",
+        ["_get_n_gpus_for_throughput"],
+        {},
+    )["_get_n_gpus_for_throughput"]
+    replicas = []
+    service = NS(control=NS(replicas=lambda: replicas))
+    trainer = NS(
+        resource_pool_manager=NS(get_n_gpus=lambda: 4),
+        standalone_server_manager=NS(get_n_gpus=lambda: count(service)),
+    )
+    for assigned in (1, 4, 2):
+        replicas[:] = [
+            dict(resource={}, allocation={"actual_device_ids": [str(i)]}) for i in range(assigned)
+        ]
+        replicas.extend(
+            [
+                dict(resource={}, allocation={"actual_device_ids": []}),
+                dict(resource=None, allocation={"actual_device_ids": ["old"]}),
+            ]
+        )
+        assert throughput(trainer) == 4 + assigned
+    trainer.standalone_server_manager = NS()
+    trainer.config = NS(actor_rollout_ref=NS(rollout=NS(nnodes=2, n_gpus_per_node=4)))
+    assert throughput(trainer) == 12
