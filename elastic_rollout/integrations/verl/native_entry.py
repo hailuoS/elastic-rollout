@@ -23,7 +23,8 @@ class NativeOptions:
     vllm_port: int = 18100
     policy: dict = field(default_factory=dict)
     resource_backend: str = "static"
-    pg_resource_label: str = ""
+    pg_label_selector: dict[str, str] = field(default_factory=dict)
+    train_label_selector: dict[str, str] = field(default_factory=lambda: {"role": "train"})
 
     def __post_init__(self):
         if type(self.enabled) is not bool or type(self.autoscale) is not bool:
@@ -39,13 +40,10 @@ class NativeOptions:
         if self.resource_backend not in ("static", "ray_pg"):
             raise ValueError("resource_backend must be static or ray_pg")
         if self.resource_backend == "ray_pg":
-            if not self.pg_resource_label or self.pg_resource_label in (
-                "CPU",
-                "GPU",
-                "NPU",
-                "memory",
-            ):
-                raise ValueError("ray_pg requires a dedicated pg_resource_label")
+            from elastic_rollout.launcher.ray_pg import validate_label_selector
+
+            validate_label_selector(self.pg_label_selector)
+            validate_label_selector(self.train_label_selector)
             if self.max_replicas is None:
                 raise ValueError("ray_pg requires explicit max_replicas")
         AutoscalingConfig(**self.policy)
@@ -54,8 +52,8 @@ class NativeOptions:
 def build_launch(config, nodes, address, host, options):
     """Derive resources from native trainer shape and discovered Ray node capacities.
 
-    This first static-pool entry uses a dedicated, uniform accelerator cluster;
-    training and rollout both span the selected nodes. No user-maintained slots.
+    PG mode selects labeled training nodes and requests rollout nodes on demand.
+    Static mode shares the selected nodes. No user-maintained slots.
     """
     from omegaconf import OmegaConf, open_dict
 
@@ -90,7 +88,19 @@ def build_launch(config, nodes, address, host, options):
         raise ValueError("trainer node/device counts and rollout TP must be positive integers")
     pg_mode = options.resource_backend == "ray_pg"
     if pg_mode:
-        nodes = [n for n in nodes if not n["Resources"].get(options.pg_resource_label, 0)]
+        nodes = [
+            n
+            for n in nodes
+            if all(
+                n.get("Labels", {}).get(k) == v
+                for k, v in options.train_label_selector.items()
+            )
+        ]
+    if pg_mode and any(
+        all(n.get("Labels", {}).get(k) == v for k, v in options.pg_label_selector.items())
+        for n in nodes
+    ):
+        raise ValueError("training nodes must not match the rollout label selector")
     nodes = sorted(nodes, key=lambda n: n["NodeManagerAddress"])
     if len(nodes) != count:
         raise ValueError("use a dedicated Ray accelerator cluster matching trainer.nnodes")
@@ -198,7 +208,7 @@ def build_launch(config, nodes, address, host, options):
         ],
     )
     if pg_mode:
-        core.update(resource_backend="ray_pg", pg_resource_label=options.pg_resource_label)
+        core.update(resource_backend="ray_pg", pg_label_selector=options.pg_label_selector)
     spec = LaunchSpec(
         ray_address=address,
         bind_host="0.0.0.0",
@@ -252,7 +262,14 @@ def run_native(config):
         resource = "NPU" if config.trainer.device == "npu" else "GPU"
         nodes = [n for n in ray.nodes() if n["Alive"] and n["Resources"].get(resource, 0) > 0]
         if options.resource_backend == "ray_pg":
-            nodes = [n for n in nodes if not n["Resources"].get(options.pg_resource_label, 0)]
+            nodes = [
+                n
+                for n in nodes
+                if all(
+                    n.get("Labels", {}).get(k) == v
+                    for k, v in options.train_label_selector.items()
+                )
+            ]
         free = ray._private.state.available_resources_per_node()
         if any(
             free.get(n["NodeID"], {}).get(resource, 0) != n["Resources"][resource] for n in nodes

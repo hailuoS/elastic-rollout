@@ -29,14 +29,15 @@ def pg_api(monkeypatch, fake_ray):
 
 
 def test_pending_request_is_idempotent_and_cancellable(fake_ray, pg_api):
-    launcher = RayPGProcessLauncher(resource_label="rollout")
+    launcher = RayPGProcessLauncher(label_selector={"role": "rollout"})
     replica, _ = replica_and_spec(tp=2)
     plan = LaunchPlan(("python",))
     launcher.start("r", replica.resource, plan)
     launcher.start("r", replica.resource, plan)
     pg_api.placement_group.assert_called_once_with(
-        [{"CPU": replica.resource.slot.num_cpus, "NPU": 2, "rollout": 0.001}],
+        [{"CPU": replica.resource.slot.num_cpus, "NPU": 2}],
         strategy="STRICT_PACK",
+        bundle_label_selector=[{"role": "rollout"}],
     )
     assert launcher.alive("r")
     fake_ray.remote.assert_not_called()
@@ -46,7 +47,7 @@ def test_pending_request_is_idempotent_and_cancellable(fake_ray, pg_api):
 
 
 def test_actor_uses_reserved_bundle_and_cleanup_precedes_pg_removal(fake_ray, pg_api):
-    launcher = RayPGProcessLauncher(resource_label="rollout")
+    launcher = RayPGProcessLauncher(label_selector={"role": "rollout"})
     replica, _ = replica_and_spec(tp=2)
     launcher.start("r", replica.resource, LaunchPlan(("python",)))
     fake_ray.wait.side_effect = lambda refs, **kwargs: (refs, [])
@@ -71,20 +72,30 @@ def test_actor_uses_reserved_bundle_and_cleanup_precedes_pg_removal(fake_ray, pg
 
 
 @pytest.mark.parametrize("strategy", ["fsdp2", "megatron"])
-def test_pg_entry_accepts_future_capacity_and_pins_training(tmp_path, strategy):
+@pytest.mark.parametrize("train_nodes", [1, 2])
+def test_pg_entry_accepts_future_capacity_and_pins_training(tmp_path, strategy, train_nodes):
     config, nodes = native_config(tmp_path, accelerator="npu", strategy=strategy)
+    nodes[0]["Labels"] = {"role": "train"}
     nodes[0]["Resources"]["NPU"] = 4  # All currently existing devices are for training.
+    config.trainer.nnodes = train_nodes
+    if train_nodes == 2:
+        nodes.append({"NodeID": "n1", "NodeManagerAddress": "10.0.0.2",
+                      "Resources": {"NPU": 4}, "Labels": {"role": "train"}})
+    nodes.append({"NodeID": "unlabeled", "NodeManagerAddress": "10.0.0.9",
+                  "Resources": {"NPU": 4}})
+    nodes.append({"NodeID": "inference", "NodeManagerAddress": "10.0.0.8",
+                  "Resources": {"NPU": 2}, "Labels": {"role": "rollout"}})
     spec, child = build_launch(
         config,
         nodes,
         "10.0.0.1:6379",
         "10.0.0.1",
-        NativeOptions(resource_backend="ray_pg", pg_resource_label="rollout", max_replicas=8),
+        NativeOptions(resource_backend="ray_pg", pg_label_selector={"role": "rollout"}, max_replicas=8),
     )
     core = spec.core_config()
     assert len(core["slots"]) == 8
     assert all(s["placement_group"] and not s["node_id"] for s in core["slots"])
-    assert child.trainer.placement_group_node_ids.global_pool == ["n0"]
+    assert child.trainer.placement_group_node_ids.global_pool == [f"n{i}" for i in range(train_nodes)]
     validate_verl_config(spec, spec.ray_address, [], core, config=child)
 
 
@@ -95,6 +106,7 @@ def test_pg_ignores_static_rollout_shape_through_native_constructor(tmp_path, sh
     from test_integrations import ROOT, source_methods
 
     config, nodes = native_config(tmp_path)
+    nodes[0]["Labels"] = {"role": "train"}
     config.actor_rollout_ref.rollout.nnodes, config.actor_rollout_ref.rollout.n_gpus_per_node = (
         shape
     )
@@ -105,7 +117,7 @@ def test_pg_ignores_static_rollout_shape_through_native_constructor(tmp_path, sh
         "head",
         NativeOptions(
             resource_backend="ray_pg",
-            pg_resource_label="rollout",
+            pg_label_selector={"role": "rollout"},
             max_replicas=4,
         ),
     )

@@ -135,7 +135,7 @@ class LaunchSpec:
             "endpoint",
             "ray_address",
             "resource_backend",
-            "pg_resource_label",
+            "pg_label_selector",
         }:
             raise ValueError(f"unsupported Core template fields: {sorted(unknown)}")
         slots = [ResourceSlot(**slot) for slot in config["slots"]]
@@ -171,7 +171,7 @@ class LaunchSpec:
         if config.get("resource_backend") == "ray_pg":
             if not all(slot.placement_group for slot in slots):
                 raise ValueError("PG mode requires logical PG slots")
-            result.update(resource_backend="ray_pg", pg_resource_label=config["pg_resource_label"])
+            result.update(resource_backend="ray_pg", pg_label_selector=config["pg_label_selector"])
         elif any(slot.placement_group for slot in slots):
             raise ValueError("logical PG slots require ray_pg backend")
         return result

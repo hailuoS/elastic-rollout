@@ -3,12 +3,23 @@
 from .ray import RayProcessLauncher, _ProcessActor
 
 
+def validate_label_selector(selector):
+    """The rollout pool uses exact node-label matches."""
+    if not isinstance(selector, dict) or not selector or any(
+        not isinstance(k, str)
+        or not k
+        or not isinstance(v, str)
+        or v.startswith(("!", "in("))
+        for k, v in selector.items()
+    ):
+        raise ValueError("ray_pg requires nonempty pg_label_selector with exact string labels")
+
+
 class RayPGProcessLauncher(RayProcessLauncher):
-    def __init__(self, *args, resource_label, **kwargs):
+    def __init__(self, *args, label_selector, **kwargs):
         super().__init__(*args, **kwargs)
-        if not resource_label or resource_label in ("CPU", "GPU", "NPU", "memory"):
-            raise ValueError("PG mode requires a dedicated rollout resource label")
-        self.resource_label = resource_label
+        validate_label_selector(label_selector)
+        self.label_selector = dict(label_selector)
         self.groups = {}
         self.pending = {}
         self.locations = {}
@@ -22,9 +33,10 @@ class RayPGProcessLauncher(RayProcessLauncher):
         bundle = {
             "CPU": slot.num_cpus,
             "GPU" if plan.accelerator == "gpu" else "NPU": slot.num_devices,
-            self.resource_label: 0.001,
         }
-        pg = placement_group([bundle], strategy="STRICT_PACK")
+        pg = placement_group(
+            [bundle], strategy="STRICT_PACK", bundle_label_selector=[self.label_selector]
+        )
         self.groups[replica_id] = pg
         self.leases[replica_id] = lease
         self.pending[replica_id] = (pg.ready(), plan)

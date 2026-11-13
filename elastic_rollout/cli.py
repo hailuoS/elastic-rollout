@@ -84,7 +84,7 @@ def main() -> None:
         from .launcher.ray_pg import RayPGProcessLauncher
 
         launcher_class = RayPGProcessLauncher
-        launcher_options["resource_label"] = config["pg_resource_label"]
+        launcher_options["label_selector"] = config["pg_label_selector"]
     controller = Controller(
         resources,
         VLLMServiceDriver(
