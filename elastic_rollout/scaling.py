@@ -21,7 +21,7 @@ class ScalingControl:
                 if self.scale_failures >= self.spec.scale_retry_limit:
                     raise PolicyConflict("scale retry budget exhausted; manual recovery required")
                 if count < self.desired:
-                    if self.policy_config.policy_mode != "service":
+                    if self.policy_config.policy_mode == "pipeline":
                         raise PolicyConflict(
                             "automatic scale-in requires a successful shrink trial"
                         )
@@ -36,7 +36,7 @@ class ScalingControl:
                         or sum(r.state == S.READY for r in live) != self.desired
                     ):
                         raise PolicyConflict(
-                            "service scale-in requires one stable replica at a time"
+                            "automatic scale-in requires one stable replica at a time"
                         )
             else:
                 self._cancel_trial("manual desired override")
@@ -155,13 +155,10 @@ class ScalingControl:
                 and self.traffic.accepting_routes
                 and not self.generation_paused
             ):
-                valid = [
-                    sample
-                    for sample in samples
-                    if "queue_per_replica" in sample
-                    and "kv_usage" in sample
-                    and "generation_tps" in sample
-                ]
+                required = ("queue_per_replica",)
+                if self.policy_config.policy_mode != "queue":
+                    required += ("kv_usage", "generation_tps")
+                valid = [sample for sample in samples if all(key in sample for key in required)]
                 metrics["coverage"] = len(valid) / len(targets)
                 for key in (
                     "queue_per_replica",

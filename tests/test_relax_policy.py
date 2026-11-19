@@ -81,7 +81,10 @@ def test_auto_shrink_keeps_update_and_one_at_a_time_guards(elastic):
 
 
 @pytest.mark.parametrize("queue,target", [(0, 2), (100, 4)])
-def test_runner_executes_both_directions_over_core_http(elastic, monkeypatch, queue, target):
+@pytest.mark.parametrize("policy_mode", ["service", "queue"])
+def test_runner_executes_both_directions_over_core_http(
+    elastic, monkeypatch, queue, target, policy_mode
+):
     import threading
     from types import SimpleNamespace
 
@@ -92,9 +95,12 @@ def test_runner_executes_both_directions_over_core_http(elastic, monkeypatch, qu
     c, m, driver, clock = elastic
     grow(c, m, 3)
     update(m, 1)
-    driver.pressure = lambda replica: dict(
-        queue_per_replica=queue, kv_usage=0.1, generation_tps=100, wait_p95_s=0
-    )
+    if policy_mode == "queue":
+        driver.pressure = lambda replica: {"queue_per_replica": queue or 1}
+    else:
+        driver.pressure = lambda replica: dict(
+            queue_per_replica=queue, kv_usage=0.1, generation_tps=100, wait_p95_s=0
+        )
     server = make_server(c, port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -107,7 +113,11 @@ def test_runner_executes_both_directions_over_core_http(elastic, monkeypatch, qu
 
     monkeypatch.setattr(autoscaling, "time", SimpleNamespace(time=clock, sleep=tick))
     try:
-        config = AutoscalingConfig(scale_out_persistence_s=10, scale_in_persistence_s=10)
+        config = (
+            AutoscalingConfig(policy_mode="queue")
+            if policy_mode == "queue"
+            else AutoscalingConfig(scale_out_persistence_s=10, scale_in_persistence_s=10)
+        )
         client = ControlClient(f"http://127.0.0.1:{server.server_port}", "m4")
         with pytest.raises(StopIteration):
             autoscaling.run_autoscaler(client, config, activate=True)

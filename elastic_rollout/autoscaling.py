@@ -16,8 +16,8 @@ class AutoscalingConfig:
     kv_high: float = 0.85
     kv_low: float = 0.30
     projected_kv_limit: float = 0.50
-    scale_out_persistence_s: float = 30.0
-    scale_in_persistence_s: float = 120.0
+    scale_out_persistence_s: float | None = None
+    scale_in_persistence_s: float | None = None
     scale_out_cooldown_s: float = 60.0
     scale_in_cooldown_s: float = 300.0
     sample_ttl_s: float = 30.0
@@ -33,17 +33,31 @@ class AutoscalingConfig:
     trial_min_cycles: int = 3
     trial_policy_advances: int = 2
     ongoing_wait_limit_s: float = 5.0
+    queue_low: float = 1.0
 
     def __post_init__(self):
+        if self.scale_out_persistence_s is None:
+            object.__setattr__(
+                self, "scale_out_persistence_s", 10.0 if self.policy_mode == "queue" else 30.0
+            )
+        if self.scale_in_persistence_s is None:
+            object.__setattr__(
+                self, "scale_in_persistence_s", 10.0 if self.policy_mode == "queue" else 120.0
+            )
         for name, value in vars(self).items():
             if name == "policy_mode":
-                if value not in ("pipeline", "service"):
-                    raise ValueError("policy_mode must be pipeline or service")
+                if value not in ("pipeline", "service", "queue"):
+                    raise ValueError("policy_mode must be pipeline, service or queue")
             elif name == "pipeline_enabled":
                 if type(value) is not bool:
                     raise ValueError("pipeline_enabled must be boolean")
+            elif name == "queue_low":
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("queue_low must be finite and nonnegative")
             elif isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.policy_mode == "queue" and self.queue_low >= self.queue_high:
+            raise ValueError("queue_low must be less than queue_high in queue mode")
         if not 0 < self.kv_low < self.projected_kv_limit < self.kv_high < 1:
             raise ValueError("invalid KV thresholds")
         if not 0 < self.wait_low < self.wait_high < 1 or type(self.high_reports) is not int:
@@ -149,37 +163,42 @@ class ServicePressurePolicy:
         if self.last_observation is not None and timestamp <= self.last_observation:
             return hold("waiting for a new engine observation")
         self.last_observation = timestamp
+        queue_only = c.policy_mode == "queue"
         values = {
             k: metrics[k]
             for k in ("queue_per_replica", "kv_usage", "wait_p95_s", "ttft_p95_s", "generation_tps")
             if number(metrics.get(k))
         }
-        if values.get("kv_usage", 0) > 1:
-            values.pop("kv_usage")
-        self.samples.append((timestamp, values))
-        self.samples = [(t, v) for t, v in self.samples if timestamp - t <= c.window_s][-10:]
-        throughputs = [v["generation_tps"] for _, v in self.samples if "generation_tps" in v]
-        mean = sum(throughputs) / len(throughputs) if throughputs else 0
-        variance = max((abs(v - mean) for v in throughputs), default=0) / mean if mean else 0
         queue, kv = values.get("queue_per_replica"), values.get("kv_usage")
+        if kv is not None and kv > 1:
+            kv = None
         coverage = metrics.get("coverage", 0)
-        conditions = {
-            "kv_high": kv is not None and kv > c.kv_high,
-            "queue_high": queue is not None and queue > c.queue_high,
-            "latency_high": values.get("wait_p95_s", 0) > c.wait_high_s
-            or metrics.get("queue_p95_overflow") is True,
-            "ttft_high": values.get("ttft_p95_s", 0) > c.ttft_high_s
-            or metrics.get("ttft_p95_overflow") is True,
-            "low": coverage == 1
-            and queue == 0
-            and kv is not None
-            and kv < c.kv_low
-            and len(throughputs) >= 3
-            and len(throughputs) == len(self.samples)
-            and variance < c.throughput_variance_limit,
-        }
+        conditions = {"queue_high": queue is not None and queue > c.queue_high}
+        if queue_only:
+            conditions["low"] = queue is not None and queue <= c.queue_low
+        else:
+            self.samples.append((timestamp, values))
+            self.samples = [(t, v) for t, v in self.samples if timestamp - t <= c.window_s][-10:]
+            throughputs = [v["generation_tps"] for _, v in self.samples if "generation_tps" in v]
+            mean = sum(throughputs) / len(throughputs) if throughputs else 0
+            variance = max((abs(v - mean) for v in throughputs), default=0) / mean if mean else 0
+            conditions.update(
+                kv_high=kv is not None and kv > c.kv_high,
+                latency_high=values.get("wait_p95_s", 0) > c.wait_high_s
+                or metrics.get("queue_p95_overflow") is True,
+                ttft_high=values.get("ttft_p95_s", 0) > c.ttft_high_s
+                or metrics.get("ttft_p95_overflow") is True,
+                low=coverage == 1
+                and queue == 0
+                and kv is not None
+                and kv < c.kv_low
+                and len(throughputs) >= 3
+                and len(throughputs) == len(self.samples)
+                and variance < c.throughput_variance_limit,
+            )
         for key, active in conditions.items():
-            if not active or not number(coverage) or coverage < (1 if key == "low" else 0.5):
+            min_coverage = 1 if queue_only or key == "low" else 0.5
+            if not active or not number(coverage) or coverage < min_coverage:
                 self.streaks.pop(key, None)
             else:
                 self.streaks.setdefault(key, timestamp)
@@ -197,31 +216,36 @@ class ServicePressurePolicy:
             for key, start in self.streaks.items()
             if key != "low"
         ):
-            usage_delta = int((kv - 0.7) / 0.1) if kv is not None and kv > 0.9 else 1
-            queue_delta = (
-                max(1, int((queue * ready - ready * c.queue_high) // (c.queue_high * 2)))
-                if queue is not None
-                else 1
-            )
-            target = min(
-                s["maximum"], ready + min(c.max_scale_out_delta, max(usage_delta, queue_delta, 1))
-            )
+            delta = 1
+            if not queue_only:
+                usage_delta = int((kv - 0.7) / 0.1) if kv is not None and kv > 0.9 else 1
+                queue_delta = (
+                    int((queue * ready - ready * c.queue_high) // (c.queue_high * 2))
+                    if queue is not None
+                    else 1
+                )
+                delta = min(c.max_scale_out_delta, max(usage_delta, queue_delta, 1))
+            target = min(s["maximum"], ready + delta)
             if target > ready:
                 return {
                     "action": "OUT",
                     "target": target,
-                    "reason": "Relax sustained engine pressure",
+                    "reason": "sustained high queue"
+                    if queue_only
+                    else "Relax sustained engine pressure",
                 }
         if (
             self.low_since is not None
             and timestamp - self.low_since >= c.scale_in_persistence_s
             and ready > s["minimum"]
-            and kv * ready / (ready - 1) <= c.projected_kv_limit
+            and (queue_only or kv * ready / (ready - 1) <= c.projected_kv_limit)
         ):
             return {
                 "action": "IN",
                 "target": ready - 1,
-                "reason": "Relax sustained low usage, empty queue and stable throughput",
+                "reason": "sustained low queue"
+                if queue_only
+                else "Relax sustained low usage, empty queue and stable throughput",
             }
         return hold("engine pressure persistence, bounds or incomplete shrink evidence")
 
